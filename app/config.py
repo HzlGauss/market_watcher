@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
+
 from app.models import WatchItem, Holding, VALID_MARKETS
 from app.utils import log, safe_float, safe_int
 from app.helpers import validate_watch_item, validate_holding
@@ -51,6 +53,12 @@ class Config:
             config_path = Path(config_path)
 
         self.config_path = config_path
+
+        # 加载 .env 文件
+        env_path = config_path.parent / ".env"
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=True)
+            log.debug(f"Loaded environment variables from {env_path}")
 
         # CSV 文件路径（需要在_validate 之前设置）
         self._holdings_csv = config_path.parent / "holdings.csv"

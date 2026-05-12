@@ -107,8 +107,8 @@ def _call_llm(prompt: str, config: Config) -> str | None:
     try:
         llm = get_llm_client(config)
         system_prompt = SYSTEM_PROMPTS.get("analyst", "")
-        response = llm.chat(system_prompt, prompt, max_tokens=2000)
-        return response.strip()
+        response = llm.chat(system_prompt, prompt, max_tokens=2000, timeout=120)
+        return response
     except Exception as e:
         log.error(f"LLM call failed: {e}")
         return None

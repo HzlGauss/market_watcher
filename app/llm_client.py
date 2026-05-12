@@ -38,17 +38,19 @@ class LLMClient:
         max_tokens: int = 500,
         temperature: float = 0.3,
         stop: Optional[List[str]] = None,
+        timeout: int = 60,
     ) -> Optional[str]:
         """
         调用LLM进行对话
-        
+
         Args:
             prompt: 用户提示词
             system_prompt: 系统提示词（角色设定）
             max_tokens: 最大生成token数
             temperature: 温度系数，越低越确定性
             stop: 停止词列表
-        
+            timeout: 请求超时时间（秒）
+
         Returns:
             LLM返回的内容，失败返回None
         """
@@ -72,10 +74,11 @@ class LLMClient:
             payload["stop"] = stop
 
         try:
-            resp = http_client.post("/chat/completions", json=payload, headers=headers, timeout=30)
+            resp = http_client.post("/chat/completions", json=payload, headers=headers, timeout=timeout)
             if resp and resp.status_code == 200:
                 result = resp.json()
-                return result["choices"][0]["message"]["content"].strip()
+                content = result["choices"][0]["message"]["content"]
+                return content.strip() if content else None
             else:
                 status = resp.status_code if resp else "None"
                 log.warning(f"LLM请求失败 (HTTP {status})")
@@ -92,27 +95,27 @@ _default_llm_client: Optional[LLMClient] = None
 def get_llm_client(config: Optional[Config] = None) -> LLMClient:
     """
     获取全局LLM客户端实例
-    
+
     Args:
         config: 配置对象，可选，用于获取模型名称
-    
+
     Returns:
         LLMClient实例
     """
     global _default_llm_client
-    
+
     if _default_llm_client is None:
         model = config.llm_model if config else "deepseek-chat"
         _default_llm_client = LLMClient(model=model)
-    
+
     return _default_llm_client
 
 
 # 预设的系统提示词
 SYSTEM_PROMPTS = {
     "analyst": "你是一位专业的A股市场实时分析师。请基于提供的实时盯盘数据，给出专业、简洁的盘面研判。语言简洁专业，基于数据说话，不做无依据预测。",
-    
+
     "strategist": "你是一位拥有20年经验的A股首席策略分析师。你的报告以专业、务实、可执行著称。每次分析不超过300字，语言精炼，有数据支撑，有操作建议。不模棱两可，不堆砌术语，让普通投资者也能看懂。",
-    
+
     "fund_expert": "你是一位拥有15年经验的基金研究专家，曾任晨星（Morningstar）高级分析师。你熟悉中国公募基金行业的所有明星基金经理。你的分析风格：客观、数据说话、不迎合不贬低。每次分析不超过600字。",
 }
