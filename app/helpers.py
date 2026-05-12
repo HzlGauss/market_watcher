@@ -12,6 +12,27 @@ from app.models import Quote, WatchItem, Holding, VALID_MARKETS
 from app.utils import log
 
 
+def _detect_market(code: str, provided_market: str = "") -> str:
+    """根据代码特征自动识别市场 (SH/SZ/HK)"""
+    market = str(provided_market).strip().upper()
+    if market in VALID_MARKETS:
+        return market
+
+    # 自动识别逻辑
+    if len(code) == 5:
+        return "HK"
+    
+    # 深圳代码特征：00, 30, 15, 16, 18
+    if code.startswith(("00", "30", "15", "16", "18")):
+        return "SZ"
+    
+    # 上海代码特征：60, 68, 51, 58
+    if code.startswith(("60", "68", "51", "58")):
+        return "SH"
+        
+    return "SH"  # 默认上海
+
+
 def validate_watch_item(item: dict, source: str = "unknown") -> Optional[WatchItem]:
     """
     验证并创建 WatchItem
@@ -31,13 +52,8 @@ def validate_watch_item(item: dict, source: str = "unknown") -> Optional[WatchIt
             return None
 
         name = str(item.get("name", "")).strip()
-        market = str(item.get("market", "SH")).strip().upper()
+        market = _detect_market(code, item.get("market", ""))
         item_type = str(item.get("type", "宽基 ETF")).strip()
-
-        # 验证市场标识
-        if market not in VALID_MARKETS:
-            log.warning(f"Invalid market '{market}' for {code}, using 'SH'")
-            market = "SH"
 
         return WatchItem(
             name=name,
@@ -69,14 +85,9 @@ def validate_holding(item: dict, source: str = "unknown") -> Optional[Holding]:
             return None
 
         name = str(item.get("name", "")).strip()
-        market = str(item.get("market", "SH")).strip().upper()
+        market = _detect_market(code, item.get("market", ""))
         amount = _safe_positive_int(item.get("amount", 0))
         cost = _safe_positive_float(item.get("cost", 0.0))
-
-        # 验证市场标识
-        if market not in VALID_MARKETS:
-            log.warning(f"Invalid market '{market}' for {code}, using 'SH'")
-            market = "SH"
 
         return Holding(
             name=name,

@@ -4,9 +4,8 @@
 import os
 import sys
 import time
-import signal
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from app.config import Config
@@ -135,9 +134,26 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
         print_llm_result, print_tail, save_brief
     )
 
-    log.info("Scanning market data...")
+    log.info("Scanning market data (Holdings only)...")
 
-    quotes = fetch_quotes(config.watch_items)
+    # Only fetch and analyze items from holdings
+    holdings = config.holdings
+    if not holdings:
+        log.warning("No holdings found to monitor")
+        return
+
+    # Convert holdings to watch items for fetch_quotes
+    from app.models import WatchItem
+    monitor_items = []
+    for h in holdings:
+        monitor_items.append(WatchItem(
+            name=h.name,
+            code=h.code,
+            market=h.market,
+            type="持仓股"
+        ))
+
+    quotes = fetch_quotes(monitor_items)
     if not quotes:
         log.warning("No quote data received")
         return

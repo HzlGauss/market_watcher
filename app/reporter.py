@@ -4,22 +4,42 @@ Generate actionable strategy reports from a senior investment expert perspective
 """
 
 from __future__ import annotations
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from app.models import Quote, Alert, AnalysisStats, SentimentResult, Holding
+from app.models import WatchItem, Quote, Holding
 from app.config import Config
 from app.data_fetcher import fetch_quotes, NorthFlowFetcher
 from app.analyzer import analyze, calc_market_sentiment
 from app.utils import log
-from app.http_client import sina_client, serverchan_client
+from app.http_client import serverchan_client
 from app.llm_client import get_llm_client, SYSTEM_PROMPTS
 
 
 # ============================================================
-# Holdings P&L Calculation
+# Private Helpers
 # ============================================================
+
+def _get_unique_items(config: Config) -> list[WatchItem]:
+    """Merge watchlist and holdings to get unique list of items for fetching"""
+    watchlist = config.watch_items
+    holdings = config.holdings
+    
+    # Use code as key to avoid duplicates
+    unique_map = {item.code: item for item in watchlist}
+    
+    for h in holdings:
+        if h.code not in unique_map:
+            # Convert Holding to WatchItem for fetcher compatibility
+            unique_map[h.code] = WatchItem(
+                name=h.name,
+                code=h.code,
+                market=h.market,
+                type="持仓股"
+            )
+            
+    return list(unique_map.values())
+
 
 def _holdings_summary(
     holdings: list[Holding],
@@ -130,8 +150,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     from app.data_fetcher import fetch_global_markets
     global_data = fetch_global_markets()
 
-    # 2. Get yesterday's A股 data (also fetch once during non-trading hours)
-    quotes = fetch_quotes(config.watch_items)
+    # 2. Get yesterday's A股 data (fetch unique items)
+    all_items = _get_unique_items(config)
+    quotes = fetch_quotes(all_items)
 
     # 3. Build prompt
     lines = [
@@ -141,31 +162,39 @@ def generate_morning_brief(config: Config) -> Path | None:
 
     # Overnight US market
     if global_data:
-        lines.append("\n## 隔夜市场")
-        lines.append(f"- 道琼斯: {global_data.get('道琼斯', '')}")
-        lines.append(f"- 纳斯达克: {global_data.get('纳斯达克', '')}")
-        lines.append(f"- 标普500: {global_data.get('标普500', '')}")
-        lines.append(f"- A50期货: {global_data.get('A50期货', '')}")
-        lines.append(f"- 恒生指数: {global_data.get('恒生指数', '')}")
-        lines.append(f"- 汇率: {global_data.get('汇率', '')}")
+        lines.append("\n## 隔夜市场数据")
+        for k, v in global_data.items():
+            lines.append(f"- {k}: {v}")
 
     # Market sentiment from yesterday
     if quotes:
-        sentiment = calc_market_sentiment(quotes)
-        lines.append(f"\n## 昨日情绪")
+        watchlist_codes = {item.code for item in config.watch_items}
+        watch_quotes = [q for q in quotes if q.code in watchlist_codes]
+        sentiment = calc_market_sentiment(watch_quotes)
+        lines.append(f"\n## 昨日A股情绪")
         lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
+        
+        # Summary of holdings yesterday
+        holdings = config.holdings
+        if holdings:
+            h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
+            if h_results:
+                lines.append(f"\n## 当前持仓概况 (Holdings)")
+                lines.append(f"- 总盈亏: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
+                for h in h_results[:5]: # Only show top 5 in brief
+                    lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%")
 
     lines.append(f"""
 
-Please provide analysis from the following 5 aspects, within 300 words:
+请作为首席策略师，基于以上数据生成一份结构化的早盘简报（约500字）：
 
-1️⃣ **Overnight Review**: Key movements in US stocks, A50 futures, and Hong Kong market
-2️⃣ **A-share Strategy**: Today's expected trend, key support/resistance levels
-3️⃣ **Hot Sectors**: Which sectors are likely to perform well today?
-4️⃣ **Position Impact**: Based on your holdings, what's the operation suggestion for today?
-5️⃣ **Risk Reminders**: What risks need attention today?
+1️⃣ **隔夜盘面解析**: 美股、A50及港股的表现对今日A股开盘的影响
+2️⃣ **今日走势研判**: 预计今日大盘的波动区间、关键压力位与支撑位
+3️⃣ **行业机会点**: 哪些板块今天可能受到消息面或隔夜行情的提振？
+4️⃣ **持仓应对策略**: 针对现有持仓，今日开盘后建议的操作策略
+5️⃣ **风险预警**: 今日盘中需重点防范的风险点
 
-Requirements: Professional and practical, data-supported, actionable for ordinary investors.""")
+要求：专业、简洁、有明确的操作导向。使用 Markdown 格式增强可读性。""")
 
     content = _call_llm("\n".join(lines), config)
     if not content:
@@ -196,18 +225,19 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
 
     log.info("Generating midday review...")
 
-    # Get morning intraday data
-    items = config.watch_items
-    quotes = fetch_quotes(items)
+    # Fetch quotes for both watchlist and holdings
+    all_items = _get_unique_items(config)
+    quotes = fetch_quotes(all_items)
 
     if not quotes:
         log.warning("Midday review: No quote data")
         return None
 
-    # Analysis
-    alerts, stats = analyze(quotes, {}, config)
+    # Separate quotes for analysis
+    watchlist_codes = {item.code for item in config.watch_items}
+    watch_quotes = [q for q in quotes if q.code in watchlist_codes]
 
-    # Northbound funds
+    _, stats = analyze(watch_quotes, {}, config)
     nf = north_fetcher.fetch()
 
     lines = [
@@ -215,83 +245,51 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
         f"Please generate an A-share midday review report."
     ]
 
-    # Morning data
-    lines.append(f"\n## Morning Session Data")
-    lines.append(f"- Sentiment Score: {stats.sentiment.score}/100 ({stats.sentiment.label})")
-    lines.append(f"- Up/Down/Flat: {stats.up} / {stats.down} / {stats.flat}")
-    lines.append(f"- Alerts: {stats.alert_count}")
-
+    # Section 1: Morning Session Overview
+    lines.append(f"\n## 1. 午间行情概览")
+    lines.append(f"- 市场情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
+    lines.append(f"- 涨/跌/平盘数量: {stats.up} / {stats.down} / {stats.flat}")
     if nf:
-        lines.append(f"- Northbound Funds: {nf.total_net:+.0f}亿")
+        lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
 
-    # Morning rankings
-    sorted_q = sorted(quotes, key=lambda q: (q.change_pct or 0), reverse=True)
-    lines.append("\n## Top 5 Gainers")
+    # Section 2: Watchlist Performance
+    sorted_q = sorted(watch_quotes, key=lambda q: (q.change_pct or 0), reverse=True)
+    lines.append("\n## 2. 核心观察标的 (Watchlist)")
+    lines.append("### 涨幅榜前5:")
     for q in sorted_q[:5]:
         if q.change_pct is not None:
             lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
 
-    lines.append("\n## Top 5 Losers")
+    lines.append("### 跌幅榜前5:")
     for q in sorted_q[-5:]:
         if q.change_pct is not None:
             lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
 
-    if alerts:
-        lines.append("\n## Morning Alerts")
-        for a in alerts[:5]:
-            lines.append(f"- {a.name}: {' | '.join(a.messages)}")
-
-    # Holdings analysis with technical patterns
+    # Section 3: Personal Holdings Analysis
     holdings = config.holdings
     if holdings:
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
         if h_results:
-            lines.append(f"\n## Your Holdings Morning Performance")
-            lines.append(f"- Cost: {total_cost:,.0f} | P&L: {total_pnl:+,.0f}")
-
-            # Find matching quotes for technical analysis
-            holdings_with_tech = []
+            lines.append(f"\n## 3. 个人持仓表现 (Holdings)")
+            lines.append(f"- 持仓总成本: {total_cost:,.2f} | 午间总盈亏: {total_pnl:+,.2f}")
             for h in h_results:
-                quote = next((q for q in quotes if q.code == h["code"]), None)
-                if quote:
-                    # Technical analysis
-                    tech_info = []
-                    if quote.high and quote.low and quote.price:
-                        # Price position within day range
-                        range_percent = ((quote.price - quote.low) / (quote.high - quote.low)) * 100 if (quote.high - quote.low) > 0 else 50
-                        if range_percent > 80:
-                            tech_info.append("near high")
-                        elif range_percent < 20:
-                            tech_info.append("near low")
-                        else:
-                            tech_info.append("mid range")
-
-                    if quote.amplitude:
-                        if quote.amplitude > 3:
-                            tech_info.append("high volatility")
-                        elif quote.amplitude < 1:
-                            tech_info.append("low volatility")
-
-                    holdings_with_tech.append({**h, "quote": quote, "tech": ", ".join(tech_info)})
-
-            for h in holdings_with_tech:
                 color = "🟢" if h["pnl"] >= 0 else "🔴"
-                tech_note = f" [{h['tech']}]" if h.get("tech") else ""
-                lines.append(f"  {color} {h['name']}: {h['amount']} shares "
-                             f"| P&L {h['pnl']:+,.0f} ({h['pnl_pct']:+.2f}%){tech_note}")
+                lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%)")
 
     lines.append(f"""
 
-Please provide analysis from the following 6 aspects, within 300 words:
+请作为资深策略分析师，基于以上午盘数据，生成一份结构清晰的午评报告（约500字）：
 
-1️⃣ **Morning Review**: Morning trend characteristics, major player movements
-2️⃣ **Sector Rotation**: Which sectors are strong/weak, any style shift signals?
-3️⃣ **Fund Flow**: Combining northbound funds and price-volume, judge capital sentiment
-4️⃣ **Holdings Technical Analysis**: Analyze each holding's technical pattern (price position, volatility, support/resistance levels)
-5️⃣ **Position Impact**: Based on your holdings P&L and technical patterns, give afternoon operation suggestions
-6️⃣ **Afternoon Prediction**: Likely afternoon trend direction, what to watch for
+1️⃣ **上午盘面总结**: 描述上午走势的特征（如冲高回落、缩量震荡等），点出主要影响因素
+2️⃣ **热点与异动**: 观察标的中哪些板块或个股表现突出或异常，分析其原因
+3️⃣ **持仓午间扫描**: 针对个人持仓（Holdings），简述其上午的表现，是否出现风险信号
+4️⃣ **下午走势预测**: 基于上午的情绪和资金流向，预测下午的可能走势
+5️⃣ **午间操作建议**: 下午是否需要进行调仓（补仓/减仓），给出具体的触发条件
 
-Requirements: Concise, clear views, suitable for quick intraday reading.""")
+要求：
+- 视角：专业、敏锐，重点在于"预测下午"和"给出建议"。
+- 格式：使用 Markdown 增强可读性，区分"自选"和"持仓"。
+- 语气：务实，不拖泥带水。""")
 
     content = _call_llm("\n".join(lines), config)
     if not content:
@@ -319,108 +317,90 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
 
     log.info("Generating evening review...")
 
-    items = config.watch_items
-    quotes = fetch_quotes(items)
+    holdings = config.holdings
+    if not holdings:
+        log.warning("Evening review: No holdings configured")
+        return None
+
+    holding_items = [
+        WatchItem(name=h.name, code=h.code, market=h.market, type="持仓股")
+        for h in holdings
+    ]
+    quotes = fetch_quotes(holding_items)
 
     if not quotes:
         log.warning("Evening review: No quote data")
         return None
 
-    alerts, stats = analyze(quotes, {}, config)
+    # 暂停晚报中的自选观察分析入口，仅保留代码以便后续恢复。
+    # watchlist_codes = {item.code for item in config.watch_items}
+    # watch_quotes = [q for q in quotes if q.code in watchlist_codes]
+    # alerts, stats = analyze(watch_quotes, {}, config)
+
     nf = north_fetcher.fetch()
 
     lines = [
         f"Market closed. Today is {datetime.now().strftime('%Y-%m-%d %H:%M')}, "
-        f"Please generate a complete A-share closing analysis report."
+        f"Please generate a holdings-focused daily review report."
     ]
 
-    # Full day data
-    lines.append(f"\n## Today's Market Data")
-    lines.append(f"- Sentiment Score: {stats.sentiment.score}/100 ({stats.sentiment.label})")
-    lines.append(f"- Up/Down/Flat: {stats.up} / {stats.down} / {stats.flat}")
-    lines.append(f"- Alerts: {stats.alert_count}")
-
+    # Section 1: Market Background
+    lines.append(f"\n## 1. 市场背景")
     if nf:
-        lines.append(f"- Northbound Funds: {nf.total_net:+.0f}亿")
+        lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
+    else:
+        lines.append("- 北向资金: 暂无数据")
 
-    # Full day rankings
-    sorted_q = sorted(quotes, key=lambda q: (q.change_pct or 0), reverse=True)
-    lines.append("\n## Today's Top Gainers")
-    for q in sorted_q[:5]:
-        if q.change_pct is not None:
-            lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
+    # Section 2: Personal Holdings Analysis
+    h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
+    if h_results:
+        lines.append(f"\n## 2. 个人持仓表现 (Holdings)")
+        lines.append(f"- 持仓总成本: {total_cost:,.2f} | 今日总盈亏: {total_pnl:+,.2f}")
 
-    lines.append("\n## Today's Top Losers")
-    for q in sorted_q[-5:]:
-        if q.change_pct is not None:
-            lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
+        holdings_with_tech = []
+        for h in h_results:
+            quote = next((q for q in quotes if q.code == h["code"]), None)
+            if quote:
+                tech_info = []
+                if quote.high and quote.low and quote.price:
+                    range_percent = ((quote.price - quote.low) / (quote.high - quote.low)) * 100 if (quote.high - quote.low) > 0 else 50
+                    if range_percent > 80:
+                        tech_info.append("处于日内高位")
+                    elif range_percent < 20:
+                        tech_info.append("处于日内低位")
+                    else:
+                        tech_info.append("日内震荡")
 
-    if alerts:
-        lines.append("\n## Today's Alerts")
-        for a in alerts[:5]:
-            lines.append(f"- {a.name}: {' | '.join(a.messages)}")
+                if quote.amplitude and quote.amplitude > 3:
+                    tech_info.append("波动较大")
+                if quote.change_pct:
+                    if quote.change_pct > 2:
+                        tech_info.append("走势强劲")
+                    elif quote.change_pct < -2:
+                        tech_info.append("走势疲软")
 
-    # Holdings analysis with technical patterns
-    holdings = config.holdings
-    if holdings:
-        h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
-        if h_results:
-            lines.append(f"\n## Your Holdings Today's Performance")
-            lines.append(f"- Cost: {total_cost:,.0f} | Total P&L: {total_pnl:+,.0f}")
+                holdings_with_tech.append({**h, "quote": quote, "tech": ", ".join(tech_info)})
 
-            # Find matching quotes for technical analysis
-            holdings_with_tech = []
-            for h in h_results:
-                quote = next((q for q in quotes if q.code == h["code"]), None)
-                if quote:
-                    # Technical analysis
-                    tech_info = []
-                    if quote.high and quote.low and quote.price:
-                        # Price position within day range
-                        range_percent = ((quote.price - quote.low) / (quote.high - quote.low)) * 100 if (quote.high - quote.low) > 0 else 50
-                        if range_percent > 80:
-                            tech_info.append("near high")
-                        elif range_percent < 20:
-                            tech_info.append("near low")
-                        else:
-                            tech_info.append("mid range")
-
-                    if quote.amplitude:
-                        if quote.amplitude > 3:
-                            tech_info.append("high volatility")
-                        elif quote.amplitude < 1:
-                            tech_info.append("low volatility")
-
-                    # Check for price patterns
-                    if quote.change_pct:
-                        if quote.change_pct > 2:
-                            tech_info.append("strong up")
-                        elif quote.change_pct < -2:
-                            tech_info.append("strong down")
-
-                    holdings_with_tech.append({**h, "quote": quote, "tech": ", ".join(tech_info)})
-
-            for h in holdings_with_tech:
-                color = "🟢" if h["pnl"] >= 0 else "🔴"
-                tech_note = f" [{h['tech']}]" if h.get("tech") else ""
-                lines.append(f"  {color} {h['name']}: {h['amount']} shares "
-                             f"| P&L {h['pnl']:+,.0f} ({h['pnl_pct']:+.2f}%){tech_note}")
+        for h in holdings_with_tech:
+            color = "🟢" if h["pnl"] >= 0 else "🔴"
+            tech_note = f" [{h['tech']}]" if h.get("tech") else ""
+            lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%){tech_note}")
 
     lines.append(f"""
 
-Please provide analysis from the following 7 aspects, within 500 words:
+请作为资深投资专家，基于以上数据，生成一份只围绕“个人持仓”的晚报，总字数约700字：
 
-1️⃣ **Full Day Summary**: Today's trend characteristics, key turning points and capital sentiment
-2️⃣ **Sector Analysis**: Strongest and weakest sectors, sustainability
-3️⃣ **Sentiment Analysis**: Combining sentiment score and northbound funds, judge market temperature
-4️⃣ **Holdings Technical Analysis**: Analyze each holding's technical pattern (price position in day range, volatility, trend strength, support/resistance levels)
-5️⃣ **Position Analysis**: Based on your holdings' today performance and technical patterns, how to handle tomorrow
-6️⃣ **Risks & Opportunities**: ⚠️ **Special attention to cyclical sectors** (steel, coal, non-ferrous, chemical, building materials, etc.)
-   Their current valuation levels, inventory cycle position,
-   Any policy catalysts or suppression factors, short-term operation suggestions
-7️⃣ **Tomorrow's Strategy**: What to focus on tomorrow, how to adjust position
+1️⃣ **持仓全景综述**: 总结今日持仓整体盈亏、强弱分化和仓位状态
+2️⃣ **重点持仓点评**: 挑出表现最强、最弱、最值得警惕的持仓分别点评
+3️⃣ **持仓技术诊断**: 结合日内位置、波动、涨跌强弱，判断每类持仓的技术状态
+4️⃣ **调仓与风控建议**: 明确哪些适合继续持有、逢高减仓、观察或止损
+5️⃣ **明日操作清单**: 用清单形式给出次日最值得执行的动作和关注点
 
-Requirements: From a retail investor perspective, provide actionable tomorrow operation reference.""")
+要求：
+- 视角：从持仓管理和实盘操作出发，给出具可操作性的建议。
+- 格式：使用 Markdown 标题、列表、加粗和 Emoji 增强可读性。
+- 内容：不要分析自选股，不要输出观察标的板块点评，所有结论都必须落在当前持仓上。
+- 语气：专业且辛辣，不模棱两可。""")
 
     content = _call_llm("\n".join(lines), config)
     if not content:

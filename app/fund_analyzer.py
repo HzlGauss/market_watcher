@@ -37,7 +37,7 @@ def _fetch_nav(code: str) -> dict | None:
     """获取单只基金近5日净值"""
     url = f"{FUND_NAV_API}?callback=jQuery&fundCode={code}&pageIndex=1&pageSize=5"
 
-    resp = eastmoney_client.get(url)
+    resp = eastmoney_client.get(url, headers=_FUND_HEADERS)
     if resp is None:
         log.warning(f"基金{code}净值获取失败")
         return None
@@ -49,6 +49,9 @@ def _fetch_nav(code: str) -> dict | None:
         if not match:
             return None
         data = json.loads(match.group())
+        if not isinstance(data, dict):
+            return None
+            
         rows = data.get("Data", {}).get("LSJZList", [])
         if not rows:
             return None
@@ -248,8 +251,8 @@ def analyze_funds(config: Config) -> Path | None:
     global_str = ""
     if global_data:
         parts = []
-        for name, d in global_data.items():
-            parts.append(f"{name}: {d.get('price','--')} ({d.get('change_pct',0):+.2f}%)")
+        for name, val in global_data.items():
+            parts.append(f"{name}: {val}")
         global_str = " | ".join(parts)
 
     # 4. 调用 mx-data 获取深度数据（有API Key时）
@@ -274,36 +277,52 @@ def analyze_funds(config: Config) -> Path | None:
             f"| 最新净值:{f['nav']:.4f} | 日涨跌:{change}%"
         )
 
-    prompt = f"""今天是 {today}。请对以下 {len(valid_funds)} 只主动管理基金进行专业分析。
+    prompt = f"""今天是 {today}。请作为资深基金专家，为投资者生成一份**极具决策价值**的主动管理基金深度分析报告。
 
-## 当前市场环境
+### 1. 核心输入数据
+
+**【当前市场环境】**
 - A股情绪: {mood_str}
-- 板块风格:
+- 行业板块走势:
 {sectors_str}
-- 隔夜全球:
-{global_str}
+- 全球市场参考: {global_str}
 
-## 基金数据（最新净值+日涨跌）
+**【待分析基金列表】**
 {chr(10).join(fund_table_lines)}
 
-{"\n## 权威数据（东方财富妙想）\n" + mx_data + "\n" if mx_data else ""}
-请从以下5个维度进行分析，总字数不超过600字：
+{"\n【权威深度数据（持仓/评级）】\n" + mx_data if mx_data else ""}
 
-1️⃣ **权威评级**: 基于各权威机构(晨星/银河/招商等)评级，
-   用 ★★★★☆ 格式给出每只基金的综合评级（按分数从高到低排列）
+---
 
-2️⃣ **持仓风格匹配**: 分析各基金持仓风格与当前市场风格的匹配程度，
-   点出哪些基金"吃"当前行情、哪些"不吃"
+### 2. 报告输出要求（必须严格遵守以下 Markdown 结构）
 
-3️⃣ **基金经理评价**: 对每位经理的历史业绩、风格稳定性、
-   回撤控制能力做简要评价
+#### **🏆 今日决策摘要**
+- 给出 1-2 句关于当前市场风格的定性研判。
+- 列出今日**最值得关注**的 1-2 只基金及其推荐动作（如：重点加仓、止盈观察）。
 
-4️⃣ **综合评分排序**: 按综合得分从高到低列出前5和后3
+#### **📋 基金行情速览表**
+请使用 Markdown 表格列出所有 {len(valid_funds)} 只基金的摘要：
+| 基金代码 | 基金名称 | 日涨跌 | 风格匹配度 | 建议操作 |
+| :--- | :--- | :--- | :--- | :--- |
+| (代码) | (名称) | (带符号百分比) | (使用 ⭐ 数量表示) | (统一标签) |
 
-5️⃣ **操作建议**: 给出持有建议：加仓/持有/减仓/观望，
-   并说明理由
+*风格匹配度说明：⭐(极差) 到 ⭐⭐⭐⭐⭐(完美契合)*
+*操作建议标签：【强力买入】、【分批加仓】、【继续持有】、【风险观望】、【逢高止盈】*
 
-要求：客观专业，引用具体数据（近1年收益、最大回撤等），不说模棱两可的话。"""
+#### **🔍 深度研判与经理点评**
+请将基金进行分类或挑选重点进行点评（不需要逐一罗列，突出重点）：
+- **持仓体感分析**：直接点出基金目前的“真实体感”（例如：“这只基金本质上是在赌AI”、“这是一篮子红利资产”）。
+- **经理评价**：简述经理在当前环境下的应对能力。
+- **风格契合度**：为什么给出的星级评价？（例如：“在半导体大跌时仍重仓，匹配度极低”）。
+
+#### **💡 总结建议**
+- 给出总体的仓位控制建议。
+- 提醒未来 1-3 个交易日需警惕的风险点。
+
+**要求：**
+- 语言专业、辛辣、有洞察力，拒绝模棱两可。
+- 总字数控制在 800 字以内。
+- 充分利用表格、列表、Emoji 和加粗语法提升可读性。"""
 
     # 5. 调用 AI
     log.info("  🤖 DeepSeek 分析中（约30秒）...")
