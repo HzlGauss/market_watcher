@@ -13,7 +13,13 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
+# 尝试导入 dotenv，如果没有安装则不加载 .env
+try:
+    from dotenv import load_dotenv
+    _dotenv_available = True
+except ImportError:
+    load_dotenv = lambda **kwargs: None  # type: ignore
+    _dotenv_available = False
 
 from app.models import WatchItem, Holding, VALID_MARKETS
 from app.utils import log, safe_float, safe_int
@@ -57,8 +63,12 @@ class Config:
         # 加载 .env 文件
         env_path = config_path.parent / ".env"
         if env_path.exists():
-            load_dotenv(dotenv_path=env_path, override=True)
-            log.debug(f"Loaded environment variables from {env_path}")
+            if _dotenv_available:
+                load_dotenv(dotenv_path=env_path, override=True)
+                log.debug(f"Loaded environment variables from {env_path}")
+            else:
+                log.warning(f".env file exists but python-dotenv is not installed. "
+                            f"Please install it with: pip install python-dotenv")
 
         # CSV 文件路径（需要在_validate 之前设置）
         self._holdings_csv = config_path.parent / "holdings.csv"
