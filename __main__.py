@@ -134,34 +134,66 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
         print_llm_result, print_tail, save_brief
     )
 
-    log.info("Scanning market data (Holdings only)...")
+    log.info("Scanning market data (Holdings + Watchlist)...")
 
-    # Only fetch and analyze items from holdings
+    # Get holdings from CSV
     holdings = config.holdings
-    if not holdings:
-        log.warning("No holdings found to monitor")
+    # Get watchlist from CSV
+    watch_items = config.watch_items
+
+    if not holdings and not watch_items:
+        log.warning("No holdings or watchlist items found to monitor")
         return
 
     # Convert holdings to watch items for fetch_quotes
     from app.models import WatchItem
     monitor_items = []
+
+    # Add holdings with type "持仓"
     for h in holdings:
         monitor_items.append(WatchItem(
             name=h.name,
             code=h.code,
             market=h.market,
-            type="持仓股"
+            type="持仓"
         ))
+
+    # Add watchlist items (exclude those already in holdings)
+    holding_codes = {h.code for h in holdings}
+    for item in watch_items:
+        if item.code not in holding_codes:
+            monitor_items.append(WatchItem(
+                name=item.name,
+                code=item.code,
+                market=item.market,
+                type=item.type
+            ))
 
     quotes = fetch_quotes(monitor_items)
     if not quotes:
         log.warning("No quote data received")
         return
 
+    # Separate quotes by type for statistics
+    holdings_quotes = [q for q in quotes if q.type == "持仓"]
+    watchlist_quotes = [q for q in quotes if q.type != "持仓"]
+
     print_quotes_table(quotes)
 
-    result = analyze(quotes, config)
+    # Analyze all quotes together
+    result = analyze(quotes, {}, config)
     print_sentiment(result.stats)
+
+    # Print separate statistics
+    if holdings_quotes:
+        holdings_up = sum(1 for q in holdings_quotes if q.change_pct and q.change_pct > 0)
+        holdings_down = sum(1 for q in holdings_quotes if q.change_pct and q.change_pct < 0)
+        log.info(f"持仓统计: {len(holdings_quotes)} 只, 上涨 {holdings_up} 只, 下跌 {holdings_down} 只")
+
+    if watchlist_quotes:
+        watchlist_up = sum(1 for q in watchlist_quotes if q.change_pct and q.change_pct > 0)
+        watchlist_down = sum(1 for q in watchlist_quotes if q.change_pct and q.change_pct < 0)
+        log.info(f"标的列表统计: {len(watchlist_quotes)} 只, 上涨 {watchlist_up} 只, 下跌 {watchlist_down} 只")
 
     if result.alerts:
         print_alerts(result.alerts)

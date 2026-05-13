@@ -71,27 +71,38 @@
         "保存目录": "investment_reports"
     },
     "持仓": [
-        {
-            "name": "沪深300ETF",
-            "code": "510300",
-            "market": "SH",
-            "amount": 10000,
-            "cost": 4.850
-        },
-        {
-            "name": "半导体ETF",
-            "code": "512480",
-            "market": "SH",
-            "amount": 5000,
-            "cost": 1.920
-        },
-        {
-            "name": "科创50ETF",
-            "code": "588000",
-            "market": "SH",
-            "amount": 8000,
-            "cost": 1.780
-        }
+        {"name": "招商银行", "code": "600036", "market": "SH", "amount": 2200, "cost": 36.208},
+        {"name": "创业板50", "code": "159949", "market": "SZ", "amount": 24000, "cost": 1.051},
+        {"name": "美的集团", "code": "000333", "market": "SZ", "amount": 400, "cost": 65.380},
+        {"name": "芯片基金", "code": "159801", "market": "SZ", "amount": 26500, "cost": 0.821},
+        {"name": "沪深300", "code": "159919", "market": "SZ", "amount": 5300, "cost": 4.227},
+        {"name": "兴全趋势", "code": "163402", "market": "SZ", "amount": 27800, "cost": 0.829},
+        {"name": "恒生科技", "code": "513130", "market": "SH", "amount": 33000, "cost": 0.817},
+        {"name": "1000ETF", "code": "512100", "market": "SH", "amount": 5800, "cost": 2.566},
+        {"name": "科技50", "code": "515750", "market": "SH", "amount": 9000, "cost": 1.438},
+        {"name": "银行基金", "code": "512700", "market": "SH", "amount": 12000, "cost": 0.918},
+        {"name": "红利低波", "code": "512890", "market": "SH", "amount": 15000, "cost": 1.187},
+        {"name": "中概互联", "code": "513050", "market": "SH", "amount": 12400, "cost": 1.485},
+        {"name": "科创板", "code": "588090", "market": "SH", "amount": 8400, "cost": 1.171},
+        {"name": "恒生中国", "code": "510900", "market": "SH", "amount": 13300, "cost": 1.128},
+        {"name": "东方财富", "code": "300059", "market": "SZ", "amount": 500, "cost": 18.940},
+        {"name": "通信ETF", "code": "515880", "market": "SH", "amount": 6300, "cost": -0.076},
+        {"name": "智能汽车", "code": "515250", "market": "SH", "amount": 8000, "cost": 0.784},
+        {"name": "500ETF", "code": "510500", "market": "SH", "amount": 1017, "cost": 5.798},
+        {"name": "中证红利", "code": "515080", "market": "SH", "amount": 5100, "cost": 1.623},
+        {"name": "恒生互联", "code": "513330", "market": "SH", "amount": 16700, "cost": 0.718},
+        {"name": "科技50", "code": "159807", "market": "SZ", "amount": 7800, "cost": 0.781},
+        {"name": "消电ETF", "code": "561310", "market": "SH", "amount": 4400, "cost": 0.967},
+        {"name": "证券ETF", "code": "512880", "market": "SH", "amount": 6000, "cost": 1.098},
+        {"name": "养殖ETF", "code": "159865", "market": "SZ", "amount": 9700, "cost": 0.773},
+        {"name": "人工智能", "code": "515980", "market": "SH", "amount": 5100, "cost": 1.016},
+        {"name": "创成长", "code": "159967", "market": "SZ", "amount": 4700, "cost": 0.598},
+        {"name": "国防军工", "code": "512810", "market": "SH", "amount": 4400, "cost": 0.730},
+        {"name": "杭州银行", "code": "600926", "market": "SH", "amount": 200, "cost": 16.785},
+        {"name": "华夏翔阳", "code": "501093", "market": "SH", "amount": 2500, "cost": 1.857},
+        {"name": "三一重工", "code": "600031", "market": "SH", "amount": 100, "cost": 69.231},
+        {"name": "金发科技", "code": "600143", "market": "SH", "amount": 100, "cost": 29.294},
+        {"name": "建设银行", "code": "601939", "market": "SH", "amount": 100, "cost": 23.108}
     ],
     "标的列表": [
         {
