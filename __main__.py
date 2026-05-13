@@ -181,8 +181,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
     print_quotes_table(quotes)
 
     # Analyze all quotes together
-    result = analyze(quotes, {}, config)
-    print_sentiment(result.stats)
+    alerts, stats = analyze(quotes, {}, config)
+    print_sentiment(stats)
 
     # Print separate statistics
     if holdings_quotes:
@@ -195,24 +195,24 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
         watchlist_down = sum(1 for q in watchlist_quotes if q.change_pct and q.change_pct < 0)
         log.info(f"标的列表统计: {len(watchlist_quotes)} 只, 上涨 {watchlist_up} 只, 下跌 {watchlist_down} 只")
 
-    if result.alerts:
-        print_alerts(result.alerts)
+    if alerts:
+        print_alerts(alerts)
 
         if config.llm_enabled and config.deepseek_key:
-            llm_result = analyze_with_llm(result, quotes, config)
+            llm_result = analyze_with_llm(quotes, alerts, stats, config)
             print_llm_result(llm_result)
 
             if config.push_enabled and config.sct_sendkey:
-                for alert in result.alerts:
+                for alert in alerts:
                     push_alert(alert, config, llm_result)
         else:
             if config.push_enabled and config.sct_sendkey:
-                for alert in result.alerts:
+                for alert in alerts:
                     push_alert(alert, config)
     else:
         log.info("No alerts triggered")
 
-    save_brief(result, quotes, config, BRIEF_DIR)
+    save_brief((alerts, stats), quotes, config, BRIEF_DIR)
     print_tail(config.scan_interval)
 
 
