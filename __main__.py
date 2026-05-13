@@ -210,7 +210,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
     else:
         log.info("No alerts triggered")
 
-    save_brief((alerts, stats), quotes, config, BRIEF_DIR)
+    save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
 
 
