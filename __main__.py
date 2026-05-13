@@ -203,12 +203,10 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
             print_llm_result(llm_result)
 
             if config.push_enabled and config.sct_sendkey:
-                for alert in alerts:
-                    push_alert(alert, config, llm_result)
+                push_alert(alerts, stats, config, llm_result)
         else:
             if config.push_enabled and config.sct_sendkey:
-                for alert in alerts:
-                    push_alert(alert, config)
+                push_alert(alerts, stats, config)
     else:
         log.info("No alerts triggered")
 
