@@ -133,6 +133,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
         print_quotes_table, print_sentiment, print_alerts,
         print_llm_result, print_tail, save_brief
     )
+    from app.technical import fetch_historical_kline, get_technical_summary
 
     log.info("Scanning market data (Holdings + Watchlist)...")
 
@@ -178,10 +179,23 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
     watchlist_quotes = [q for q in quotes if q.type != "持仓"]
 
+    # Fetch technical indicators for holdings & watchlist items
+    tech_summaries: dict[str, "TechnicalSummary"] = {}
+    quote_map = {q.code: q for q in quotes}
+    item_map = {item.code: item for item in monitor_items}
+
+    for code in quote_map:
+        item = item_map.get(code)
+        if not item:
+            continue
+        klines = fetch_historical_kline(code, item.market, days=30)
+        if klines:
+            tech_summaries[code] = get_technical_summary(quote_map[code], klines)
+
     print_quotes_table(quotes)
 
-    # Analyze all quotes together
-    alerts, stats = analyze(quotes, {}, config)
+    # Analyze all quotes together (with technical signals)
+    alerts, stats = analyze(quotes, {}, config, tech_summaries)
     print_sentiment(stats)
 
     # Print separate statistics

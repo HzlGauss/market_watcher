@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_technical.py -v)",
+      "Bash(python -c \"print\\('hello'\\)\")",
+      "Bash(py -0)"
+    ]
+  }
+}

@@ -8,8 +8,8 @@ from datetime import datetime
 from app.utils import (
     format_volume, format_amount, format_percentage,
     format_number, safe_float, safe_int,
-    time_to_minutes, is_in_time_range
 )
+from app.helpers import time_to_minutes, is_in_time_range
 
 
 class TestFormatFunctions:

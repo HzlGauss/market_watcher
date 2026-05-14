@@ -1,0 +1,148 @@
+{
+  "ai": {
+    // 强制使用Claude 3.5 Sonnet（避免Trae偷偷切换模型）
+    "defaultModel": "Claude-3.5-Sonnet",
+
+    // 【核心防超限配置】经过精确计算的安全参数
+    "modelParams": {
+      // 最大输出tokens：31000（不是32000！）
+      // 计算逻辑：131072（总上限）- 99073（你的输入）- 1000（安全缓冲）= 30999
+      // 留1000个token给系统提示词、工具调用元数据和对话历史
+      "max_tokens": 31000,
+
+      // Python代码最佳温度
+      "temperature": 0.25,
+      "top_p": 0.9,
+
+      // 禁用并行工具调用（减少系统提示词长度，节省约500 tokens）
+      "parallel_tool_calls": false,
+
+      // 增加重试次数
+      "max_retries": 5,
+      "timeout": 120000
+    },
+
+    // 【第二道防线】智能上下文策略，大幅减少输入tokens
+    "contextStrategy": "intelligent",
+
+    // Python项目必须包含的目录（只加载真正需要的代码）
+    "includePaths": [
+      "src/",
+      "app/",
+      "tests/",
+      "utils/",
+      "models/",
+      "schemas/",
+      "routers/",
+      "services/",
+      "core/"
+    ],
+
+    // 【最关键优化】排除所有绝对不会用到的文件（节省30%-50% tokens）
+    "excludePaths": [
+      // Python虚拟环境（最大的token浪费源）
+      ".venv/",
+      "venv/",
+      "env/",
+      "ENV/",
+      "__pypackages__/",
+
+      // Python缓存文件
+      "__pycache__/",
+      "*.pyc",
+      "*.pyo",
+      "*.pyd",
+
+      // 静态分析工具缓存
+      ".mypy_cache/",
+      ".dmypy.json",
+      ".pyre/",
+      ".pytype/",
+      ".pytest_cache/",
+      ".coverage",
+      "coverage/",
+      "htmlcov/",
+
+      // 构建和打包目录
+      "dist/",
+      "build/",
+      "*.egg-info/",
+      "eggs/",
+      "wheels/",
+
+      // 版本控制和IDE文件
+      ".git/",
+      ".vscode/",
+      ".idea/",
+      ".trae/",
+
+      // 日志和临时文件
+      "logs/",
+      "*.log",
+      "tmp/",
+      "temp/",
+
+      // 大型二进制文件
+      "*.zip",
+      "*.tar.gz",
+      "*.pdf",
+      "*.png",
+      "*.jpg",
+      "*.jpeg",
+      "*.gif",
+      "*.mp4",
+      "*.mp3",
+
+      // 数据文件（绝对不要让AI加载这些）
+      "data/",
+      "datasets/",
+      "models/weights/",
+      "checkpoints/",
+      "corpus/",
+
+      // 依赖锁文件（内容太长且很少需要修改）
+      "package-lock.json",
+      "yarn.lock",
+      "pnpm-lock.yaml",
+      "poetry.lock"
+    ],
+
+    // 【第三道防线】硬限制最大输入上下文
+    // 绝对不允许输入超过95000 tokens，留36000给输出和系统提示
+    "maxContextSize": 95000,
+
+    // 开启代码缓存（加速重复请求，减少token消耗）
+    "enableCodeCache": true,
+
+    // 【第四道防线】自动压缩对话历史
+    "autoCompactHistory": true,
+
+    // 当上下文使用率超过70%时自动提醒（提前预警）
+    "contextUsageWarningThreshold": 0.7,
+
+    // 优先加载关键配置文件（帮助AI快速理解项目）
+    "priorityFiles": [
+      "pyproject.toml",
+      "requirements.txt",
+      "setup.py",
+      "README.md",
+      "main.py",
+      "app.py"
+    ]
+  },
+
+  // Python编辑器优化
+  "editor": {
+    "inlineSuggest.enabled": true,
+    "inlineSuggest.delay": 300,
+    "formatOnSave": true,
+    "autoImport": true,
+    "tabSize": 4,
+    "insertSpaces": true
+  },
+
+  // Windows终端自动激活虚拟环境
+  "terminal": {
+    "shellArgs": ["-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& { if (Test-Path .venv/Scripts/Activate.ps1) { . .venv/Scripts/Activate.ps1 } }"]
+  }
+}

@@ -5,7 +5,7 @@
 from __future__ import annotations
 from typing import Optional
 
-from app.models import Quote, Alert, SentimentResult, AnalysisStats
+from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary
 from app.config import Config
 
 
@@ -137,6 +137,7 @@ def analyze(
     quotes: list[Quote],
     prev_state: dict,
     config: Config,
+    tech_summaries: dict[str, TechnicalSummary] | None = None,
 ) -> tuple[list[Alert], AnalysisStats]:
     """执行全部分析，返回异动列表和统计结果"""
     base = config.thresholds
@@ -230,6 +231,13 @@ def analyze(
         # ---- 振幅异常 ----
         if amp is not None and amp >= amp_warn:
             items.append(f"💫 振幅 {amp:.2f}%")
+
+        # ---- 技术指标信号 ----
+        if tech_summaries and q.code in tech_summaries:
+            tech = tech_summaries[q.code]
+            if tech.signals:
+                for sig in tech.signals:
+                    items.append(f"📐 {sig}")
 
         if items:
             alerts.append(Alert(code=q.code, name=q.name, messages=items))

@@ -189,6 +189,40 @@ class NorthFlowData:
 
 
 # ============================================================
+# K线与技术分析模型
+# ============================================================
+
+@dataclass
+class KlineData:
+    """单日K线数据"""
+    date: str = ""
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[float] = None
+
+
+@dataclass
+class TechnicalSummary:
+    """技术指标汇总"""
+    rsi: Optional[float] = None
+    rsi_signal: str = ""
+    macd_dif: Optional[float] = None
+    macd_dea: Optional[float] = None
+    macd_histogram: Optional[float] = None
+    macd_signal: str = ""
+    kdj_k: Optional[float] = None
+    kdj_d: Optional[float] = None
+    kdj_j: Optional[float] = None
+    kdj_signal: str = ""
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    atr: Optional[float] = None
+    signals: list[str] = field(default_factory=list)
+
+
+# ============================================================
 # 常量
 # ============================================================
 

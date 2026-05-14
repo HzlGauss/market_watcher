@@ -1,0 +1,369 @@
+"""
+技术分析模块 —— 纯 Python 实现常见技术指标
+
+不依赖 numpy/pandas，保持依赖最小。
+提供 K线数据获取、RSI、MACD、KDJ、支撑/压力位计算。
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+
+from app.models import KlineData, Quote, TechnicalSummary
+from app.http_client import sina_client
+from app.utils import log
+
+
+# ============================================================
+# K线数据获取
+# ============================================================
+
+def fetch_historical_kline(code: str, market: str, days: int = 30) -> list[KlineData]:
+    """从新浪财经获取日K线数据
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ/HK)
+        days: 获取天数
+
+    Returns:
+        K线数据列表（按日期升序）
+    """
+    prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
+    sina_code = f"{prefix}{code}"
+
+    url = (
+        f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&"
+        f"&ma=no&datalen={days}"
+    )
+
+    resp = sina_client.get(url)
+    if resp is None:
+        log.warning(f"K线数据获取失败: {code}")
+        return []
+
+    try:
+        data = resp.json()
+        if not data:
+            return []
+
+        results: list[KlineData] = []
+        for item in data:
+            results.append(KlineData(
+                date=item.get("day", ""),
+                open=_sf(item.get("open")),
+                high=_sf(item.get("high")),
+                low=_sf(item.get("low")),
+                close=_sf(item.get("close")),
+                volume=_sf(item.get("volume")),
+            ))
+        return results
+    except Exception as e:
+        log.warning(f"K线数据解析失败 {code}: {e}")
+        return []
+
+
+def _sf(val) -> Optional[float]:
+    """安全浮点转换"""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# EMA 辅助
+# ============================================================
+
+def _ema(values: list[float], period: int) -> list[float]:
+    """计算 EMA（指数移动平均）"""
+    if not values:
+        return []
+    multiplier = 2.0 / (period + 1)
+    ema_vals = [values[0]]
+    for i in range(1, len(values)):
+        ema_vals.append(values[i] * multiplier + ema_vals[-1] * (1 - multiplier))
+    return ema_vals
+
+
+# ============================================================
+# RSI —— 相对强弱指标
+# ============================================================
+
+def calc_rsi(closes: list[float], period: int = 14) -> Optional[float]:
+    """计算 RSI
+
+    Args:
+        closes: 收盘价序列
+        period: 周期（默认14）
+
+    Returns:
+        RSI 值 (0-100)，数据不足时返回 None
+    """
+    if len(closes) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    # 平滑处理后续值
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100.0 - 100.0 / (1 + rs), 2)
+
+
+def rsi_signal(rsi: Optional[float]) -> str:
+    """RSI 信号判断"""
+    if rsi is None:
+        return "数据不足"
+    if rsi >= 80:
+        return "严重超买"
+    if rsi >= 70:
+        return "超买"
+    if rsi <= 20:
+        return "严重超卖"
+    if rsi <= 30:
+        return "超卖"
+    return "中性"
+
+
+# ============================================================
+# MACD —— 指数平滑异同移动平均线
+# ============================================================
+
+@dataclass
+class MACDResult:
+    dif: Optional[float] = None
+    dea: Optional[float] = None
+    histogram: Optional[float] = None
+    signal: str = ""
+
+
+def calc_macd(closes: list[float], short: int = 12, long: int = 26, signal_period: int = 9) -> MACDResult:
+    """计算 MACD
+
+    Args:
+        closes: 收盘价序列
+        short: 快线周期
+        long: 慢线周期
+        signal_period: 信号线周期
+
+    Returns:
+        MACDResult 包含 DIF、DEA、柱状图和信号
+    """
+    if len(closes) < long + signal_period:
+        return MACDResult(signal="数据不足")
+
+    ema_short = _ema(closes, short)
+    ema_long = _ema(closes, long)
+
+    dif_vals = [s - l for s, l in zip(ema_short, ema_long)]
+    dea_vals = _ema(dif_vals, signal_period)
+
+    dif = round(dif_vals[-1], 4)
+    dea = round(dea_vals[-1], 4)
+    histogram = round(2 * (dif - dea), 4)
+
+    # 金叉 / 死叉判断（比较前一日和当日）
+    signal = "中性"
+    if len(dif_vals) >= 2 and len(dea_vals) >= 2:
+        prev_cross = dif_vals[-2] - dea_vals[-2]
+        curr_cross = dif_vals[-1] - dea_vals[-1]
+        if prev_cross <= 0 and curr_cross > 0:
+            signal = "金叉"
+        elif prev_cross >= 0 and curr_cross < 0:
+            signal = "死叉"
+        elif curr_cross > 0:
+            signal = "多头"
+        else:
+            signal = "空头"
+
+    return MACDResult(dif=dif, dea=dea, histogram=histogram, signal=signal)
+
+
+# ============================================================
+# KDJ —— 随机指标
+# ============================================================
+
+@dataclass
+class KDJResult:
+    k: Optional[float] = None
+    d: Optional[float] = None
+    j: Optional[float] = None
+    signal: str = ""
+
+
+def calc_kdj(highs: list[float], lows: list[float], closes: list[float], n: int = 9) -> KDJResult:
+    """计算 KDJ
+
+    Args:
+        highs: 最高价序列
+        lows: 最低价序列
+        closes: 收盘价序列
+        n: 周期（默认9）
+
+    Returns:
+        KDJResult 包含 K、D、J 和信号
+    """
+    length = min(len(highs), len(lows), len(closes))
+    if length < n:
+        return KDJResult(signal="数据不足")
+
+    # 计算 RSV 序列
+    rsv_vals = []
+    for i in range(n - 1, length):
+        hh = max(highs[i - n + 1: i + 1])
+        ll = min(lows[i - n + 1: i + 1])
+        if hh == ll:
+            rsv_vals.append(50.0)
+        else:
+            rsv = (closes[i] - ll) / (hh - ll) * 100
+            rsv_vals.append(rsv)
+
+    if not rsv_vals:
+        return KDJResult(signal="数据不足")
+
+    # SMA 计算 K 和 D
+    k_vals = [50.0]  # 初始值
+    d_vals = [50.0]  # 初始值
+    for rsv in rsv_vals:
+        k_vals.append(2 / 3 * k_vals[-1] + 1 / 3 * rsv)
+        d_vals.append(2 / 3 * d_vals[-1] + 1 / 3 * k_vals[-1])
+
+    k = round(k_vals[-1], 2)
+    d = round(d_vals[-1], 2)
+    j = round(3 * k - 2 * d, 2)
+
+    # 信号判断
+    signal = "中性"
+    if k >= 80 or j >= 100:
+        signal = "超买"
+    elif k <= 20 or j <= 0:
+        signal = "超卖"
+    elif len(k_vals) >= 2:
+        if k_vals[-2] < d_vals[-2] and k_vals[-1] > d_vals[-1]:
+            signal = "金叉"
+        elif k_vals[-2] > d_vals[-2] and k_vals[-1] < d_vals[-1]:
+            signal = "死叉"
+
+    return KDJResult(k=k, d=d, j=j, signal=signal)
+
+
+# ============================================================
+# 支撑 / 压力位
+# ============================================================
+
+@dataclass
+class SupportResistance:
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    atr: Optional[float] = None
+
+
+def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> SupportResistance:
+    """计算支撑位、压力位和 ATR
+
+    Args:
+        klines: K线数据
+        lookback: 回看天数
+
+    Returns:
+        SupportResistance 包含支撑、压力、ATR
+    """
+    if not klines:
+        return SupportResistance()
+
+    window = klines[-min(lookback, len(klines)):]
+
+    highs = [k.high for k in window if k.high is not None]
+    lows = [k.low for k in window if k.low is not None]
+
+    if not highs or not lows:
+        return SupportResistance()
+
+    resistance = max(highs)
+    support = min(lows)
+
+    # ATR 计算
+    true_ranges = []
+    for i in range(1, len(window)):
+        h = window[i].high
+        l = window[i].low
+        prev_c = window[i - 1].close
+        if h is not None and l is not None and prev_c is not None:
+            true_ranges.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+
+    atr = round(sum(true_ranges) / len(true_ranges), 4) if true_ranges else None
+
+    return SupportResistance(
+        support=round(support, 3),
+        resistance=round(resistance, 3),
+        atr=atr,
+    )
+
+
+# ============================================================
+# 汇总
+# ============================================================
+
+def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSummary:
+    """汇总所有技术指标
+
+    Args:
+        quote: 当前行情
+        klines: 历史K线数据
+
+    Returns:
+        TechnicalSummary 包含所有指标和文字信号
+    """
+    closes = [k.close for k in klines if k.close is not None]
+    highs = [k.high for k in klines if k.high is not None]
+    lows = [k.low for k in klines if k.low is not None]
+
+    rsi = calc_rsi(closes)
+    macd = calc_macd(closes)
+    kdj = calc_kdj(highs, lows, closes)
+    sr = calc_support_resistance(klines)
+
+    signals = []
+    if rsi and rsi_signal(rsi) in ("超买", "严重超买"):
+        signals.append(f"RSI超买({rsi})")
+    elif rsi and rsi_signal(rsi) in ("超卖", "严重超卖"):
+        signals.append(f"RSI超卖({rsi})")
+
+    if macd.signal in ("金叉", "死叉"):
+        signals.append(f"MACD{macd.signal}")
+    if kdj.signal in ("金叉", "死叉", "超买", "超卖"):
+        signals.append(f"KDJ{kdj.signal}")
+
+    return TechnicalSummary(
+        rsi=rsi,
+        rsi_signal=rsi_signal(rsi),
+        macd_dif=macd.dif,
+        macd_dea=macd.dea,
+        macd_histogram=macd.histogram,
+        macd_signal=macd.signal,
+        kdj_k=kdj.k,
+        kdj_d=kdj.d,
+        kdj_j=kdj.j,
+        kdj_signal=kdj.signal,
+        support=sr.support,
+        resistance=sr.resistance,
+        atr=sr.atr,
+        signals=signals,
+    )
