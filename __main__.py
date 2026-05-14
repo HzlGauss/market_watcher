@@ -12,6 +12,7 @@ from app.config import Config
 from app.data_fetcher import NorthFlowFetcher
 from app.reporter import generate_morning_brief, generate_midday_review, generate_evening_review
 from app.fund_analyzer import analyze_funds
+from app.broker_api import auto_update_holdings
 from app.presenter import Color
 from app.utils import log, ensure_dirs, load_env
 
@@ -61,15 +62,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}3{Color.RESET}. Evening Review")
     print(f"  {Color.CYAN}4{Color.RESET}. Monitor Mode (15 min interval)")
     print(f"  {Color.CYAN}5{Color.RESET}. Fund Analysis (Rating + Style + Manager Review)")
+    print(f"  {Color.CYAN}6{Color.RESET}. Update Holdings from Broker (东方财富)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-5]: ").strip()
-            if choice in ("0", "1", "2", "3", "4", "5"):
+            choice = input(f" Enter option [0-6]: ").strip()
+            if choice in ("0", "1", "2", "3", "4", "5", "6"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-5{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-6{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -291,6 +293,13 @@ def main() -> None:
                 print(f"{Color.DIM}Fund analysis report generated (see {result}){Color.RESET}")
             else:
                 log.error("Fund analysis failed, please check funds_config.json")
+        elif choice == "6":
+            log.info("Updating holdings from broker (东方财富)...")
+            success = auto_update_holdings()
+            if success:
+                print(f"{Color.GREEN}✅ Holdings updated successfully!{Color.RESET}")
+            else:
+                print(f"{Color.RED}❌ Failed to update holdings{Color.RESET}")
 
 
 if __name__ == "__main__":
