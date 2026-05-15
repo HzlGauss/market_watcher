@@ -41,7 +41,7 @@ def _build_prompt(
     nf = stats.north_flow
     if nf:
         lines.append("")
-        lines.append(f"## 北向资金: {nf.get('total_net', 0):+.0f}亿")
+        lines.append(f"## 北向资金: {nf.total_net:+.0f}亿")
 
     # 板块表现
     sectors: dict[str, list[float]] = {}

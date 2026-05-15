@@ -162,7 +162,7 @@ def generate_morning_brief(config: Config) -> Path | None:
 
     # Overnight US market
     if global_data:
-        lines.append("\n## 隔夜市场数据")
+        lines.append("\n## 隔夜市场数据（数据截至北京时间 05:00，仅供参考）")
         for k, v in global_data.items():
             lines.append(f"- {k}: {v}")
 
@@ -179,10 +179,10 @@ def generate_morning_brief(config: Config) -> Path | None:
         if holdings:
             h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
             if h_results:
-                lines.append(f"\n## 当前持仓概况 (Holdings)")
-                lines.append(f"- 总盈亏: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
+                lines.append(f"\n## 当前持仓概况（昨收价，开盘前参考）")
+                lines.append(f"- 浮亏/盈合计: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
                 for h in h_results[:5]: # Only show top 5 in brief
-                    lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%")
+                    lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%（昨收）")
 
     lines.append(f"""
 
@@ -322,10 +322,27 @@ def _analyze_capital_flow(quote: Quote) -> str:
     if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
         return "数据不足"
 
-    # 计算关键指标
     change_pct = quote.change_pct or 0
     amplitude = quote.amplitude or 0
     volume = quote.volume or 0
+    qtype = quote.type or ""
+
+    # 按标的类型设定阈值（ETF 振幅远小于个股）
+    is_etf = "ETF" in qtype
+    is_index = "指数" in qtype
+
+    if is_index:
+        amp_high = 1.0
+        amp_low = 0.3
+        pct_high = 0.5
+    elif is_etf:
+        amp_high = 1.5
+        amp_low = 0.6
+        pct_high = 1.0
+    else:
+        amp_high = 4.0
+        amp_low = 1.5
+        pct_high = 2.0
 
     # 日内位置百分比 (0-100)
     if quote.high > quote.low:
@@ -341,43 +358,43 @@ def _analyze_capital_flow(quote: Quote) -> str:
         gap_up = False
         gap_pct = 0
 
-    # 主力/散户判断逻辑
     signals = []
 
     # 放量上涨 = 主力入场信号
-    if change_pct > 1.5 and amplitude > 3:
+    if change_pct > pct_high and amplitude > amp_high:
         signals.append("主力资金入场")
 
     # 缩量上涨 = 散户行为或锁仓
-    elif change_pct > 1 and amplitude < 2:
+    elif change_pct > pct_high * 0.7 and amplitude < amp_low:
         signals.append("散户推动或锁仓上涨")
 
     # 放量下跌 = 主力出逃
-    elif change_pct < -1.5 and amplitude > 3:
+    elif change_pct < -pct_high and amplitude > amp_high:
         signals.append("主力资金出逃")
 
     # 缩量下跌 = 散户抛售或惜售
-    elif change_pct < -1 and amplitude < 2:
+    elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
         signals.append("散户抛售或惜售")
 
     # 高位收盘 + 放量 = 强势主力
-    if position > 80 and change_pct > 1:
+    if position > 80 and change_pct > pct_high * 0.7:
         if not signals:
             signals.append("强势资金主导")
         else:
             signals[0] = signals[0].replace("资金", "强势资金")
 
     # 低位收盘 + 放量 = 恐慌抛盘
-    elif position < 20 and change_pct < -1:
+    elif position < 20 and change_pct < -pct_high * 0.7:
         if not signals:
             signals.append("恐慌抛压")
 
     # 高开低走 = 主力出货
-    if gap_up and gap_pct > 1 and change_pct < 0:
+    if gap_up and gap_pct > pct_high * 0.7 and change_pct < 0:
         signals.append("高开低走，疑似出货")
 
     # 尾盘拉升 = 主力做盘
-    if position > 85 and change_pct > 0.5 and amplitude > 2:
+    tail_amp = amp_low if is_etf else 2.0
+    if position > 85 and change_pct > pct_high * 0.5 and amplitude > tail_amp:
         signals.append("尾盘拉升，主力做盘")
 
     if signals:

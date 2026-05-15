@@ -158,7 +158,7 @@ class AnalysisStats:
     thresholds: dict = field(default_factory=dict)
     base_thresholds: dict = field(default_factory=dict)
     dynamic_enabled: bool = False
-    north_flow: Optional[dict] = None
+    north_flow: Optional["NorthFlowData"] = None
     llm_result: Optional[str] = None
 
 

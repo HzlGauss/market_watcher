@@ -5,6 +5,7 @@
 from __future__ import annotations
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData
@@ -205,72 +206,73 @@ class NorthFlowFetcher:
 # ============================================================
 
 def fetch_global_markets() -> dict[str, str]:
-    """获取全球市场数据（美股、A50期货、港股、汇率）"""
-    result = {}
+    """获取全球市场数据（美股、A50期货、港股、汇率），并发请求加速"""
 
-    try:
-        # 获取美股数据
-        us_stocks = ["gb_USTECH", "gb_US30", "gb_US500"]
-        url = f"{SINA_API}{','.join(us_stocks)}"
+    def _fetch_us_stocks() -> dict[str, str]:
+        """获取美股三大指数"""
+        result: dict[str, str] = {}
+        url = f"{SINA_API}gb_USTECH,gb_US30,gb_US500"
         resp = sina_client.get(url)
+        if not resp:
+            return result
+        resp.encoding = "gbk"
+        for line in resp.text.split("\n"):
+            match = re.search(r'"([^"]+)"', line)
+            if not match:
+                continue
+            fields = match.group(1).split(",")
+            if len(fields) <= 3:
+                continue
+            if "USTECH" in line:
+                result["纳斯达克"] = f"{fields[3]} ({fields[4]}%)"
+            elif "US30" in line:
+                result["道琼斯"] = f"{fields[3]} ({fields[4]}%)"
+            elif "US500" in line:
+                result["标普500"] = f"{fields[3]} ({fields[4]}%)"
+        return result
 
-        if resp:
-            resp.encoding = "gbk"
-            text = resp.text
-            for line in text.split("\n"):
-                if "USTECH" in line:
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        fields = match.group(1).split(",")
-                        if len(fields) > 3:
-                            result["纳斯达克"] = f"{fields[3]} ({fields[4]}%)"
-                elif "US30" in line:
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        fields = match.group(1).split(",")
-                        if len(fields) > 3:
-                            result["道琼斯"] = f"{fields[3]} ({fields[4]}%)"
-                elif "US500" in line:
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        fields = match.group(1).split(",")
-                        if len(fields) > 3:
-                            result["标普500"] = f"{fields[3]} ({fields[4]}%)"
+    def _fetch_single(name: str, code: str, url: str) -> dict[str, str]:
+        """获取单个市场数据"""
+        resp = sina_client.get(url)
+        if not resp:
+            return {}
+        resp.encoding = "gbk"
+        match = re.search(r'"([^"]+)"', resp.text)
+        if not match:
+            return {}
+        fields = match.group(1).split(",")
+        if len(fields) > 3:
+            return {name: f"{fields[3]} ({fields[4]}%)"}
+        return {}
 
-        # 获取A50期货
-        a50_url = f"{SINA_API}gb_NQH2"
-        resp = sina_client.get(a50_url)
-        if resp:
-            resp.encoding = "gbk"
-            match = re.search(r'"([^"]+)"', resp.text)
-            if match:
-                fields = match.group(1).split(",")
-                if len(fields) > 3:
-                    result["A50期货"] = f"{fields[3]} ({fields[4]}%)"
+    def _fetch_forex() -> dict[str, str]:
+        """获取汇率"""
+        resp = sina_client.get(f"{SINA_API}fx_susdcny")
+        if not resp:
+            return {}
+        resp.encoding = "gbk"
+        match = re.search(r'"([^"]+)"', resp.text)
+        if not match:
+            return {}
+        fields = match.group(1).split(",")
+        if len(fields) > 1:
+            return {"汇率": f"USD/CNY {fields[1]}"}
+        return {}
 
-        # 获取恒生指数
-        hsi_url = f"{SINA_API}hkHSI"
-        resp = sina_client.get(hsi_url)
-        if resp:
-            resp.encoding = "gbk"
-            match = re.search(r'"([^"]+)"', resp.text)
-            if match:
-                fields = match.group(1).split(",")
-                if len(fields) > 3:
-                    result["恒生指数"] = f"{fields[3]} ({fields[4]}%)"
+    tasks = {
+        "us": lambda: _fetch_us_stocks(),
+        "a50": lambda: _fetch_single("A50期货", "gb_NQH2", f"{SINA_API}gb_NQH2"),
+        "hsi": lambda: _fetch_single("恒生指数", "hkHSI", f"{SINA_API}hkHSI"),
+        "forex": _fetch_forex,
+    }
 
-        # 获取汇率
-        forex_url = f"{SINA_API}fx_susdcny"
-        resp = sina_client.get(forex_url)
-        if resp:
-            resp.encoding = "gbk"
-            match = re.search(r'"([^"]+)"', resp.text)
-            if match:
-                fields = match.group(1).split(",")
-                if len(fields) > 1:
-                    result["汇率"] = f"USD/CNY {fields[1]}"
-
-    except Exception as e:
-        log.warning(f"全球市场数据获取失败: {e}")
+    result: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(task): name for name, task in tasks.items()}
+        for future in futures:
+            try:
+                result.update(future.result())
+            except Exception as e:
+                log.warning(f"全球市场数据[{futures[future]}]获取失败: {e}")
 
     return result

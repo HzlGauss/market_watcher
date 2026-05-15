@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -51,7 +52,7 @@ def _fetch_nav(code: str) -> dict | None:
         data = json.loads(match.group())
         if not isinstance(data, dict):
             return None
-            
+
         rows = data.get("Data", {}).get("LSJZList", [])
         if not rows:
             return None
@@ -69,24 +70,27 @@ def _fetch_nav(code: str) -> dict | None:
 
 
 def _fetch_all_navs(funds: list[dict]) -> list[dict]:
-    """批量获取所有基金净值"""
-    results = []
-    for f in funds:
-        nav = _fetch_nav(f["code"])
-        if nav:
-            results.append({
-                "code": f["code"],
-                "name": f["name"],
-                "manager": f.get("manager", ""),
-                **nav,
-            })
-        else:
-            results.append({
-                "code": f["code"],
-                "name": f["name"],
-                "manager": f.get("manager", ""),
-                "nav": None,
-            })
+    """批量获取所有基金净值（并发请求，max_workers=5 避免触发频率限制）"""
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_nav, f["code"]): f for f in funds}
+        for future in as_completed(futures):
+            f = futures[future]
+            nav = future.result()
+            if nav:
+                results.append({
+                    "code": f["code"],
+                    "name": f["name"],
+                    "manager": f.get("manager", ""),
+                    **nav,
+                })
+            else:
+                results.append({
+                    "code": f["code"],
+                    "name": f["name"],
+                    "manager": f.get("manager", ""),
+                    "nav": None,
+                })
     return results
 
 
@@ -144,9 +148,9 @@ def _fetch_mx_fund_data(funds: list[dict], config: Config) -> str:
 # AI 分析（DeepSeek）
 # ============================================================
 
-def _call_llm(prompt: str) -> str | None:
+def _call_llm(prompt: str, config: Config) -> str | None:
     """调用 DeepSeek 分析"""
-    llm = get_llm_client()
+    llm = get_llm_client(config)
     if not llm.enabled:
         return None
 
@@ -180,20 +184,20 @@ def analyze_funds(config: Config) -> Path | None:
                 row_num = 1  # 从1开始，因为标题行是第1行
                 for row in reader:
                     row_num += 1
-                    
+
                     # 确保code字段不为空
                     code_value = row.get("code", "").strip()
                     if not code_value:
                         log.warning(f"Skipping row {row_num} in funds.csv: code field is empty")
                         continue
-                    
+
                     # 处理空字段，设置为空字符串
                     for key, value in row.items():
                         if value is None:
                             row[key] = ""
                         elif isinstance(value, str) and value.strip() == "":
                             row[key] = ""
-                    
+
                     fund_list.append(row)
             log.info(f"Loaded {len(fund_list)} funds from funds.csv")
         except Exception as e:
@@ -326,7 +330,7 @@ def analyze_funds(config: Config) -> Path | None:
 
     # 5. 调用 AI
     log.info("  🤖 DeepSeek 分析中（约30秒）...")
-    content = _call_llm(prompt)
+    content = _call_llm(prompt, config)
 
     if not content:
         log.error("基金分析生成失败")

@@ -331,12 +331,12 @@ class BollingerResult:
 
 
 def _stddev(values: list[float]) -> float:
-    """计算标准差（不依赖 numpy）"""
+    """计算总体标准差（布林带使用总体标准差，除以 n）"""
     n = len(values)
     if n < 2:
         return 0.0
     mean = sum(values) / n
-    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    variance = sum((v - mean) ** 2 for v in values) / n
     return variance ** 0.5
 
 

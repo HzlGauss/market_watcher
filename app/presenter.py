@@ -102,7 +102,7 @@ def print_sentiment(stats: AnalysisStats) -> None:
     # 北向资金
     nf = stats.north_flow
     if nf:
-        net = nf.get("total_net", 0)
+        net = nf.total_net
         nf_color = Color.RED if net > 0 else (Color.GREEN if net < 0 else Color.DIM)
         total_str = f"{nf_color}北向:{net:+.0f}亿{Color.RESET}" if net != 0 else f"{Color.DIM}北向:待更新{Color.RESET}"
         print(f"{Color.CYAN}💵 资金流向:{Color.RESET}   {total_str}")
@@ -226,17 +226,15 @@ def save_brief(
     # 北向资金（追加）
     nf = stats.north_flow
     if nf:
-        hk2sh = nf.get("hk2sh", {})
-        hk2sz = nf.get("hk2sz", {})
-        net = hk2sh.get("balance", 0) + hk2sz.get("balance", 0)
+        net = nf.hk2sh_net + nf.hk2sz_net
         with open(str(filepath), "r", encoding="utf-8") as f:
             content = f.read()
         section = (
             f"\n\n## 💵 北向资金\n\n"
             f"| 方向 | 净买入(亿) | 余额度(亿) |\n"
             f"|------|----------|----------|\n"
-            f"| 沪股通 | {hk2sh.get('balance', 0):+.0f} | {hk2sh.get('quota', 0) / 10000:.0f} |\n"
-            f"| 深股通 | {hk2sz.get('balance', 0):+.0f} | {hk2sz.get('quota', 0) / 10000:.0f} |\n"
+            f"| 沪股通 | {nf.hk2sh_net:+.0f} | {nf.hk2sh_quota:.0f} |\n"
+            f"| 深股通 | {nf.hk2sz_net:+.0f} | {nf.hk2sz_quota:.0f} |\n"
             f"| **合计** | **{net:+.0f}亿** | |\n"
         )
         with open(str(filepath), "w", encoding="utf-8") as f:

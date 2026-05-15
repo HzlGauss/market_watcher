@@ -3,6 +3,7 @@
 
 import os
 import sys
+import json
 import time
 import logging
 from datetime import datetime
@@ -173,9 +174,24 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
 
     print_quotes_table(quotes)
 
+    # 加载上一周期成交量，用于量价对比
+    prev_state: dict = {}
+    if STATE_PATH.exists():
+        try:
+            prev_state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning(f"读取状态文件失败: {e}")
+
     # Analyze all quotes together (with technical signals)
-    alerts, stats = analyze(quotes, {}, config, tech_summaries)
+    alerts, stats = analyze(quotes, prev_state, config, tech_summaries, north_data=north_fetcher.fetch())
     print_sentiment(stats)
+
+    # 保存当前成交量，供下一周期量价分析
+    try:
+        cur_state = {q.code: {"volume": q.volume} for q in quotes if q.volume is not None}
+        STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"保存状态文件失败: {e}")
 
     # Print separate statistics
     if holdings_quotes:

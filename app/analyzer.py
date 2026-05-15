@@ -3,11 +3,20 @@
 """
 
 from __future__ import annotations
+import statistics
 from typing import Optional
 
-from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary
+from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData
 from app.config import Config
 
+
+# ============================================================
+# 情绪等级边界常量
+# ============================================================
+STRONG = 70       # 强势门槛
+SLIGHTLY_UP = 55  # 偏强门槛
+SLIGHTLY_DOWN = 40  # 偏弱门槛
+WEAK = 25         # 弱势门槛
 
 # ============================================================
 # 市场情绪评估
@@ -28,7 +37,7 @@ def calc_market_sentiment(quotes: list[Quote]) -> SentimentResult:
     pcts = [q.change_pct for q in valid]  # type: ignore
     n = len(pcts)
     up_ratio = sum(1 for p in pcts if p > 0) / n
-    median_pct = sorted(pcts)[n // 2]
+    median_pct = statistics.median(pcts)
     mean_pct = sum(pcts) / n
 
     # 标准差：衡量涨跌分化程度
@@ -83,21 +92,21 @@ def adjust_thresholds(
     score = sentiment.score
     t = dict(base)
 
-    if score >= 70:  # 强势：放宽涨跌幅阈值（更不敏感）
+    if score >= STRONG:  # 强势：放宽涨跌幅阈值（更不敏感）
         t["涨幅预警"] = base["涨幅预警"] + 1.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 1.0 * intensity
         t["跌幅预警"] = base["跌幅预警"] + 0.5 * intensity
         t["跌幅关注"] = base["跌幅关注"] + 0.3 * intensity
-    elif score >= 55:  # 偏强
+    elif score >= SLIGHTLY_UP:  # 偏强
         t["涨幅预警"] = base["涨幅预警"] + 0.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 0.3 * intensity
-    elif score <= 25:  # 弱势：收紧涨幅阈值、放宽跌幅阈值（更敏感）
+    elif score <= WEAK:  # 弱势：收紧涨幅阈值、放宽跌幅阈值（更敏感）
         t["涨幅预警"] = base["涨幅预警"] - 1.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] - 1.0 * intensity
         t["跌幅预警"] = base["跌幅预警"] + 0.5 * intensity
         t["跌幅关注"] = base["跌幅关注"] + 0.3 * intensity
         t["大跌预警"] = base["大跌预警"] + 1.0 * intensity
-    elif score <= 40:  # 偏弱
+    elif score <= SLIGHTLY_DOWN:  # 偏弱
         t["涨幅预警"] = base["涨幅预警"] - 0.5 * intensity
         t["跌幅预警"] = base["跌幅预警"] + 0.3 * intensity
 
@@ -147,6 +156,7 @@ def analyze(
     prev_state: dict,
     config: Config,
     tech_summaries: dict[str, TechnicalSummary] | None = None,
+    north_data: Optional["NorthFlowData"] = None,
 ) -> tuple[list[Alert], AnalysisStats]:
     """执行全部分析，返回异动列表和统计结果"""
     base = config.thresholds
@@ -261,5 +271,6 @@ def analyze(
         thresholds=thresholds,
         base_thresholds=base,
         dynamic_enabled=config.dynamic_threshold_enabled,
+        north_flow=north_data,
     )
     return alerts, stats
