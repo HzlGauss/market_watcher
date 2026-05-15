@@ -318,6 +318,71 @@ def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> Supp
 
 
 # ============================================================
+# 布林带（Bollinger Bands）
+# ============================================================
+
+@dataclass
+class BollingerResult:
+    upper: Optional[float] = None
+    middle: Optional[float] = None
+    lower: Optional[float] = None
+    width: Optional[float] = None
+    signal: str = ""
+
+
+def _stddev(values: list[float]) -> float:
+    """计算标准差（不依赖 numpy）"""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return variance ** 0.5
+
+
+def calc_bollinger(closes: list[float], period: int = 20, multiplier: float = 2.0) -> BollingerResult:
+    """计算布林带
+
+    Args:
+        closes: 收盘价序列
+        period: 周期（默认20）
+        multiplier: 标准差倍数（默认2.0）
+
+    Returns:
+        BollingerResult 包含上轨、中轨、下轨、带宽和信号
+    """
+    if len(closes) < period:
+        return BollingerResult(signal="数据不足")
+
+    window = closes[-period:]
+    middle = sum(window) / period
+
+    std = _stddev(window)
+    upper = middle + multiplier * std
+    lower = middle - multiplier * std
+    width = (upper - lower) / middle * 100 if middle > 0 else 0.0
+
+    price = closes[-1]
+    signal = "中性"
+    if price >= upper:
+        signal = "触及上轨"
+    elif price <= lower:
+        signal = "触及下轨"
+    elif price > middle:
+        signal = "偏强"
+    else:
+        signal = "偏弱"
+
+    return BollingerResult(
+        upper=round(upper, 3),
+        middle=round(middle, 3),
+        lower=round(lower, 3),
+        width=round(width, 2),
+        signal=signal,
+    )
+
+
+# ============================================================
 # 汇总
 # ============================================================
 
@@ -339,6 +404,7 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
     macd = calc_macd(closes)
     kdj = calc_kdj(highs, lows, closes)
     sr = calc_support_resistance(klines)
+    bb = calc_bollinger(closes)
 
     signals = []
     if rsi and rsi_signal(rsi) in ("超买", "严重超买"):
@@ -350,6 +416,10 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         signals.append(f"MACD{macd.signal}")
     if kdj.signal in ("金叉", "死叉", "超买", "超卖"):
         signals.append(f"KDJ{kdj.signal}")
+    if bb.signal == "触及上轨":
+        signals.append(f"布林触及上轨(带宽{bb.width}%)")
+    elif bb.signal == "触及下轨":
+        signals.append(f"布林触及下轨(带宽{bb.width}%)")
 
     return TechnicalSummary(
         rsi=rsi,
@@ -365,5 +435,10 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         support=sr.support,
         resistance=sr.resistance,
         atr=sr.atr,
+        bb_upper=bb.upper,
+        bb_middle=bb.middle,
+        bb_lower=bb.lower,
+        bb_width=bb.width,
+        bb_signal=bb.signal,
         signals=signals,
     )

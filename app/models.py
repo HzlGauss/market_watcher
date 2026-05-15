@@ -219,6 +219,11 @@ class TechnicalSummary:
     support: Optional[float] = None
     resistance: Optional[float] = None
     atr: Optional[float] = None
+    bb_upper: Optional[float] = None
+    bb_middle: Optional[float] = None
+    bb_lower: Optional[float] = None
+    bb_width: Optional[float] = None
+    bb_signal: str = ""
     signals: list[str] = field(default_factory=list)
 
 

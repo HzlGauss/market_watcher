@@ -19,22 +19,31 @@ def calc_market_sentiment(quotes: list[Quote]) -> SentimentResult:
     评分维度:
     - 涨跌比: 0-40分
     - 涨跌幅中位数: 0-40分
-    - 涨跌幅均值: 0-20分
+    - 分化度: 0-20分（标准差越小越一致，越有方向性）
     """
     valid = [q for q in quotes if q.change_pct is not None]
     if not valid:
         return SentimentResult()
 
     pcts = [q.change_pct for q in valid]  # type: ignore
-    up_ratio = sum(1 for p in pcts if p > 0) / len(pcts)
-    median_pct = sorted(pcts)[len(pcts) // 2]
-    mean_pct = sum(pcts) / len(pcts)
+    n = len(pcts)
+    up_ratio = sum(1 for p in pcts if p > 0) / n
+    median_pct = sorted(pcts)[n // 2]
+    mean_pct = sum(pcts) / n
+
+    # 标准差：衡量涨跌分化程度
+    if n >= 2:
+        std_pct = (sum((p - mean_pct) ** 2 for p in pcts) / (n - 1)) ** 0.5
+    else:
+        std_pct = 0.0
 
     ratio_score = up_ratio * 40
     median_score = max(0.0, min(40.0, (median_pct + 3) / 6 * 40))
-    mean_score = max(0.0, min(20.0, (mean_pct + 3) / 6 * 20))
+    # 标准差越小 → 市场越一致 → 方向性越强，分数更高
+    # std=0 → 20分，std=3 → 0分
+    std_score = max(0.0, min(20.0, 20.0 - std_pct / 3 * 20))
 
-    score = round(ratio_score + median_score + mean_score)
+    score = round(ratio_score + median_score + std_score)
     score = max(0, min(100, score))
 
     if score >= 75:
