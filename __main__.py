@@ -15,6 +15,7 @@ from app.fund_analyzer import analyze_funds
 from app.broker_api import auto_update_holdings
 from app.presenter import Color
 from app.utils import log, ensure_dirs, load_env
+from app.helpers import is_trading_time
 
 # Path definitions
 BASE_DIR = Path(__file__).resolve().parent
@@ -88,12 +89,6 @@ def _gen_report(report_type: str, config: Config,
     elif report_type == "Evening Review":
         log.info("Generating evening review...")
         generate_evening_review(config, north_fetcher)
-
-
-def _in_trading_hours(config: Config) -> bool:
-    """Check if current time is within trading hours"""
-    from app.helpers import is_trading_time
-    return is_trading_time(datetime.now(), config.sessions)[0]
 
 
 def _wait_until_next_slot(interval: int) -> None:
@@ -222,7 +217,7 @@ def _run_monitoring_loop(config: Config,
     first_run = True
     try:
         while True:
-            if _in_trading_hours(config):
+            if is_trading_time(datetime.now(), config.sessions)[0]:
                 _run_once(config, north_fetcher)
             else:
                 now = datetime.now()

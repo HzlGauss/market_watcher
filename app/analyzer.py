@@ -83,11 +83,11 @@ def adjust_thresholds(
     score = sentiment.score
     t = dict(base)
 
-    if score >= 70:  # 强势：放宽涨幅阈值、收紧跌幅阈值（更不敏感）
+    if score >= 70:  # 强势：放宽涨跌幅阈值（更不敏感）
         t["涨幅预警"] = base["涨幅预警"] + 1.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 1.0 * intensity
-        t["跌幅预警"] = base["跌幅预警"] - 0.5 * intensity
-        t["跌幅关注"] = base["跌幅关注"] - 0.3 * intensity
+        t["跌幅预警"] = base["跌幅预警"] + 0.5 * intensity
+        t["跌幅关注"] = base["跌幅关注"] + 0.3 * intensity
     elif score >= 55:  # 偏强
         t["涨幅预警"] = base["涨幅预警"] + 0.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 0.3 * intensity
