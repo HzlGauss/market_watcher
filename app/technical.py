@@ -239,9 +239,9 @@ def calc_kdj(highs: list[float], lows: list[float], closes: list[float], n: int 
         return KDJResult(signal="数据不足")
 
     # SMA 计算 K 和 D
-    k_vals = [50.0]  # 初始值
-    d_vals = [50.0]  # 初始值
-    for rsv in rsv_vals:
+    k_vals = [rsv_vals[0]]
+    d_vals = [rsv_vals[0]]
+    for rsv in rsv_vals[1:]:
         k_vals.append(2 / 3 * k_vals[-1] + 1 / 3 * rsv)
         d_vals.append(2 / 3 * d_vals[-1] + 1 / 3 * k_vals[-1])
 

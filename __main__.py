@@ -92,26 +92,8 @@ def _gen_report(report_type: str, config: Config,
 
 def _in_trading_hours(config: Config) -> bool:
     """Check if current time is within trading hours"""
-    now = datetime.now()
-    today = now.weekday()
-
-    if today >= 5:
-        return False
-
-    sessions = config.sessions
-    morning = sessions.get("上午", ["09:30", "11:30"])
-    afternoon = sessions.get("下午", ["13:00", "15:00"])
-
-    current_minutes = now.hour * 60 + now.minute
-
-    def time_to_minutes(time_str: str) -> int:
-        h, m = map(int, time_str.split(":"))
-        return h * 60 + m
-
-    am_start, am_end = time_to_minutes(morning[0]), time_to_minutes(morning[1])
-    pm_start, pm_end = time_to_minutes(afternoon[0]), time_to_minutes(afternoon[1])
-
-    return (am_start <= current_minutes <= am_end) or (pm_start <= current_minutes <= pm_end)
+    from app.helpers import is_trading_time
+    return is_trading_time(datetime.now(), config.sessions)[0]
 
 
 def _wait_until_next_slot(interval: int) -> None:
@@ -190,7 +172,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
         item = item_map.get(code)
         if not item:
             continue
-        klines = fetch_historical_kline(code, item.market, days=30)
+        klines = fetch_historical_kline(code, item.market, days=60)
         if klines:
             tech_summaries[code] = get_technical_summary(quote_map[code], klines)
 

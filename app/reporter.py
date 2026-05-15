@@ -105,7 +105,7 @@ def _push_report(title: str, content: str, config: Config) -> bool:
         url = f"/{config.sct_sendkey}.send"
         resp = serverchan_client.post(
             url,
-            data={"text": title, "desp": content},
+            data={"title": title, "desp": content},
             timeout=30
         )
         if resp is None:
@@ -319,7 +319,7 @@ def _analyze_capital_flow(quote: Quote) -> str:
     3. 日内位置：收盘接近高点且放量倾向于主力
     4. 振幅与波动：大幅波动且放量可能是主力博弈
     """
-    if not quote.price or not quote.open or not quote.high or not quote.low:
+    if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
         return "数据不足"
 
     # 计算关键指标

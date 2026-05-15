@@ -98,11 +98,22 @@ def auto_update_holdings(source: str = "eastmoney", cookie: str = "") -> bool:
         是否更新成功
     """
     log.info(f"开始自动更新持仓，数据源: {source}")
-    
+
     if source == "eastmoney":
+        if not cookie:
+            log.warning("=" * 60)
+            log.warning("⚠️  未提供东方财富登录 Cookie！")
+            log.warning("   当前为 MOCK 模式，将用演示数据覆盖 holdings.csv")
+            log.warning("   如需真实数据，请在调用时传入有效的 Cookie")
+            log.warning("=" * 60)
+            confirm = input("确认用演示数据覆盖 holdings.csv？[y/N]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                log.info("已取消操作")
+                return False
+
         api = EastMoneyAPI(cookie)
         return api.update_holdings_csv()
-    
+
     log.warning(f"不支持的数据源: {source}")
     return False
 
