@@ -69,6 +69,12 @@ class Quote:
         volume: 成交量
         amount: 成交额
         amplitude: 振幅 (%)
+        pe_ratio: 动态市盈率
+        pb_ratio: 市净率
+        market_cap: 总市值（元）
+        turnover_rate: 换手率 (%)
+        upper_limit: 涨停价
+        lower_limit: 跌停价
     """
     code: str = ""
     name: str = ""
@@ -83,6 +89,12 @@ class Quote:
     volume: Optional[float] = None
     amount: Optional[float] = None
     amplitude: Optional[float] = None
+    pe_ratio: Optional[float] = None
+    pb_ratio: Optional[float] = None
+    market_cap: Optional[float] = None
+    turnover_rate: Optional[float] = None
+    upper_limit: Optional[float] = None
+    lower_limit: Optional[float] = None
 
 
 @dataclass
@@ -160,6 +172,16 @@ class AnalysisStats:
     dynamic_enabled: bool = False
     north_flow: Optional["NorthFlowData"] = None
     llm_result: Optional[str] = None
+
+
+@dataclass
+class MarketNews:
+    """单条市场快讯"""
+    time: str = ""
+    title: str = ""
+    category: str = ""
+    content: str = ""
+    url: str = ""
 
 
 @dataclass

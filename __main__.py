@@ -103,7 +103,7 @@ def _wait_until_next_slot(interval: int) -> None:
         time.sleep(1)
 
 
-def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
+def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = True) -> None:
     """Run one scan cycle"""
     from app.data_fetcher import fetch_quotes
     from app.analyzer import analyze
@@ -207,13 +207,15 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher) -> None:
     if alerts:
         print_alerts(alerts)
 
-        if config.llm_enabled and config.deepseek_key:
-            llm_result = analyze_with_llm(quotes, alerts, stats, config)
+        if call_llm and config.llm_enabled and config.deepseek_key:
+            llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
 
             if config.push_enabled and config.sct_sendkey:
                 push_alert(alerts, stats, config, llm_result)
         else:
+            if not call_llm:
+                log.info("LLM 跳过（本轮不请求）")
             if config.push_enabled and config.sct_sendkey:
                 push_alert(alerts, stats, config)
     else:
@@ -231,10 +233,14 @@ def _run_monitoring_loop(config: Config,
     print()
 
     first_run = True
+    scan_count = 0
     try:
         while True:
             if is_trading_time(datetime.now(), config.sessions)[0]:
-                _run_once(config, north_fetcher)
+                scan_count += 1
+                # LLM 每两次扫描执行一次（第 2、4、6... 次）
+                call_llm = (scan_count % 2 == 0)
+                _run_once(config, north_fetcher, call_llm=call_llm)
             else:
                 now = datetime.now()
                 if first_run or now.minute % 15 == 0:

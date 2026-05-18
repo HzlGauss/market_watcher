@@ -1,9 +1,42 @@
 {
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "EMPTYTOKEN",
+    "ANTHROPIC_BASE_URL": "http://183.222.230.10:40101/anthropic/v1/messages",
+    "ANTHROPIC_MODEL": "chaos3.6-27b",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "chaos3.6-27b",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "chaos3.6-27b",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "chaos3.6-27b",
+    "ANTHROPIC_REASONING_MODEL": "chaos3.6-27b",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "chaos3.6-27b",
+    "CLAUDE_CODE_EFFORT_LEVEL": "medium"
+  },
   "permissions": {
     "allow": [
       "Bash(python -m pytest tests/test_technical.py -v)",
       "Bash(python -c \"print\\('hello'\\)\")",
-      "Bash(py -0)"
-    ]
-  }
+      "Bash(py -0)",
+      "Bash(curl -sL \"https://api.github.com/repos/TauricResearch/TradingAgents/contents/tradingagents/agents\")",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/technical_analyst.py\")",
+      "Bash(curl -sL \"https://api.github.com/repos/TauricResearch/TradingAgents/contents/tradingagents/agents/analysts\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/graph/trading_graph.py\")",
+      "Bash(curl -sL \"https://api.github.com/repos/TauricResearch/TradingAgents/contents/tradingagents/agents/analysts/technical_analyst.py\")",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/TauricResearch/TradingAgents/main/tradingagents/agents/analysts/market_analyst.py\")",
+      "Bash(curl -s -H \"Referer: https://finance.sina.com.cn\" \"https://hq.sinajs.cn/list=hf_NQ,hf_ES,hf_CL\")",
+      "Bash(iconv -f gbk -t utf-8)",
+      "WebFetch(domain:vip.stock.finance.sina.com.cn)",
+      "mcp__ccs-websearch__WebSearch",
+      "Bash(curl -s -H \"Referer: https://finance.sina.com.cn\" \"https://finance.sina.com.cn/futures/quotes/\")",
+      "Bash(curl *)",
+      "Bash(python3 -c \"import yfinance; print\\('yfinance available'\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 *)",
+      "Bash(python *)"
+    ],
+    "deny": []
+  },
+  "model": "opus",
+  "effortLevel": "medium",
+  "version": 1
 }

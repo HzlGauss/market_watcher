@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from app.config import Config
-from app.data_fetcher import fetch_quotes
+from app.data_fetcher import fetch_quotes, fetch_quotes_rich
 from app.analyzer import calc_market_sentiment
 from app.data_fetcher import fetch_global_markets
 from app.reporter import _save_report, _push_report
@@ -708,7 +708,7 @@ def _call_llm(prompt: str, config: Config) -> str | None:
     return llm.chat(
         prompt=prompt,
         system_prompt=SYSTEM_PROMPTS["fund_expert"],
-        max_tokens=2500,  # 增加token限制，支持更多基金分析
+        max_tokens=3500,
         temperature=0.3,
     )
 
@@ -794,7 +794,7 @@ def analyze_funds(config: Config) -> Path | None:
     # 2. 获取当前市场行情
     log.info("  获取当前市场风格...")
     watch_items = config.watch_items
-    quotes = fetch_quotes(watch_items)
+    quotes = fetch_quotes_rich(watch_items)
     sentiment = calc_market_sentiment(quotes) if quotes else None
 
     sectors_str = ""
@@ -875,7 +875,6 @@ def analyze_funds(config: Config) -> Path | None:
 
     # 加载评分历史并分析趋势
     rating_history = _load_rating_history()
-    today = datetime.now().strftime("%Y-%m-%d")
     warnings = []
 
     # 更新今日评分并分析趋势
@@ -985,6 +984,41 @@ def analyze_funds(config: Config) -> Path | None:
                 )
             fund_metrics_lines.append(f"**{f['name']}**{metrics_str}")
 
+    # 构建风格分析数据（从 Beta/Alpha 反推）
+    style_analysis = []
+    for f in funds_with_metrics:
+        bm = f.get("benchmark_metrics", {})
+        beta = bm.get("beta", "--")
+        alpha = bm.get("alpha", "--")
+
+        # 从 Beta 反推风格
+        if beta != "--" and beta != 0:
+            if beta > 1.2:
+                style = "高弹性/激进型（Beta>1.2，大盘涨时涨更多，跌时跌更深）"
+            elif beta > 0.8:
+                style = "市场同步型（Beta 0.8-1.2，与大盘基本同步）"
+            else:
+                style = "稳健型（Beta<0.8，波动小于大盘）"
+        else:
+            style = "数据不足，无法判断"
+
+        # 从 Alpha 判断超额收益能力
+        if alpha != "--":
+            if alpha > 5:
+                alpha_judge = "显著正 Alpha，基金经理创造稳定超额收益"
+            elif alpha > 0:
+                alpha_judge = "微弱正 Alpha，超额收益不明显"
+            elif alpha > -5:
+                alpha_judge = "微弱负 Alpha，略跑输基准"
+            else:
+                alpha_judge = "显著负 Alpha，持续跑输基准，需警惕"
+        else:
+            alpha_judge = "数据不足"
+
+        style_analysis.append(
+            f"- {f['name']}({f['code']}): {style} | {alpha_judge}"
+        )
+
     prompt = f"""今天是 {today}。请作为资深基金专家，为投资者生成一份**极具决策价值**的主动管理基金深度分析报告。
 
 ### 1. 核心输入数据
@@ -996,10 +1030,13 @@ def analyze_funds(config: Config) -> Path | None:
 - 全球市场参考: {global_str}
 
 **【待分析基金列表】**
-{chr(10).join(fund_table_lines)}
+{ "\n".join(fund_table_lines)}
 
 **【基金量化指标（近1年数据）】**
-{chr(10).join(fund_metrics_lines)}
+{ "\n".join(fund_metrics_lines)}
+
+**【风格与超额收益预分析】**
+{ "\n".join(style_analysis)}
 
 {"\n【权威深度数据（持仓/评级）】\n" + mx_data if mx_data else ""}
 
@@ -1020,14 +1057,31 @@ def analyze_funds(config: Config) -> Path | None:
 *风格匹配度说明：⭐(极差) 到 ⭐⭐⭐⭐⭐(完美契合)，需综合考虑量化指标和当前市场风格*
 *操作建议标签：【强力买入】、【分批加仓】、【继续持有】、【风险观望】、【逢高止盈】*
 
-#### **🔍 深度研判与经理点评**
+#### **🔍 深度研判与风格分析**
 请将基金进行分类或挑选重点进行点评（不需要逐一罗列，突出重点）：
-- **量化分析**：基于夏普比率、最大回撤、卡玛比率评估基金风险收益特征。
-- **基准对比**：分析超额收益和Alpha，判断基金经理是否创造了真正的超额收益。
-- **Beta分析**：评估基金的市场敏感度，Beta>1表示激进，Beta<1表示稳健。
-- **持仓体感分析**：直接点出基金目前的“真实体感”（例如：“这只基金本质上是在赌AI”、“这是一篮子红利资产”）。
-- **经理评价**：简述经理在当前环境下的应对能力，特别是相对基准的表现。
-- **风格契合度**：为什么给出的星级评价？（例如：“在半导体大跌时仍重仓，匹配度极低”）。
+
+##### a. 风格定位
+基于 Beta 系数和持仓特征，将基金归入以下三类之一：
+- **进攻型**（Beta > 1.2）：适合牛市/反弹行情
+- **均衡型**（Beta 0.8 - 1.2）：适合震荡市
+- **防御型**（Beta < 0.8）：适合熊市/避险行情
+
+##### b. 超额收益质量评估
+- 区分”运气”和”能力”：Alpha 是否稳定？还是靠某几只股票的偶然爆发？
+- 与基准的跟踪误差是否在合理范围内？
+
+##### c. 风格漂移检测
+对比基金的历史风格标签与最新 Beta 值：
+- 如果之前是防御型最近 Beta 突然变大，说明经理可能在做风格轮动
+- 如果风格与招募说明书不一致，标注”⚠️ 存在风格漂移风险”
+
+##### d. 持仓体感分析
+直接点出基金目前的”真实体感”（例如：”这只基金本质上是在赌AI”、”这是一篮子红利资产”）
+
+##### e. 操作建议
+每只基金给出具体建议，格式为”条件 → 行动”：
+- “如果市场风格切换到成长，该基金是优先加仓标的”
+- “如果该基金规模继续扩张至 100 亿以上，需重新评估其选股能力”
 
 #### **💡 总结建议**
 - 给出总体的仓位控制建议。
@@ -1038,7 +1092,14 @@ def analyze_funds(config: Config) -> Path | None:
 - 语言专业、辛辣、有洞察力，拒绝模棱两可。
 - 总字数控制在 2000 字以内（根据基金数量动态调整）。
 - 充分利用表格、列表、Emoji 和加粗语法提升可读性。
-- **必须**基于提供的量化指标和基准对比数据进行分析，不能凭空臆断。"""
+- **必须**基于提供的量化指标和基准对比数据进行分析，不能凭空臆断。
+
+---
+**置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
+- [高]：数据充分、指标一致、历史模式明确
+- [中]：数据尚可但存在分歧信号
+- [低]：数据不足或逻辑链条不完整
+**不确定性处理**：如果数据不足以支持判断，请直接输出"数据不足"而非强行给出结论。"""
 
     # 5. 调用 AI
     log.info("  🤖 DeepSeek 分析中（约30秒）...")

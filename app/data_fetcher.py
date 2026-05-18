@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -109,6 +109,9 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
 
             name = fields[0].strip() if fields[0] else ""
 
+            # 换手率在 fields[37]，需要足够字段数
+            turnover = _parse_float(fields[37]) if len(fields) > 37 else None
+
             results.append(Quote(
                 code=item.code,
                 name=name,
@@ -123,6 +126,7 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                 volume=_parse_float(fields[8]),
                 amount=_parse_float(fields[9]),
                 amplitude=amplitude,
+                turnover_rate=turnover,
             ))
 
         return results
@@ -130,6 +134,103 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
     except Exception as e:
         log.error(f"数据解析异常: {e}")
         return []
+
+
+# ============================================================
+# AKShare 数据源
+# ============================================================
+
+def _fetch_quotes_akshare(items: list[WatchItem]) -> list[Quote]:
+    """通过 AKShare 获取行情（东方财富后端，返回全市场数据后本地过滤）"""
+    import akshare as ak
+
+    df = ak.stock_zh_a_spot_em()
+
+    item_map = {item.code: item for item in items}
+    results: list[Quote] = []
+
+    for _, row in df.iterrows():
+        code = str(row["代码"])
+        if code not in item_map:
+            continue
+
+        item = item_map[code]
+        results.append(Quote(
+            code=code,
+            name=str(row.get("名称", "")),
+            type=item.type,
+            price=_parse_float(row.get("最新价")),
+            change_pct=_parse_float(row.get("涨跌幅")),
+            change_amt=_parse_float(row.get("涨跌额")),
+            pre_close=_parse_float(row.get("昨收")),
+            open=_parse_float(row.get("今开")),
+            high=_parse_float(row.get("最高")),
+            low=_parse_float(row.get("最低")),
+            volume=_parse_float(row.get("成交量")),
+            amount=_parse_float(row.get("成交额")),
+            amplitude=_parse_float(row.get("振幅")),
+            pe_ratio=_parse_float(row.get("市盈率(动态)")),
+            pb_ratio=_parse_float(row.get("市净率")),
+            market_cap=_parse_float(row.get("总市值")),
+            turnover_rate=_parse_float(row.get("换手率")),
+            upper_limit=_parse_float(row.get("涨停价")),
+            lower_limit=_parse_float(row.get("跌停价")),
+        ))
+
+    return results
+
+
+def fetch_quotes_rich(items: list[WatchItem]) -> list[Quote]:
+    """获取丰富字段行情（新浪主源 + AKShare 补查）
+
+    新浪财经稳定轻量，负责基础行情；
+    AKShare 补查 PE/PB/市值等额外字段，查不到时这些字段留 None。
+    """
+    if not items:
+        return []
+
+    quotes = fetch_quotes(items)
+    if not quotes:
+        log.warning("新浪财经无数据，尝试 AKShare...")
+        try:
+            return _fetch_quotes_akshare(items)
+        except ImportError:
+            log.debug("AKShare 未安装")
+        except Exception as e:
+            log.warning(f"AKShare 获取失败: {e}")
+        return []
+
+    try:
+        _enrich_from_akshare(quotes)
+    except Exception:
+        pass
+
+    return quotes
+
+
+def _enrich_from_akshare(quotes: list[Quote]) -> None:
+    """用 AKShare 补查 PE/PB/市值等丰富字段（原地修改）"""
+    import akshare as ak
+    from time import sleep
+
+    code_map = {q.code: q for q in quotes}
+
+    for code, q in code_map.items():
+        try:
+            df = ak.stock_zh_a_spot_individual_em(code)
+            if df.empty:
+                continue
+            row = df.iloc[0]
+            q.pe_ratio = _parse_float(row.get("市盈率(动态)"))
+            q.pb_ratio = _parse_float(row.get("市净率"))
+            q.market_cap = _parse_float(row.get("总市值"))
+            if q.turnover_rate is None:
+                q.turnover_rate = _parse_float(row.get("换手率"))
+            q.upper_limit = _parse_float(row.get("涨停价"))
+            q.lower_limit = _parse_float(row.get("跌停价"))
+            sleep(0.3)
+        except Exception:
+            continue
 
 
 # ============================================================
@@ -211,7 +312,7 @@ def fetch_global_markets() -> dict[str, str]:
     def _fetch_us_stocks() -> dict[str, str]:
         """获取美股三大指数"""
         result: dict[str, str] = {}
-        url = f"{SINA_API}gb_USTECH,gb_US30,gb_US500"
+        url = f"{SINA_API}gb_ixic,gb_dji,gb_inx"
         resp = sina_client.get(url)
         if not resp:
             return result
@@ -221,14 +322,14 @@ def fetch_global_markets() -> dict[str, str]:
             if not match:
                 continue
             fields = match.group(1).split(",")
-            if len(fields) <= 3:
+            if len(fields) < 3:
                 continue
-            if "USTECH" in line:
-                result["纳斯达克"] = f"{fields[3]} ({fields[4]}%)"
-            elif "US30" in line:
-                result["道琼斯"] = f"{fields[3]} ({fields[4]}%)"
-            elif "US500" in line:
-                result["标普500"] = f"{fields[3]} ({fields[4]}%)"
+            if "ixic" in line:
+                result["纳斯达克"] = f"{fields[1]} ({fields[2]}%)"
+            elif "dji" in line:
+                result["道琼斯"] = f"{fields[1]} ({fields[2]}%)"
+            elif "inx" in line:
+                result["标普500"] = f"{fields[1]} ({fields[2]}%)"
         return result
 
     def _fetch_single(name: str, code: str, url: str) -> dict[str, str]:
@@ -245,6 +346,25 @@ def fetch_global_markets() -> dict[str, str]:
             return {name: f"{fields[3]} ({fields[4]}%)"}
         return {}
 
+    def _fetch_a50_futures() -> dict[str, str]:
+        """通过东方财富获取A50期指当月连续"""
+        try:
+            resp = eastmoney_client.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={"secid": "104.CN00Y", "fields": "f2,f3,f14"},
+            )
+            if not resp:
+                return {}
+            data = resp.json()
+            d = (data or {}).get("data") or {}
+            price = d.get("f2")
+            chg_pct = d.get("f3")
+            if price is not None and chg_pct is not None:
+                return {"A50期指当月连续": f"{price:.2f} ({chg_pct:+.2f}%)"}
+        except Exception as e:
+            log.warning(f"A50期货数据获取失败: {e}")
+        return {}
+
     def _fetch_forex() -> dict[str, str]:
         """获取汇率"""
         resp = sina_client.get(f"{SINA_API}fx_susdcny")
@@ -259,11 +379,47 @@ def fetch_global_markets() -> dict[str, str]:
             return {"汇率": f"USD/CNY {fields[1]}"}
         return {}
 
+    def _fetch_us_treasury_yield() -> dict[str, str]:
+        """获取美国10年期国债收益率"""
+        try:
+            resp = eastmoney_client.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={"secid": "122.DXY_TL", "fields": "f2,f3"},
+            )
+            if not resp:
+                return {}
+            data = resp.json()
+            d = (data or {}).get("data") or {}
+            yield_val = d.get("f2")
+            if yield_val is not None:
+                return {"美债10Y收益率": f"{yield_val:.2f}%"}
+        except Exception as e:
+            log.warning(f"美债收益率获取失败: {e}")
+        return {}
+
+    def _fetch_hk_index() -> dict[str, str]:
+        """获取恒生指数（港股字段索引不同于美股/A股）"""
+        resp = sina_client.get(f"{SINA_API}hkHSI")
+        if not resp:
+            return {}
+        resp.encoding = "gbk"
+        match = re.search(r'"([^"]+)"', resp.text)
+        if not match:
+            return {}
+        fields = match.group(1).split(",")
+        # 港股格式: 名称,今开,昨收,现价,最高,最低,涨跌额,涨跌幅,...
+        if len(fields) > 7:
+            price = fields[3]
+            chg_pct = fields[7]
+            return {"恒生指数": f"{price} ({chg_pct}%)"}
+        return {}
+
     tasks = {
         "us": lambda: _fetch_us_stocks(),
-        "a50": lambda: _fetch_single("A50期货", "gb_NQH2", f"{SINA_API}gb_NQH2"),
-        "hsi": lambda: _fetch_single("恒生指数", "hkHSI", f"{SINA_API}hkHSI"),
+        "a50": _fetch_a50_futures,
+        "hsi": _fetch_hk_index,
         "forex": _fetch_forex,
+        "treasury": _fetch_us_treasury_yield,
     }
 
     result: dict[str, str] = {}
@@ -276,3 +432,64 @@ def fetch_global_markets() -> dict[str, str]:
                 log.warning(f"全球市场数据[{futures[future]}]获取失败: {e}")
 
     return result
+
+
+# ============================================================
+# 市场快讯
+# ============================================================
+
+def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> list[MarketNews]:
+    """获取指定时间窗口内的市场快讯
+
+    Args:
+        start_hour: 开始小时 (0-23)
+        end_hour:   结束小时 (0-23)
+        max_count:  最多返回条数
+
+    Returns:
+        快讯列表，按时间倒序。网络异常时返回空列表。
+    """
+    from datetime import datetime
+
+    url = "https://www.eastmoney.com/commweb/api/newsFlow"
+    params = {"client": "web", "channel": "65", "pageSize": str(max_count * 2)}
+
+    resp = eastmoney_client.get(url, params=params)
+    if resp is None:
+        return []
+
+    try:
+        data = resp.json()
+        items = (data or {}).get("data", []) or []
+    except Exception as e:
+        log.warning(f"快讯解析失败: {e}")
+        return []
+
+    news_list: list[MarketNews] = []
+    for item in items:
+        if not item.get("title"):
+            continue
+
+        ctime = item.get("ctime", "")
+        if not ctime:
+            continue
+
+        try:
+            news_time = datetime.strptime(ctime, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            news_time = datetime.now()
+
+        hour = news_time.hour
+        if start_hour <= hour < end_hour:
+            news_list.append(MarketNews(
+                time=f"{news_time.hour:02d}:{news_time.minute:02d}",
+                title=item["title"],
+                category=item.get("category", ""),
+                content=(item.get("content", "") or "")[:200],
+                url=item.get("url", ""),
+            ))
+
+        if len(news_list) >= max_count:
+            break
+
+    return news_list

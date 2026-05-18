@@ -19,7 +19,7 @@ from app.utils import log
 # ============================================================
 
 def fetch_historical_kline(code: str, market: str, days: int = 30) -> list[KlineData]:
-    """从新浪财经获取日K线数据
+    """获取日K线数据（新浪主源 + AKShare 兜底）
 
     Args:
         code: 股票代码
@@ -39,29 +39,50 @@ def fetch_historical_kline(code: str, market: str, days: int = 30) -> list[Kline
     )
 
     resp = sina_client.get(url)
-    if resp is None:
-        log.warning(f"K线数据获取失败: {code}")
-        return []
+    if resp is not None:
+        try:
+            data = resp.json()
+            if data:
+                results: list[KlineData] = []
+                for item in data:
+                    results.append(KlineData(
+                        date=item.get("day", ""),
+                        open=_sf(item.get("open")),
+                        high=_sf(item.get("high")),
+                        low=_sf(item.get("low")),
+                        close=_sf(item.get("close")),
+                        volume=_sf(item.get("volume")),
+                    ))
+                if results:
+                    return results
+        except Exception as e:
+            log.warning(f"K线数据解析失败 {code}: {e}")
 
+    # 新浪数据为空或解析失败，尝试 AKShare 兜底
     try:
-        data = resp.json()
-        if not data:
-            return []
-
-        results: list[KlineData] = []
-        for item in data:
-            results.append(KlineData(
-                date=item.get("day", ""),
-                open=_sf(item.get("open")),
-                high=_sf(item.get("high")),
-                low=_sf(item.get("low")),
-                close=_sf(item.get("close")),
-                volume=_sf(item.get("volume")),
-            ))
-        return results
+        import akshare as ak
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq", start_date="", end_date="")
+        if df is not None and not df.empty:
+            df = df.tail(days).reset_index(drop=True)
+            results = []
+            for _, row in df.iterrows():
+                results.append(KlineData(
+                    date=str(row.get("日期", "")),
+                    open=_sf(row.get("开盘")),
+                    high=_sf(row.get("最高")),
+                    low=_sf(row.get("最低")),
+                    close=_sf(row.get("收盘")),
+                    volume=_sf(row.get("成交量")),
+                ))
+            if results:
+                return results
+    except ImportError:
+        pass
     except Exception as e:
-        log.warning(f"K线数据解析失败 {code}: {e}")
-        return []
+        log.warning(f"AKShare K线数据获取失败 {code}: {e}")
+
+    log.warning(f"K线数据获取失败: {code}")
+    return []
 
 
 def _sf(val) -> Optional[float]:
@@ -380,6 +401,52 @@ def calc_bollinger(closes: list[float], period: int = 20, multiplier: float = 2.
         width=round(width, 2),
         signal=signal,
     )
+
+
+# ============================================================
+# 量价关系分析
+# ============================================================
+
+def analyze_volume_price(quote: Quote, klines: list[KlineData]) -> str:
+    """分析量价关系
+
+    对比今日成交量与 N 日均量，判断放量/缩量/平量，
+    结合涨跌方向给出量价关系标注。
+
+    Args:
+        quote: 当前行情
+        klines: 历史K线（含当日）
+
+    Returns:
+        量价关系描述字符串，如 "放量上涨", "缩量下跌", "平量震荡" 等
+    """
+    if not klines or quote.volume is None or quote.volume <= 0:
+        return "数据不足"
+
+    # 取近 10 日（不含当日）的平均成交量作为基准
+    hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
+    if len(hist) < 3:
+        return "数据不足"
+
+    avg_vol = sum(hist) / len(hist)
+    ratio = quote.volume / avg_vol if avg_vol > 0 else 1.0
+    change_pct = quote.change_pct or 0
+
+    # 量比标注
+    if ratio >= 1.5:
+        vol_label = "放量"
+    elif ratio <= 0.6:
+        vol_label = "缩量"
+    else:
+        vol_label = "平量"
+
+    # 结合方向
+    if change_pct > 0.5:
+        return f"{vol_label}上涨（量比{ratio:.2f}）"
+    elif change_pct < -0.5:
+        return f"{vol_label}下跌（量比{ratio:.2f}）"
+    else:
+        return f"{vol_label}震荡（量比{ratio:.2f}）"
 
 
 # ============================================================

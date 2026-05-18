@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.models import WatchItem, Quote, Holding
 from app.config import Config
-from app.data_fetcher import fetch_quotes, NorthFlowFetcher
+from app.data_fetcher import fetch_quotes, fetch_quotes_rich, NorthFlowFetcher
 from app.analyzer import analyze, calc_market_sentiment
 from app.utils import log
 from app.http_client import serverchan_client
@@ -76,9 +76,98 @@ def _holdings_summary(
     return results, total_pnl, total_cost
 
 
+def _get_holdings_tech_analysis(
+    holdings: list[Holding],
+    quotes: list[Quote],
+) -> list[dict]:
+    """获取持仓的技术分析数据（支撑/压力位、量价关系、技术指标）
+
+    返回每个持仓的技术分析字典列表。
+    网络异常时返回空列表。
+    """
+    from app.technical import (
+        fetch_historical_kline,
+        calc_support_resistance,
+        analyze_volume_price,
+        calc_rsi,
+        calc_macd,
+        calc_kdj,
+        rsi_signal,
+    )
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: list[dict] = []
+
+    def _fetch_one(h: Holding) -> dict | None:
+        quote = next((q for q in quotes if q.code == h.code), None)
+        if not quote:
+            return None
+
+        # 获取 30 日 K 线
+        klines = fetch_historical_kline(h.code, h.market, days=30)
+        if not klines:
+            return None
+
+        # 支撑/压力位
+        sr = calc_support_resistance(klines)
+
+        # 量价关系
+        vol_price = analyze_volume_price(quote, klines)
+
+        # 技术指标
+        closes = [k.close for k in klines if k.close is not None]
+        highs = [k.high for k in klines if k.high is not None]
+        lows = [k.low for k in klines if k.low is not None]
+
+        rsi_val = calc_rsi(closes)
+        macd = calc_macd(closes)
+        kdj = calc_kdj(highs, lows, closes)
+
+        return {
+            "name": h.name,
+            "code": h.code,
+            "price": quote.price,
+            "change_pct": quote.change_pct,
+            "support": sr.support,
+            "resistance": sr.resistance,
+            "atr": sr.atr,
+            "vol_price": vol_price,
+            "rsi": rsi_val,
+            "rsi_signal": rsi_signal(rsi_val) if rsi_val else "数据不足",
+            "macd_signal": macd.signal,
+            "macd_dif": macd.dif,
+            "kdj_signal": kdj.signal,
+            "kdj_k": kdj.k,
+            "volume": quote.volume,
+            "turnover": quote.turnover_rate,
+        }
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_fetch_one, h): h.code for h in holdings}
+        for future in futures:
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                log.warning(f"技术分析获取失败 [{futures[future]}]: {e}")
+
+    return results
+
+
 # ============================================================
 # Report Saving & Pushing
 # ============================================================
+
+SEPARATOR = "═" * 43
+
+
+def _build_report(data_section: str, llm_content: str | None) -> str:
+    """拼接数据区 + 分析区为完整报告"""
+    if llm_content:
+        return f"{data_section}\n\n{SEPARATOR}\n\n## AI 分析\n\n{llm_content}"
+    return data_section
+
 
 def _save_report(content: str, title: str, report_dir: Path) -> Path:
     """Save report to markdown file"""
@@ -119,15 +208,23 @@ def _push_report(title: str, content: str, config: Config) -> bool:
         return False
 
 
-def _call_llm(prompt: str, config: Config) -> str | None:
-    """Call LLM to generate analysis content"""
+def _call_llm(prompt: str, config: Config, role: str = "analyst", temperature: float = 0.3, max_tokens: int = 2000) -> str | None:
+    """Call LLM to generate analysis content
+
+    Args:
+        prompt: User prompt
+        config: Config object
+        role: System prompt role key (analyst/morning_brief/midday_review/evening_review)
+        temperature: Temperature parameter (0.3 default, 0.4 for morning_brief)
+        max_tokens: Max tokens for response
+    """
     if not config.llm_enabled or not config.deepseek_key:
         return None
 
     try:
         llm = get_llm_client(config)
-        system_prompt = SYSTEM_PROMPTS.get("analyst", "")
-        response = llm.chat(prompt, system_prompt=system_prompt, max_tokens=2000, timeout=120)
+        system_prompt = SYSTEM_PROMPTS.get(role, "")
+        response = llm.chat(prompt, system_prompt=system_prompt, max_tokens=max_tokens, temperature=temperature, timeout=120)
         return response
     except Exception as e:
         log.error(f"LLM call failed: {e}")
@@ -146,68 +243,149 @@ def generate_morning_brief(config: Config) -> Path | None:
 
     log.info("Generating morning brief...")
 
-    # 1. Get overnight market data
-    from app.data_fetcher import fetch_global_markets
+    # 1. Fetch data
+    from app.data_fetcher import fetch_global_markets, fetch_market_news
     global_data = fetch_global_markets()
-
-    # 2. Get yesterday's A股 data (fetch unique items)
+    morning_news = fetch_market_news(start_hour=0, end_hour=9, max_count=15)
     all_items = _get_unique_items(config)
-    quotes = fetch_quotes(all_items)
+    quotes = fetch_quotes_rich(all_items)
 
-    # 3. Build prompt
-    lines = [
-        f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}，A股即将开盘。"
-        f"请生成一份完整的早盘策略报告。"
-    ]
+    # 2. Build data section (shown in report)
+    data_lines = []
 
-    # Overnight US market
     if global_data:
-        lines.append("\n## 隔夜市场数据（数据截至北京时间 05:00，仅供参考）")
+        data_lines.append("## 一、隔夜市场（截至北京时间 05:00，仅供参考）")
         for k, v in global_data.items():
-            lines.append(f"- {k}: {v}")
+            data_lines.append(f"- {k}: {v}")
 
-    # Market sentiment from yesterday
+    if morning_news:
+        data_lines.append("\n## 二、早间要闻（供参考）")
+        for n in morning_news:
+            cat = f" [{n.category}]" if n.category else ""
+            data_lines.append(f"- [{n.time}]{cat} {n.title}")
+
     if quotes:
         watchlist_codes = {item.code for item in config.watch_items}
         watch_quotes = [q for q in quotes if q.code in watchlist_codes]
         sentiment = calc_market_sentiment(watch_quotes)
-        lines.append(f"\n## 昨日A股情绪")
-        lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
+        data_lines.append(f"\n## 三、昨日A股收盘数据")
+        data_lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
 
-        # Summary of holdings yesterday
+        index_quotes = [q for q in quotes if q.type == "指数"]
+        for idx in index_quotes:
+            close = f"{idx.price:.2f}" if idx.price else "--"
+            chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
+            data_lines.append(f"- {idx.name}: {close} ({chg})")
+
         holdings = config.holdings
         if holdings:
             h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
             if h_results:
-                lines.append(f"\n## 当前持仓概况（昨收价，开盘前参考）")
-                lines.append(f"- 浮亏/盈合计: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
-                for h in h_results[:5]: # Only show top 5 in brief
-                    lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%（昨收）")
+                data_lines.append(f"\n## 四、持仓概况（昨收，开盘前参考）")
+                data_lines.append(f"- 浮盈/亏合计: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
+                for h in h_results[:5]:
+                    data_lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%（昨收）")
 
-    lines.append(f"""
+    data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
-请作为首席策略师，基于以上数据生成一份结构化的早盘简报（约500字）：
+    # 4. Fetch technical analysis for holdings (for LLM prompt)
+    holdings = config.holdings
+    tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings and quotes else []
 
-1️⃣ **隔夜盘面解析**: 美股、A50及港股的表现对今日A股开盘的影响
-2️⃣ **今日走势研判**: 预计今日大盘的波动区间、关键压力位与支撑位
-3️⃣ **行业机会点**: 哪些板块今天可能受到消息面或隔夜行情的提振？
-4️⃣ **持仓应对策略**: 针对现有持仓，今日开盘后建议的操作策略
-5️⃣ **风险预警**: 今日盘中需重点防范的风险点
+    # 5. Build LLM prompt (compact data format)
+    llm_lines = [
+        f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}，A股即将开盘。"
+        f"请生成一份完整的早盘策略报告。"
+    ]
 
-要求：专业、简洁、有明确的操作导向。使用 Markdown 格式增强可读性。""")
+    if global_data:
+        llm_lines.append("\n[隔夜市场]")
+        for k, v in global_data.items():
+            llm_lines.append(f"  {k}: {v}")
 
-    content = _call_llm("\n".join(lines), config)
-    if not content:
-        log.warning("Morning brief generation failed")
-        return None
+    if morning_news:
+        llm_lines.append("\n[早间要闻]")
+        for n in morning_news:
+            llm_lines.append(f"  [{n.time}] {n.title}")
 
-    # Save
+    if quotes:
+        watchlist_codes = {item.code for item in config.watch_items}
+        watch_quotes = [q for q in quotes if q.code in watchlist_codes]
+        sentiment = calc_market_sentiment(watch_quotes)
+        llm_lines.append(f"\n[昨日A股] 情绪: {sentiment.score}/100 ({sentiment.label})")
+
+        index_quotes = [q for q in quotes if q.type == "指数"]
+        for idx in index_quotes:
+            close = f"{idx.price:.2f}" if idx.price else "--"
+            chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
+            llm_lines.append(f"  {idx.name}: {close} ({chg})")
+
+        h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes) if holdings else ([], 0, 0)
+        if h_results:
+            llm_lines.append(f"\n[持仓] 浮盈/亏: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
+            for h in h_results[:5]:
+                llm_lines.append(f"  {h['name']}: {h['pnl_pct']:+.2f}%")
+
+    if tech_data:
+        llm_lines.append("\n[持仓技术分析]")
+        for t in tech_data:
+            parts = [f"  {t['name']}:"]
+            if t['support']:
+                parts.append(f"支撑:{t['support']:.3f}")
+            if t['resistance']:
+                parts.append(f"压力:{t['resistance']:.3f}")
+            parts.append(f"量价:{t['vol_price']}")
+            if t['rsi']:
+                parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
+            parts.append(f"MACD:{t['macd_signal']}")
+            parts.append(f"KDJ:{t['kdj_signal']}")
+            llm_lines.append(" ".join(parts))
+
+    llm_lines.append(f"""
+
+请按以下结构生成早盘简报（约 600 字，关键判断标注置信度）：
+
+### 一、隔夜传导判断（置信度：[高/中/低]）
+- 隔夜美股/A50/港股/汇率的综合影响是正面、中性还是负面？
+- 推导逻辑：外盘涨跌 → 对应的 A 股传导链条是什么？
+
+### 二、今日走势推演
+给出两种情景及概率：
+- **基准情景（60%+）**：认为最可能的走势，给出波动区间参考
+- **风险情景（20-30%）**：如果什么超预期事件发生会导致走势偏离预期
+- **关键观察点**：开盘后前 30 分钟的量价特征
+
+### 三、持仓应对预案（表格形式）
+| 持仓 | 技术状态 | 若高开 | 若平开 | 若低开 | 止损位 |
+|------|---------|--------|--------|--------|--------|
+| ... | ... | ... | ... | ... | ... |
+
+### 四、风险预警
+今日最需要关注的 1-2 个风险点。
+
+要求：每一个判断都必须标注置信度。如果数据不足以支撑判断，如实说"数据不足"。使用 Markdown 格式增强可读性。
+
+---
+**置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
+- [高]：数据充分、指标一致、历史模式明确
+- [中]：数据尚可但存在分歧信号
+- [低]：数据不足或逻辑链条不完整
+**不确定性处理**：如果数据不足以支持判断，请直接输出"数据不足"而非强行给出结论。""")
+
+    # 6. Call LLM
+    llm_content = _call_llm("\n".join(llm_lines), config, role="morning_brief", temperature=0.4, max_tokens=2000)
+    if not llm_content:
+        log.warning("Morning brief: LLM generation failed")
+
+    # 7. Build complete report
+    report = _build_report(data_section, llm_content)
+
+    # 8. Save & push
     report_dir = Path(config.report_dir)
-    filepath = _save_report(content, "Morning Brief", report_dir)
+    filepath = _save_report(report, "Morning Brief", report_dir)
 
-    # Push
     push_title = f"Morning Brief {datetime.now().strftime('%m-%d')}"
-    _push_report(push_title, f"## Morning Strategy\n\n{content}", config)
+    _push_report(push_title, report, config)
 
     log.info(f"Morning brief generated: {filepath}")
     return filepath
@@ -225,63 +403,162 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
 
     log.info("Generating midday review...")
 
-    # Fetch quotes for both watchlist and holdings
+    # 1. Fetch data
     all_items = _get_unique_items(config)
-    quotes = fetch_quotes(all_items)
+    quotes = fetch_quotes_rich(all_items)
 
     if not quotes:
         log.warning("Midday review: No quote data")
         return None
 
-    # Separate quotes for analysis
     watchlist_codes = {item.code for item in config.watch_items}
     watch_quotes = [q for q in quotes if q.code in watchlist_codes]
-
     _, stats = analyze(watch_quotes, {}, config)
     nf = north_fetcher.fetch()
 
-    lines = [
-        f"It's now {datetime.now().strftime('%H:%M')}, morning trading has ended."
-        f"Please generate an A-share midday review report."
-    ]
+    from app.data_fetcher import fetch_market_news
+    morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
 
-    # Section 1: Morning Session Overview
-    lines.append(f"\n## 1. 午间行情概览")
-    lines.append(f"- 市场情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
-    lines.append(f"- 涨/跌/平盘数量: {stats.up} / {stats.down} / {stats.flat}")
+    # 2. Build data section
+    data_lines = []
+
+    if morning_news:
+        data_lines.append("## 一、上午快讯（供参考）")
+        for n in morning_news:
+            cat = f" [{n.category}]" if n.category else ""
+            data_lines.append(f"- [{n.time}]{cat} {n.title}")
+
+    data_lines.append(f"\n## 二、行情概览")
+    data_lines.append(f"- 情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
+    data_lines.append(f"- 涨/跌/平: {stats.up} / {stats.down} / {stats.flat}")
     if nf:
-        lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
+        data_lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
 
-    # Section 2: Watchlist Performance
     sorted_q = sorted(watch_quotes, key=lambda q: (q.change_pct or 0), reverse=True)
-    lines.append("\n## 2. 核心观察标的 (Watchlist)")
-    lines.append("### 涨幅榜前5:")
+    data_lines.append("\n## 三、自选标的排行")
+    data_lines.append("### 涨幅前5:")
     for q in sorted_q[:5]:
         if q.change_pct is not None:
-            lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
+            detail = f"- {q.name}: {q.change_pct:+.2f}%"
+            if q.pe_ratio is not None:
+                detail += f" | PE:{q.pe_ratio:.1f}"
+            if q.market_cap is not None:
+                detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
+            if q.turnover_rate is not None:
+                detail += f" | 换手:{q.turnover_rate:.2f}%"
+            data_lines.append(detail)
 
-    lines.append("### 跌幅榜前5:")
+    data_lines.append("### 跌幅前5:")
     for q in sorted_q[-5:]:
         if q.change_pct is not None:
-            lines.append(f"- {q.name}: {q.change_pct:+.2f}%")
+            detail = f"- {q.name}: {q.change_pct:+.2f}%"
+            if q.pe_ratio is not None:
+                detail += f" | PE:{q.pe_ratio:.1f}"
+            if q.market_cap is not None:
+                detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
+            if q.turnover_rate is not None:
+                detail += f" | 换手:{q.turnover_rate:.2f}%"
+            data_lines.append(detail)
 
-    # Section 3: Personal Holdings Analysis
     holdings = config.holdings
     if holdings:
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
         if h_results:
-            lines.append(f"\n## 3. 个人持仓表现 (Holdings)")
-            lines.append(f"- 持仓总成本: {total_cost:,.2f} | 午间总盈亏: {total_pnl:+,.2f}")
+            data_lines.append(f"\n## 四、持仓午间扫描")
+            data_lines.append(f"- 总成本: {total_cost:,.2f} | 午间总盈亏: {total_pnl:+,.2f}")
             for h in h_results:
                 color = "🟢" if h["pnl"] >= 0 else "🔴"
-                lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%)")
+                data_lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%)")
 
-    lines.append(f"""
+    # Technical analysis for holdings
+    tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings else []
+    if tech_data:
+        data_lines.append("\n## 五、持仓技术分析")
+        data_lines.append("")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位 | 压力位 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|--------|--------|-----|----------|-----|------|-----|--------|--------|")
+        for t in tech_data:
+            price = f"{t['price']:.3f}" if t.get('price') else "--"
+            chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
+            sup = f"{t['support']:.3f}" if t['support'] else "--"
+            res = f"{t['resistance']:.3f}" if t['resistance'] else "--"
+            atr = f"{t['atr']:.3f}" if t['atr'] else "--"
+            rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
+            macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
+            kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
+            vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
+            tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+
+    data_section = "\n".join(data_lines) if data_lines else "暂无数据"
+
+    # 3. Build LLM prompt (compact)
+    llm_lines = [
+        f"现在是 {datetime.now().strftime('%Y-%m-%d %H:%M')}，上午交易结束。"
+        f"请生成一份A股午评报告。"
+    ]
+
+    if morning_news:
+        llm_lines.append("\n[上午快讯]")
+        for n in morning_news:
+            llm_lines.append(f"  [{n.time}] {n.title}")
+
+    llm_lines.append(f"\n[行情] 情绪: {stats.sentiment.score}/100 ({stats.sentiment.label}), 涨跌平: {stats.up}/{stats.down}/{stats.flat}")
+    if nf:
+        llm_lines.append(f"  北向: {nf.total_net:+.2f}亿")
+
+    llm_lines.append("\n[自选-涨幅前5]")
+    for q in sorted_q[:5]:
+        if q.change_pct is not None:
+            detail = f"  {q.name}: {q.change_pct:+.2f}%"
+            if q.pe_ratio is not None:
+                detail += f" PE:{q.pe_ratio:.1f}"
+            if q.market_cap is not None:
+                detail += f" 市值:{q.market_cap/1e4:.0f}亿"
+            if q.turnover_rate is not None:
+                detail += f" 换手:{q.turnover_rate:.2f}%"
+            llm_lines.append(detail)
+
+    llm_lines.append("[自选-跌幅前5]")
+    for q in sorted_q[-5:]:
+        if q.change_pct is not None:
+            detail = f"  {q.name}: {q.change_pct:+.2f}%"
+            if q.pe_ratio is not None:
+                detail += f" PE:{q.pe_ratio:.1f}"
+            if q.market_cap is not None:
+                detail += f" 市值:{q.market_cap/1e4:.0f}亿"
+            if q.turnover_rate is not None:
+                detail += f" 换手:{q.turnover_rate:.2f}%"
+            llm_lines.append(detail)
+
+    if holdings:
+        h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
+        if h_results:
+            llm_lines.append(f"\n[持仓] 总盈亏: {total_pnl:+,.2f}")
+            for h in h_results:
+                llm_lines.append(f"  {h['name']}: {h['pnl_pct']:+.2f}%")
+
+    if tech_data:
+        llm_lines.append("\n[技术分析]")
+        for t in tech_data:
+            parts = [f"  {t['name']}:"]
+            if t['support']:
+                parts.append(f"支撑:{t['support']:.3f}")
+            if t['resistance']:
+                parts.append(f"压力:{t['resistance']:.3f}")
+            parts.append(f"量价:{t['vol_price']}")
+            if t['rsi']:
+                parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
+            parts.append(f"MACD:{t['macd_signal']}")
+            parts.append(f"KDJ:{t['kdj_signal']}")
+            llm_lines.append(" ".join(parts))
+
+    llm_lines.append(f"""
 
 请作为资深策略分析师，基于以上午盘数据，生成一份结构清晰的午评报告（约500字）：
 
 1️⃣ **上午盘面总结**: 描述上午走势的特征（如冲高回落、缩量震荡等），点出主要影响因素
-2️⃣ **热点与异动**: 观察标的中哪些板块或个股表现突出或异常，分析其原因
+2️⃣ **热点与异动**: 观察标的中哪些板块或个股表现突出或异常，结合换手率和市值判断市场风格
 3️⃣ **持仓午间扫描**: 针对个人持仓（Holdings），简述其上午的表现，是否出现风险信号
 4️⃣ **下午走势预测**: 基于上午的情绪和资金流向，预测下午的可能走势
 5️⃣ **午间操作建议**: 下午是否需要进行调仓（补仓/减仓），给出具体的触发条件
@@ -289,17 +566,27 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
 要求：
 - 视角：专业、敏锐，重点在于"预测下午"和"给出建议"。
 - 格式：使用 Markdown 增强可读性，区分"自选"和"持仓"。
-- 语气：务实，不拖泥带水。""")
+- 语气：务实，不拖泥带水。
 
-    content = _call_llm("\n".join(lines), config)
-    if not content:
-        return None
+---
+**置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
+- [高]：数据充分、指标一致、历史模式明确
+- [中]：数据尚可但存在分歧信号
+- [低]：数据不足或逻辑链条不完整
+**不确定性处理**：如果数据不足以支持判断，请直接输出"数据不足"而非强行给出结论。""")
 
+    # 4. Call LLM
+    llm_content = _call_llm("\n".join(llm_lines), config, role="midday_review", temperature=0.3, max_tokens=1500)
+    if not llm_content:
+        log.warning("Midday review: LLM generation failed")
+
+    # 5. Build & save
+    report = _build_report(data_section, llm_content)
     report_dir = Path(config.report_dir)
-    filepath = _save_report(content, "Midday Review", report_dir)
+    filepath = _save_report(report, "Midday Review", report_dir)
 
     push_title = f"Midday Review {datetime.now().strftime('%m-%d')}"
-    _push_report(push_title, f"## Midday Update\n\n{content}", config)
+    _push_report(push_title, report, config)
 
     log.info(f"Midday review generated: {filepath}")
     return filepath
@@ -309,98 +596,88 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
 # Evening Review 16:00
 # ============================================================
 
-def _analyze_capital_flow(quote: Quote) -> str:
-    """
-    分析个股资金流向，判断主力/散户行为
+def _simple_attribution(h_results: list[dict], market_return: float | None) -> dict:
+    """简单的持仓归因：将持仓收益拆解为 β（市场）和 α（选股）部分
 
-    判断依据：
-    1. 量价关系：放量上涨倾向于主力入场，缩量上涨可能是散户行为
-    2. 开盘表现：高开高走且放量可能是主力
-    3. 日内位置：收盘接近高点且放量倾向于主力
-    4. 振幅与波动：大幅波动且放量可能是主力博弈
+    Args:
+        h_results: _holdings_summary 的返回结果列表
+        market_return: 大盘当日涨跌幅（小数，如 0.02 表示 2%），为 None 时跳过归因
+
+    Returns:
+        包含 beta_pnl, alpha_pnl, total_pnl 的字典
     """
+    total_pnl = sum(h["pnl"] for h in h_results)
+    total_cost = sum(h["cost"] * h["amount"] for h in h_results)
+
+    if market_return is not None and total_cost > 0:
+        beta_pnl = total_cost * market_return
+        alpha_pnl = total_pnl - beta_pnl
+        return {
+            "beta_pnl": round(beta_pnl, 2),
+            "alpha_pnl": round(alpha_pnl, 2),
+            "total_pnl": round(total_pnl, 2),
+        }
+    return {
+        "beta_pnl": None,
+        "alpha_pnl": None,
+        "total_pnl": round(total_pnl, 2),
+    }
+
+
+def _analyze_capital_flow(quote: Quote) -> str:
+    """分析个股资金流向，判断主力/散户行为"""
     if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
         return "数据不足"
 
     change_pct = quote.change_pct or 0
     amplitude = quote.amplitude or 0
-    volume = quote.volume or 0
     qtype = quote.type or ""
 
-    # 按标的类型设定阈值（ETF 振幅远小于个股）
     is_etf = "ETF" in qtype
     is_index = "指数" in qtype
 
     if is_index:
-        amp_high = 1.0
-        amp_low = 0.3
-        pct_high = 0.5
+        amp_high, amp_low, pct_high = 1.0, 0.3, 0.5
     elif is_etf:
-        amp_high = 1.5
-        amp_low = 0.6
-        pct_high = 1.0
+        amp_high, amp_low, pct_high = 1.5, 0.6, 1.0
     else:
-        amp_high = 4.0
-        amp_low = 1.5
-        pct_high = 2.0
+        amp_high, amp_low, pct_high = 4.0, 1.5, 2.0
 
-    # 日内位置百分比 (0-100)
     if quote.high > quote.low:
         position = ((quote.price - quote.low) / (quote.high - quote.low)) * 100
     else:
         position = 50
 
-    # 开盘溢价
-    if quote.open > quote.pre_close:
-        gap_up = True
-        gap_pct = ((quote.open - quote.pre_close) / quote.pre_close) * 100
-    else:
-        gap_up = False
-        gap_pct = 0
-
+    gap_up = quote.open > quote.pre_close
+    gap_pct = ((quote.open - quote.pre_close) / quote.pre_close * 100) if gap_up else 0
     signals = []
 
-    # 放量上涨 = 主力入场信号
     if change_pct > pct_high and amplitude > amp_high:
         signals.append("主力资金入场")
-
-    # 缩量上涨 = 散户行为或锁仓
     elif change_pct > pct_high * 0.7 and amplitude < amp_low:
         signals.append("散户推动或锁仓上涨")
-
-    # 放量下跌 = 主力出逃
     elif change_pct < -pct_high and amplitude > amp_high:
         signals.append("主力资金出逃")
-
-    # 缩量下跌 = 散户抛售或惜售
     elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
         signals.append("散户抛售或惜售")
 
-    # 高位收盘 + 放量 = 强势主力
     if position > 80 and change_pct > pct_high * 0.7:
         if not signals:
             signals.append("强势资金主导")
         else:
             signals[0] = signals[0].replace("资金", "强势资金")
-
-    # 低位收盘 + 放量 = 恐慌抛盘
     elif position < 20 and change_pct < -pct_high * 0.7:
         if not signals:
             signals.append("恐慌抛压")
 
-    # 高开低走 = 主力出货
     if gap_up and gap_pct > pct_high * 0.7 and change_pct < 0:
         signals.append("高开低走，疑似出货")
 
-    # 尾盘拉升 = 主力做盘
     tail_amp = amp_low if is_etf else 2.0
     if position > 85 and change_pct > pct_high * 0.5 and amplitude > tail_amp:
         signals.append("尾盘拉升，主力做盘")
 
-    if signals:
-        return "; ".join(signals)
-    else:
-        return "资金面中性"
+    return "; ".join(signals) if signals else "资金面中性"
 
 
 def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> Path | None:
@@ -420,7 +697,7 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
         WatchItem(name=h.name, code=h.code, market=h.market, type="持仓股")
         for h in holdings
     ]
-    quotes = fetch_quotes(holding_items)
+    quotes = fetch_quotes_rich(holding_items)
 
     if not quotes:
         log.warning("Evening review: No quote data")
@@ -428,24 +705,38 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
 
     nf = north_fetcher.fetch()
 
-    lines = [
-        f"Market closed. Today is {datetime.now().strftime('%Y-%m-%d %H:%M')}, "
-        f"Please generate a holdings-focused daily review report."
-    ]
+    # 获取大盘当日涨跌幅，用于 β/α 归因
+    market_return = None
+    try:
+        from app.config import Config as _Cfg
+        # 用沪深300作为大盘基准
+        market_items = [WatchItem(name="沪深300", code="000300", market="sh", type="指数")]
+        market_quotes = fetch_quotes_rich(market_items)
+        if market_quotes and market_quotes[0].change_pct is not None:
+            market_return = market_quotes[0].change_pct / 100  # 转为小数
+    except Exception:
+        pass
 
-    # Section 1: Market Background
-    lines.append(f"\n## 1. 市场背景")
+    from app.data_fetcher import fetch_market_news
+    day_news = fetch_market_news(start_hour=9, end_hour=16, max_count=10)
+
+    # 2. Build data section
+    data_lines = []
+
+    if day_news:
+        data_lines.append("## 一、盘中快讯（供参考）")
+        for n in day_news:
+            cat = f" [{n.category}]" if n.category else ""
+            data_lines.append(f"- [{n.time}]{cat} {n.title}")
+
+    data_lines.append(f"\n## 二、市场背景")
     if nf:
-        lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
+        data_lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
     else:
-        lines.append("- 北向资金: 暂无数据")
+        data_lines.append("- 北向资金: 暂无数据")
 
-    # Section 2: Personal Holdings Analysis with Capital Flow
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     if h_results:
-        lines.append(f"\n## 2. 个人持仓表现 (Holdings)")
-        lines.append(f"- 持仓总成本: {total_cost:,.2f} | 今日总盈亏: {total_pnl:+,.2f}")
-
         holdings_with_analysis = []
         for h in h_results:
             quote = next((q for q in quotes if q.code == h["code"]), None)
@@ -459,7 +750,6 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
                         tech_info.append("处于日内低位")
                     else:
                         tech_info.append("日内震荡")
-
                 if quote.amplitude and quote.amplitude > 3:
                     tech_info.append("波动较大")
                 if quote.change_pct:
@@ -468,55 +758,168 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
                     elif quote.change_pct < -2:
                         tech_info.append("走势疲软")
 
-                # 新增：资金流向分析
                 capital_flow = _analyze_capital_flow(quote)
-
                 holdings_with_analysis.append({
                     **h,
                     "quote": quote,
                     "tech": ", ".join(tech_info),
-                    "capital_flow": capital_flow
+                    "capital_flow": capital_flow,
                 })
 
-        lines.append("\n### 2.1 持仓详情")
+        data_lines.append(f"\n## 三、持仓表现")
+        data_lines.append(f"- 总成本: {total_cost:,.2f} | 今日总盈亏: {total_pnl:+,.2f}")
+
+        data_lines.append("\n### 3.1 持仓详情")
         for h in holdings_with_analysis:
             color = "🟢" if h["pnl"] >= 0 else "🔴"
             tech_note = f" [{h['tech']}]" if h.get("tech") else ""
-            lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%){tech_note}")
+            data_lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%){tech_note}")
 
-        # 新增：资金流向分析报告
-        lines.append("\n### 2.2 资金流向分析（主力/散户）")
+        has_rich = any(h.get("quote", {}).pe_ratio is not None for h in holdings_with_analysis)
+        if has_rich:
+            data_lines.append("\n### 3.2 估值与市值")
+            for h in holdings_with_analysis:
+                q = h.get("quote")
+                if q and (q.pe_ratio is not None or q.market_cap is not None or q.turnover_rate is not None):
+                    parts = []
+                    if q.pe_ratio is not None:
+                        parts.append(f"PE:{q.pe_ratio:.1f}")
+                    if q.pb_ratio is not None:
+                        parts.append(f"PB:{q.pb_ratio:.2f}")
+                    if q.market_cap is not None:
+                        parts.append(f"市值:{q.market_cap/1e4:.0f}亿")
+                    if q.turnover_rate is not None:
+                        parts.append(f"换手:{q.turnover_rate:.2f}%")
+                    data_lines.append(f"  - {h['name']}({h['code']}): {', '.join(parts)}")
+
+        data_lines.append("\n### 3.3 资金流向（主力/散户）")
         for h in holdings_with_analysis:
             flow_color = "🔵" if "主力" in h["capital_flow"] else "⚪"
-            lines.append(f"  {flow_color} {h['name']}({h['code']}): {h['capital_flow']}")
+            data_lines.append(f"  {flow_color} {h['name']}({h['code']}): {h['capital_flow']}")
 
-    lines.append(f"""
+    # Technical analysis for holdings
+    tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
+    if tech_data_evening:
+        data_lines.append("\n## 四、持仓技术分析")
+        data_lines.append("")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位 | 压力位 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|--------|--------|-----|----------|-----|------|-----|--------|--------|")
+        for t in tech_data_evening:
+            price = f"{t['price']:.3f}" if t.get('price') else "--"
+            chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
+            sup = f"{t['support']:.3f}" if t['support'] else "--"
+            res = f"{t['resistance']:.3f}" if t['resistance'] else "--"
+            atr = f"{t['atr']:.3f}" if t['atr'] else "--"
+            rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
+            macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
+            kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
+            vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
+            tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
 
-请作为资深投资专家，基于以上数据，生成一份只围绕"个人持仓"的晚报，总字数约700字：
+    data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
-1️⃣ **持仓全景综述**: 总结今日持仓整体盈亏、强弱分化和仓位状态
-2️⃣ **重点持仓点评**: 挑出表现最强、最弱、最值得警惕的持仓分别点评
-3️⃣ **资金流向分析**: 分析各持仓的资金属性（主力/散户主导），判断后市方向
-4️⃣ **持仓技术诊断**: 结合日内位置、波动、涨跌强弱，判断每类持仓的技术状态
-5️⃣ **调仓与风控建议**: 明确哪些适合继续持有、逢高减仓、观察或止损
-6️⃣ **明日操作清单**: 用清单形式给出次日最值得执行的动作和关注点
+    # 3. Build LLM prompt (compact)
+    llm_lines = [
+        f"今日收盘。时间是 {datetime.now().strftime('%Y-%m-%d %H:%M')}，"
+        f"请生成一份围绕个人持仓的晚报。"
+    ]
 
-要求：
-- 视角：从持仓管理和实盘操作出发，给出具可操作性的建议。
-- 格式：使用 Markdown 标题、列表、加粗和 Emoji 增强可读性。
-- 内容：不要分析自选股，不要输出观察标的板块点评，所有结论都必须落在当前持仓上。
-- 语气：专业且辛辣，不模棱两可。
-- 重点关注资金流向分析部分，明确指出主力资金动向。""")
+    if day_news:
+        llm_lines.append("\n[盘中快讯]")
+        for n in day_news:
+            llm_lines.append(f"  [{n.time}] {n.title}")
 
-    content = _call_llm("\n".join(lines), config)
-    if not content:
-        return None
+    if nf:
+        llm_lines.append(f"\n[市场] 北向资金: {nf.total_net:+.2f}亿")
 
+    if h_results:
+        attr = _simple_attribution(h_results, market_return)
+        if attr["beta_pnl"] is not None:
+            llm_lines.append(f"\n[持仓] 总成本: {total_cost:,.2f} | 总盈亏: {attr['total_pnl']:+,.2f} | β贡献: {attr['beta_pnl']:+,.2f} | α贡献: {attr['alpha_pnl']:+,.2f}")
+        else:
+            llm_lines.append(f"\n[持仓] 总成本: {total_cost:,.2f} | 总盈亏: {total_pnl:+,.2f}")
+    else:
+        attr = {"beta_pnl": None, "alpha_pnl": None, "total_pnl": 0}
+        for h in h_results:
+            quote = next((q for q in quotes if q.code == h["code"]), None)
+            info = f"  {h['name']}: {h['pnl_pct']:+.2f}%"
+            if quote:
+                flow = _analyze_capital_flow(quote)
+                info += f" [{flow}]"
+                if quote.pe_ratio is not None:
+                    info += f" PE:{quote.pe_ratio:.1f}"
+                if quote.market_cap is not None:
+                    info += f" 市值:{quote.market_cap/1e4:.0f}亿"
+                if quote.turnover_rate is not None:
+                    info += f" 换手:{quote.turnover_rate:.2f}%"
+                if quote.change_pct and abs(quote.change_pct) > 2:
+                    info += f" {'走势强劲' if quote.change_pct > 0 else '走势疲软'}"
+            llm_lines.append(info)
+
+    if tech_data_evening:
+        llm_lines.append("\n[技术分析]")
+        for t in tech_data_evening:
+            parts = [f"  {t['name']}:"]
+            if t['support']:
+                parts.append(f"支撑:{t['support']:.3f}")
+            if t['resistance']:
+                parts.append(f"压力:{t['resistance']:.3f}")
+            parts.append(f"量价:{t['vol_price']}")
+            if t['rsi']:
+                parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
+            parts.append(f"MACD:{t['macd_signal']}")
+            parts.append(f"KDJ:{t['kdj_signal']}")
+            llm_lines.append(" ".join(parts))
+
+    llm_lines.append(f"""
+
+请按以下结构生成晚报（约 700 字）：
+
+### 一、持仓全景归因
+- 今日总盈亏：{attr['total_pnl']:+,.2f}{" | β贡献: " + f"{attr['beta_pnl']:+,.2f}" + " | α贡献: " + f"{attr['alpha_pnl']:+,.2f}" if attr['beta_pnl'] is not None else ""}
+- 归因分析：多少来自市场整体涨跌（β），多少来自持仓自身表现（α）？
+- 强弱分化：哪只最强/最弱，差距原因是什么？
+
+### 二、重点持仓深度点评（按重要性排序，不超过 3 只）
+对每只持仓输出：
+- **技术状态**：价在均线什么位置？RSI/MACD/KDJ 是否同向？
+- **资金行为**：主力主导还是散户主导？有无异常放量/缩量？
+- **估值水平**：结合 PE/PB 判断贵贱（标注置信度）
+- **核心判断**：一句话结论（如："短期超买，明日有回调需求"）
+
+### 三、明日多情景预案
+
+| 情景 | 触发条件 | 应对动作 | 置信度 |
+|------|---------|---------|--------|
+| 乐观 | 大盘高开+放量 | ... | 中 |
+| 基准 | 平开震荡 | ... | 高 |
+| 悲观 | 低开+北向流出 | ... | 中 |
+
+### 四、风控红线
+明日每只持仓的硬止损位和硬止盈位（具体价格或盈亏百分比）。
+
+要求：必须使用条件格式（if-then），标注置信度。不输出与持仓无关的市场分析。
+
+---
+**置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
+- [高]：数据充分、指标一致、历史模式明确
+- [中]：数据尚可但存在分歧信号
+- [低]：数据不足或逻辑链条不完整
+**不确定性处理**：如果数据不足以支持判断，请直接输出"数据不足"而非强行给出结论。""")
+
+    # 4. Call LLM
+    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=2000)
+    if not llm_content:
+        log.warning("Evening review: LLM generation failed")
+
+    # 5. Build & save
+    report = _build_report(data_section, llm_content)
     report_dir = Path(config.report_dir)
-    filepath = _save_report(content, "Evening Review", report_dir)
+    filepath = _save_report(report, "Evening Review", report_dir)
 
     push_title = f"Evening Review {datetime.now().strftime('%m-%d')}"
-    _push_report(push_title, f"## Evening Summary\n\n{content}", config)
+    _push_report(push_title, report, config)
 
     log.info(f"Evening review generated: {filepath}")
     return filepath

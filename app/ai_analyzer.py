@@ -5,7 +5,9 @@ AI分析 —— 调用 DeepSeek API 生成盘面研判
 from __future__ import annotations
 from datetime import datetime
 
-from app.models import Quote, Alert, AnalysisStats, INDEX_TYPE
+from typing import Dict
+
+from app.models import Quote, Alert, AnalysisStats, INDEX_TYPE, TechnicalSummary
 from app.config import Config
 from app.utils import log
 from app.llm_client import get_llm_client, SYSTEM_PROMPTS
@@ -15,18 +17,26 @@ def _build_prompt(
     quotes: list[Quote],
     alerts: list[Alert],
     stats: AnalysisStats,
+    tech_summaries: Dict[str, TechnicalSummary] | None = None,
 ) -> str:
     """构建大模型分析用的 Prompt"""
     s = stats.sentiment
     lines = [
-        "你是一位专业的A股市场实时分析师。请基于以下实时盯盘数据，给出专业、简洁的盘面研判。",
+        "请基于以下实时盯盘数据，给出专业、简洁的盘面研判。",
         "",
         f"## 市场状态",
         f"- 时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"- 监控标的: {stats.total} 只",
         f"- 涨跌分布: 涨{stats.up} / 跌{stats.down} / 平{stats.flat}",
+        f"- 上涨家数占比: {stats.up/(stats.up+stats.down+stats.flat)*100:.0f}%",
         f"- 情绪评分: {s.score}/100 ({s.label})",
     ]
+
+    # 成交量分析
+    total_volume = sum(q.volume for q in quotes if q.volume is not None and q.volume > 0)
+    advance_volume = sum(q.volume for q in quotes if q.volume and q.volume > 0 and q.change_pct and q.change_pct > 0)
+    if total_volume > 0:
+        lines.append(f"- 上涨量比: {advance_volume/total_volume*100:.0f}%（上涨标的成交量/总成交量）")
 
     # 指数数据
     indices = [q for q in quotes if q.type == INDEX_TYPE]
@@ -73,14 +83,52 @@ def _build_prompt(
         cp = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
         lines.append(f"- {q.name}({q.code}): {cp}")
 
+    # 技术指标
+    if tech_summaries:
+        lines.append("")
+        lines.append("## 持仓技术指标")
+        for q in quotes:
+            tech = tech_summaries.get(q.code)
+            if tech:
+                parts = [f"- {q.name}({q.code}):"]
+                if tech.rsi is not None:
+                    parts.append(f"RSI:{tech.rsi:.1f}({tech.rsi_signal})")
+                if tech.macd_dif is not None:
+                    parts.append(f"MACD:{tech.macd_signal}")
+                if tech.kdj_k is not None:
+                    parts.append(f"KDJ:{tech.kdj_signal}")
+                if tech.support is not None:
+                    parts.append(f"支撑:{tech.support:.3f}")
+                if tech.resistance is not None:
+                    parts.append(f"压力:{tech.resistance:.3f}")
+                if tech.bb_signal:
+                    parts.append(f"布林带:{tech.bb_signal}")
+                lines.append(" ".join(parts))
+
     lines.extend([
         "",
-        "请从以下3个方面分析，总字数不超过200字：",
-        "1. 盘面特征: 当前市场的主要特征和资金动向",
-        "2. 异动解读: 异动标的原因分析和后续关注点",
-        "3. 操作参考: 针对当前盘面的参考建议",
+        "请按以下框架分析，输出控制在 300 字以内：",
         "",
-        "注意: 语言简洁专业，基于数据说话，不做无依据预测。",
+        "### 第一步：盘面定性（1 句）",
+        "用一个词或短语定性当前盘面（如：缩量震荡、放量上攻、冲高回落等），然后一句话说明核心矛盾。",
+        "",
+        "### 第二步：量价验证",
+        "- 当前上涨是否有量能支撑？上涨量比是否大于 50%？",
+        "- 如果缩量上涨，需标注\"缩量上涨，持续性存疑\"",
+        "- 如果放量下跌，需标注\"抛压较重，谨慎\"",
+        "",
+        "### 第三步：异动解读",
+        "对警报标的逐一说明：是技术性回调、资金驱动还是基本面因素？",
+        "",
+        "### 第四步：关键技术位判断",
+        "结合 RSI（超买/超卖）、MACD（金叉/死叉）、KDJ 的位置，给出交叉验证结论：",
+        "- 多个指标是否指向同一方向？（如 RSI 超买 + KDJ 高位死叉 = 短期回调压力大）",
+        "- 指标是否出现背离？（如价格新高但 RSI 未创新高 = 顶背离风险）",
+        "",
+        "### 置信度标注",
+        "对以上判断标注置信度：[高] 数据充分且指标一致 / [中] 数据尚可但指标有分歧 / [低] 数据不足或方向不明",
+        "",
+        "注意: 如果数据不足以得出明确结论，请明确说\"数据不足\"，不要强行分析。",
     ])
 
     return "\n".join(lines)
@@ -91,6 +139,7 @@ def analyze(
     alerts: list[Alert],
     stats: AnalysisStats,
     config: Config,
+    tech_summaries: Dict[str, TechnicalSummary] | None = None,
 ) -> str | None:
     """调用 DeepSeek 大模型进行智能分析"""
     if not config.llm_enabled:
@@ -104,11 +153,11 @@ def analyze(
     if not llm.enabled:
         return None
 
-    prompt = _build_prompt(quotes, alerts, stats)
+    prompt = _build_prompt(quotes, alerts, stats, tech_summaries)
     result = llm.chat(
         prompt=prompt,
         system_prompt=SYSTEM_PROMPTS["analyst"],
-        max_tokens=500,
+        max_tokens=800,
         temperature=0.3,
     )
 
