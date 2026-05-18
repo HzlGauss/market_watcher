@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.models import WatchItem, Quote, Holding
 from app.config import Config
-from app.data_fetcher import fetch_quotes, fetch_quotes_rich, NorthFlowFetcher
+from app.data_fetcher import fetch_quotes, fetch_quotes_rich
 from app.analyzer import analyze, calc_market_sentiment
 from app.utils import log
 from app.http_client import serverchan_client
@@ -103,8 +103,8 @@ def _get_holdings_tech_analysis(
         if not quote:
             return None
 
-        # 获取 30 日 K 线
-        klines = fetch_historical_kline(h.code, h.market, days=30)
+        # 获取 60 日 K 线（MACD 需要至少 35 天，RSI 需要 15 天，60 天留足余量）
+        klines = fetch_historical_kline(h.code, h.market, days=60)
         if not klines:
             return None
 
@@ -395,7 +395,7 @@ def generate_morning_brief(config: Config) -> Path | None:
 # Midday Review 11:35
 # ============================================================
 
-def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> Path | None:
+def generate_midday_review(config: Config) -> Path | None:
     """Midday Review - Morning review + afternoon prediction"""
     report_cfg = config.report_cfg.get("Midday Review", {})
     if not report_cfg.get("启用", False):
@@ -414,8 +414,6 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
     watchlist_codes = {item.code for item in config.watch_items}
     watch_quotes = [q for q in quotes if q.code in watchlist_codes]
     _, stats = analyze(watch_quotes, {}, config)
-    nf = north_fetcher.fetch()
-
     from app.data_fetcher import fetch_market_news
     morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
 
@@ -431,8 +429,6 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
     data_lines.append(f"\n## 二、行情概览")
     data_lines.append(f"- 情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
     data_lines.append(f"- 涨/跌/平: {stats.up} / {stats.down} / {stats.flat}")
-    if nf:
-        data_lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
 
     sorted_q = sorted(watch_quotes, key=lambda q: (q.change_pct or 0), reverse=True)
     data_lines.append("\n## 三、自选标的排行")
@@ -504,8 +500,6 @@ def generate_midday_review(config: Config, north_fetcher: NorthFlowFetcher) -> P
             llm_lines.append(f"  [{n.time}] {n.title}")
 
     llm_lines.append(f"\n[行情] 情绪: {stats.sentiment.score}/100 ({stats.sentiment.label}), 涨跌平: {stats.up}/{stats.down}/{stats.flat}")
-    if nf:
-        llm_lines.append(f"  北向: {nf.total_net:+.2f}亿")
 
     llm_lines.append("\n[自选-涨幅前5]")
     for q in sorted_q[:5]:
@@ -680,7 +674,7 @@ def _analyze_capital_flow(quote: Quote) -> str:
     return "; ".join(signals) if signals else "资金面中性"
 
 
-def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> Path | None:
+def generate_evening_review(config: Config) -> Path | None:
     """Evening Review - Full day summary + next day strategy"""
     report_cfg = config.report_cfg.get("Evening Review", {})
     if not report_cfg.get("启用", False):
@@ -702,8 +696,6 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
     if not quotes:
         log.warning("Evening review: No quote data")
         return None
-
-    nf = north_fetcher.fetch()
 
     # 获取大盘当日涨跌幅，用于 β/α 归因
     market_return = None
@@ -730,10 +722,6 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
 
     data_lines.append(f"\n## 二、市场背景")
-    if nf:
-        data_lines.append(f"- 北向资金: {nf.total_net:+.2f}亿")
-    else:
-        data_lines.append("- 北向资金: 暂无数据")
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     if h_results:
@@ -830,9 +818,6 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
         for n in day_news:
             llm_lines.append(f"  [{n.time}] {n.title}")
 
-    if nf:
-        llm_lines.append(f"\n[市场] 北向资金: {nf.total_net:+.2f}亿")
-
     if h_results:
         attr = _simple_attribution(h_results, market_return)
         if attr["beta_pnl"] is not None:
@@ -894,7 +879,7 @@ def generate_evening_review(config: Config, north_fetcher: NorthFlowFetcher) -> 
 |------|---------|---------|--------|
 | 乐观 | 大盘高开+放量 | ... | 中 |
 | 基准 | 平开震荡 | ... | 高 |
-| 悲观 | 低开+北向流出 | ... | 中 |
+| 悲观 | 低开+放量下跌 | ... | 中 |
 
 ### 四、风控红线
 明日每只持仓的硬止损位和硬止盈位（具体价格或盈亏百分比）。

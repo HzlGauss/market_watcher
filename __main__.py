@@ -41,7 +41,6 @@ def _print_banner(config: Config) -> None:
     bt = config.thresholds
     llm_ok = config.llm_enabled and config.deepseek_key
     push_ok = config.push_enabled and config.sct_sendkey
-    nf_ok = config.north_flow_enabled
 
     print(f"""
 {Color.BOLD}{Color.CYAN}======================================================={Color.RESET}
@@ -52,7 +51,7 @@ def _print_banner(config: Config) -> None:
     log.info(f"Watch items: {len(config.watch_items)}")
     log.info(f"Thresholds: Up>{bt.get('涨幅预警',4)}% Down<{bt.get('跌幅预警',-3)}%")
     log.info(f"AI Analysis:  {'OK' if llm_ok else 'OFF'}  |  Push: {'OK' if push_ok else 'OFF'}")
-    log.info(f"North Flow: {'OK' if nf_ok else 'OFF'} |  Briefs/Reports: {BRIEF_DIR}")
+    log.info(f"Reports: {BRIEF_DIR}")
     print()
 
 
@@ -78,18 +77,17 @@ def _show_menu() -> str:
             return "0"
 
 
-def _gen_report(report_type: str, config: Config,
-                north_fetcher: NorthFlowFetcher) -> None:
+def _gen_report(report_type: str, config: Config) -> None:
     """Generate single report"""
     if report_type == "Morning Brief":
         log.info("Generating morning brief...")
         generate_morning_brief(config)
     elif report_type == "Midday Review":
         log.info("Generating midday review...")
-        generate_midday_review(config, north_fetcher)
+        generate_midday_review(config)
     elif report_type == "Evening Review":
         log.info("Generating evening review...")
-        generate_evening_review(config, north_fetcher)
+        generate_evening_review(config)
 
 
 def _wait_until_next_slot(interval: int) -> None:
@@ -281,7 +279,7 @@ def main() -> None:
             if not rc.get("启用", False):
                 log.warning(f"'{rtype}' is disabled, please enable in watchlist_config.json")
                 continue
-            _gen_report(rtype, config, north_fetcher)
+            _gen_report(rtype, config)
             print(f"{Color.DIM}Report generated and pushed (see {REPORT_DIR}){Color.RESET}")
         elif choice == "4":
             _run_monitoring_loop(config, north_fetcher)

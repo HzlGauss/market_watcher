@@ -47,12 +47,6 @@ def _build_prompt(
             cp = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
             lines.append(f"- {idx.name}({idx.code}): {cp}")
 
-    # 北向资金
-    nf = stats.north_flow
-    if nf:
-        lines.append("")
-        lines.append(f"## 北向资金: {nf.total_net:+.0f}亿")
-
     # 板块表现
     sectors: dict[str, list[float]] = {}
     for q in quotes:

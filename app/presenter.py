@@ -99,14 +99,6 @@ def print_sentiment(stats: AnalysisStats) -> None:
         down_str = f"{t['跌幅预警']:+.1f}%({down_adj:+.1f})" if abs(down_adj) > 0.01 else f"{bt['跌幅预警']:+.1f}%"
         print(f"{Color.DIM}⚙️ 动态阈值: 涨幅预警 {up_str} | 跌幅预警 {down_str}{Color.RESET}")
 
-    # 北向资金
-    nf = stats.north_flow
-    if nf:
-        net = nf.total_net
-        nf_color = Color.RED if net > 0 else (Color.GREEN if net < 0 else Color.DIM)
-        total_str = f"{nf_color}北向:{net:+.0f}亿{Color.RESET}" if net != 0 else f"{Color.DIM}北向:待更新{Color.RESET}"
-        print(f"{Color.CYAN}💵 资金流向:{Color.RESET}   {total_str}")
-
     # 涨跌分布
     print(f"{Color.CYAN}📊 涨跌分布:{Color.RESET}   "
           f"{Color.RED}涨{stats.up}{Color.RESET} | "
@@ -222,23 +214,6 @@ def save_brief(
             f.write(f"| {rank} | {q.code} | {q.name} | {price} | {cp} | {ca} | {vol} | {amt} | {amp} |\n")
 
         f.write(f"\n\n---\n*下次扫描: {datetime.now() + timedelta(minutes=15)}*")
-
-    # 北向资金（追加）
-    nf = stats.north_flow
-    if nf:
-        net = nf.hk2sh_net + nf.hk2sz_net
-        with open(str(filepath), "r", encoding="utf-8") as f:
-            content = f.read()
-        section = (
-            f"\n\n## 💵 北向资金\n\n"
-            f"| 方向 | 净买入(亿) | 余额度(亿) |\n"
-            f"|------|----------|----------|\n"
-            f"| 沪股通 | {nf.hk2sh_net:+.0f} | {nf.hk2sh_quota:.0f} |\n"
-            f"| 深股通 | {nf.hk2sz_net:+.0f} | {nf.hk2sz_quota:.0f} |\n"
-            f"| **合计** | **{net:+.0f}亿** | |\n"
-        )
-        with open(str(filepath), "w", encoding="utf-8") as f:
-            f.write(content + section)
 
     # AI研判（追加）
     llm = stats.llm_result
