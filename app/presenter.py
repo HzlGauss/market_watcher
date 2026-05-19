@@ -121,6 +121,61 @@ def print_alerts(alerts: list[Alert]) -> None:
     print()
 
 
+def print_key_levels(tech_summaries: dict, quotes: list[Quote]) -> None:
+    """打印关键支撑/压力位
+
+    Args:
+        tech_summaries: 技术摘要字典
+        quotes: 行情列表
+    """
+    if not tech_summaries:
+        print(f"\n{Color.BOLD}{Color.CYAN}═══ 关键价位 ═══{Color.RESET}")
+        print(f"  {Color.DIM}暂无关键位数据{Color.RESET}")
+        print()
+        return
+
+    quote_map = {q.code: q for q in quotes}
+    has_data = False
+
+    print(f"\n{Color.BOLD}{Color.CYAN}═══ 关键价位 ═══{Color.RESET}")
+    for code, tech in tech_summaries.items():
+        quote = quote_map.get(code)
+        if not quote or quote.price is None:
+            continue
+
+        parts = [f"{Color.BOLD}{quote.name}({code}){Color.RESET}"]
+        current = quote.price
+
+        # 枢轴点（日内最重要）
+        if tech.pivot_supports and tech.pivot_resistances:
+            p_str = f"枢轴:S1={tech.pivot_supports[0]:.3f} "
+            if len(tech.pivot_supports) > 1:
+                p_str += f"S2={tech.pivot_supports[1]:.3f} "
+            p_str += f"P={(tech.pivot_supports[0] + tech.pivot_resistances[0])/2:.3f} "
+            p_str += f"R1={tech.pivot_resistances[0]:.3f}"
+            if len(tech.pivot_resistances) > 1:
+                p_str += f" R2={tech.pivot_resistances[1]:.3f}"
+            parts.append(p_str)
+
+        # 主支撑/压力位
+        if tech.support and tech.resistance:
+            parts.append(f"| 支撑:{tech.support:.3f} 压力:{tech.resistance:.3f}")
+
+            # 标注当前价格位置
+            if current <= tech.support * 1.01:
+                parts.append(f"{Color.GREEN}←跌破支撑{Color.RESET}")
+            elif current >= tech.resistance * 0.99:
+                parts.append(f"{Color.RED}←突破压力{Color.RESET}")
+
+        if len(parts) > 1:
+            print(f"  {' | '.join(parts)}")
+            has_data = True
+
+    if not has_data:
+        print(f"  {Color.DIM}暂无关键位数据{Color.RESET}")
+    print()
+
+
 def print_llm_result(result: str | None) -> None:
     """打印AI研判结果"""
     if not result:

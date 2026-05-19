@@ -109,10 +109,11 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     from app.notifier import push_alert
     from app.presenter import (
         print_quotes_table, print_sentiment, print_alerts,
-        print_llm_result, print_tail, save_brief
+        print_llm_result, print_tail, save_brief, print_key_levels
     )
     from app.technical import fetch_historical_kline, get_technical_summary
-    from app.models import ScanRecord, FundScanStatus
+    from app.models import ScanRecord, FundScanStatus, TechSnapshot
+    from app.models import tech_snapshot_to_summary
     import time
 
     log.info("Scanning market data (Holdings + Watchlist)...")
@@ -161,6 +162,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 
     # Fetch technical indicators for holdings & watchlist items
     tech_summaries: dict[str, "TechnicalSummary"] = {}
+    klines_map: dict[str, list] = {}
     quote_map = {q.code: q for q in quotes}
     item_map = {item.code: item for item in monitor_items}
 
@@ -170,9 +172,14 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
             continue
         klines = fetch_historical_kline(code, item.market, days=60)
         if klines:
+            klines_map[code] = klines
             tech_summaries[code] = get_technical_summary(quote_map[code], klines)
 
     print_quotes_table(quotes)
+
+    # 展示关键价位（支撑/压力位）
+    if tech_summaries:
+        print_key_levels(tech_summaries, quotes)
 
     # 加载上一周期成交量，用于量价对比
     prev_state: dict = {}
@@ -185,11 +192,21 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     # 加载扫描历史
     scan_history = _load_scan_history()
 
+    # 构建前一次扫描的技术快照（用于组合策略跨周期对比）
+    prev_tech_summaries: dict[str, "TechnicalSummary"] = {}
+    if scan_history:
+        last_record = scan_history[-1]
+        for code, status in last_record.funds_status.items():
+            if status.tech_snapshot:
+                prev_tech_summaries[code] = tech_snapshot_to_summary(status.tech_snapshot)
+
     # Analyze all quotes together (with technical signals and history)
     alerts, stats = analyze(
         quotes, prev_state, config, tech_summaries,
         north_data=north_fetcher.fetch(),
-        scan_history=scan_history
+        scan_history=scan_history,
+        prev_tech_summaries=prev_tech_summaries,
+        klines_map=klines_map
     )
     print_sentiment(stats)
 
@@ -211,13 +228,18 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         if prev_vol and prev_vol > 0 and q.volume and q.volume > 0:
             vol_ratio = q.volume / prev_vol
 
+        tech_snapshot = None
+        if tech_summaries and q.code in tech_summaries:
+            tech_snapshot = TechSnapshot.from_technical_summary(tech_summaries[q.code])
+
         funds_status[q.code] = FundScanStatus(
             price=q.price,
             change_pct=q.change_pct,
             volume=q.volume,
             vol_ratio=vol_ratio,
             alerts=alert_map.get(q.code, []),
-            tech_signals=tech_summaries.get(q.code, []).signals if tech_summaries and q.code in tech_summaries else []
+            tech_signals=tech_summaries.get(q.code, []).signals if tech_summaries and q.code in tech_summaries else [],
+            tech_snapshot=tech_snapshot
         )
 
     scan_record = ScanRecord(

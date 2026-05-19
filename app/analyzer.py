@@ -10,7 +10,7 @@ from typing import Optional
 
 from app.models import (
     Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary,
-    NorthFlowData, ScanRecord, FundScanStatus
+    NorthFlowData, ScanRecord, FundScanStatus, KlineData, TechSnapshot
 )
 from app.config import Config
 
@@ -31,13 +31,19 @@ def _load_scan_history() -> list[ScanRecord]:
         for item in data:
             funds_status = {}
             for code, status_data in item.get("funds_status", {}).items():
+                snapshot_data = status_data.get("tech_snapshot")
+                tech_snapshot = None
+                if snapshot_data:
+                    tech_snapshot = TechSnapshot.from_dict(snapshot_data)
+
                 funds_status[code] = FundScanStatus(
                     price=status_data.get("price"),
                     change_pct=status_data.get("change_pct"),
                     volume=status_data.get("volume"),
                     vol_ratio=status_data.get("vol_ratio"),
                     alerts=status_data.get("alerts", []),
-                    tech_signals=status_data.get("tech_signals", [])
+                    tech_signals=status_data.get("tech_signals", []),
+                    tech_snapshot=tech_snapshot
                 )
 
             records.append(ScanRecord(
@@ -78,7 +84,8 @@ def _save_scan_history(records: list[ScanRecord]) -> None:
                     "volume": status.volume,
                     "vol_ratio": status.vol_ratio,
                     "alerts": status.alerts,
-                    "tech_signals": status.tech_signals
+                    "tech_signals": status.tech_signals,
+                    "tech_snapshot": status.tech_snapshot.to_dict() if status.tech_snapshot else None
                 }
 
             data.append({
@@ -306,8 +313,15 @@ def analyze(
     tech_summaries: dict[str, TechnicalSummary] | None = None,
     north_data: Optional["NorthFlowData"] = None,
     scan_history: list[ScanRecord] | None = None,
+    prev_tech_summaries: dict[str, TechnicalSummary] | None = None,
+    klines_map: dict[str, list["KlineData"]] | None = None,
 ) -> tuple[list[Alert], AnalysisStats]:
-    """执行全部分析，返回异动列表和统计结果"""
+    """执行全部分析，返回异动列表和统计结果
+
+    Args:
+        prev_tech_summaries: 前一日技术汇总（用于组合策略的趋势变化判断）
+        klines_map: 各标的K线数据（用于组合策略）
+    """
     base = config.thresholds
     sentiment = calc_market_sentiment(quotes)
     thresholds = adjust_thresholds(base, sentiment, config)
@@ -419,6 +433,47 @@ def analyze(
             if tech.signals:
                 for sig in tech.signals:
                     items.append(f"📐 {sig}")
+
+        # ---- 支撑/压力位关键位触发 ----
+        if tech_summaries and q.code in tech_summaries and q.price is not None:
+            tech = tech_summaries[q.code]
+            current_price = q.price
+            proximity_threshold = 0.02  # 接近阈值：2%
+
+            # 检查枢轴点（日内最重要）
+            if tech.pivot_supports:
+                for i, s1 in enumerate(tech.pivot_supports):
+                    if abs(current_price - s1) / s1 <= proximity_threshold:
+                        items.append(f"📐 触及枢轴支撑{i+1}({s1:.3f})")
+                        break
+            if tech.pivot_resistances:
+                for i, r1 in enumerate(tech.pivot_resistances):
+                    if abs(current_price - r1) / r1 <= proximity_threshold:
+                        items.append(f"📐 触及枢轴压力{i+1}({r1:.3f})")
+                        break
+
+            # 检查主支撑/压力位（突破/跌破）
+            if tech.support and current_price <= tech.support * (1 + proximity_threshold * 0.5):
+                items.append(f"⚠️ 接近支撑位({tech.support:.3f})")
+            if tech.resistance and current_price >= tech.resistance * (1 - proximity_threshold * 0.5):
+                items.append(f"🔥 接近压力位({tech.resistance:.3f})")
+
+        # ---- 组合策略信号 ----
+        if tech_summaries and q.code in tech_summaries and klines_map and q.code in klines_map:
+            tech = tech_summaries[q.code]
+            prev_tech = None
+            if prev_tech_summaries and q.code in prev_tech_summaries:
+                prev_tech = prev_tech_summaries[q.code]
+            klines = klines_map[q.code]
+            closes = [k.close for k in klines if k.close is not None]
+            from app.strategy import get_strategy_alert_texts, calc_macd_dif_series
+            dif_vals = calc_macd_dif_series(closes) if closes else None
+            strategy_texts = get_strategy_alert_texts(
+                tech, prev_tech, q, klines, dif_vals, closes
+            )
+            for txt in strategy_texts:
+                items.append(txt)
+                alert_count += 1
 
         # ---- 历史趋势增强判断 ----
         if scan_history and len(scan_history) >= 3 and cp is not None:

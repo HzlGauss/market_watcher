@@ -294,47 +294,224 @@ class SupportResistance:
     support: Optional[float] = None
     resistance: Optional[float] = None
     atr: Optional[float] = None
+    swing_supports: list[float] = None
+    swing_resistances: list[float] = None
+    pivot_supports: list[float] = None
+    pivot_resistances: list[float] = None
+    volume_clusters: list[float] = None
 
 
-def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> SupportResistance:
-    """计算支撑位、压力位和 ATR
+def _calc_atr(klines: list[KlineData], period: int = 14) -> Optional[float]:
+    """计算 ATR（平均真实波动幅度）
 
     Args:
         klines: K线数据
+        period: 周期（默认14）
+
+    Returns:
+        ATR 值
+    """
+    if len(klines) < 2:
+        return None
+
+    true_ranges = []
+    for i in range(1, len(klines)):
+        h = klines[i].high
+        l = klines[i].low
+        prev_c = klines[i - 1].close
+        if h is not None and l is not None and prev_c is not None:
+            true_ranges.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+
+    if not true_ranges:
+        return None
+
+    true_ranges = true_ranges[-period:]
+    return round(sum(true_ranges) / len(true_ranges), 4)
+
+
+def _find_swing_points(klines: list[KlineData], left: int = 3, right: int = 3) -> tuple[list[float], list[float]]:
+    """寻找摆动高低点（Swing High/Low）
+
+    摆动高点：左右各N天内都是最高点
+    摆动低点：左右各N天内都是最低点
+
+    Args:
+        klines: K线数据（按时间升序）
+        left: 左侧天数
+        right: 右侧天数
+
+    Returns:
+        (swing_lows, swing_highs) 排序后的摆动低点和高点列表
+    """
+    if len(klines) < left + right + 1:
+        return [], []
+
+    swing_highs = []
+    swing_lows = []
+
+    for i in range(left, len(klines) - right):
+        window = klines[i - left:i + right + 1]
+        current = klines[i]
+
+        if current.high is None or current.low is None:
+            continue
+
+        window_highs = [k.high for k in window if k.high is not None]
+        window_lows = [k.low for k in window if k.low is not None]
+
+        if not window_highs or not window_lows:
+            continue
+
+        if current.high == max(window_highs):
+            swing_highs.append(current.high)
+
+        if current.low == min(window_lows):
+            swing_lows.append(current.low)
+
+    swing_lows.sort()
+    swing_highs.sort(reverse=True)
+
+    return swing_lows, swing_highs
+
+
+def _calc_pivot_points(high: float, low: float, close: float) -> tuple[list[float], list[float]]:
+    """计算经典枢轴点（Pivot Points）
+
+    Args:
+        high: 昨日最高价
+        low: 昨日最低价
+        close: 昨日收盘价
+
+    Returns:
+        (supports, resistances) 支撑位和压力位列表
+    """
+    pivot = (high + low + close) / 3
+
+    r1 = 2 * pivot - low
+    s1 = 2 * pivot - high
+    r2 = pivot + (high - low)
+    s2 = pivot - (high - low)
+    r3 = r1 + (high - low)
+    s3 = s1 - (high - low)
+
+    supports = sorted([s3, s2, s1])
+    resistances = sorted([r1, r2, r3], reverse=True)
+
+    return supports, resistances
+
+
+def _find_volume_clusters(klines: list[KlineData], num_clusters: int = 3) -> list[float]:
+    """寻找成交密集区（Volume Profile）
+
+    按价格区间统计成交量，找到成交量最大的几个区间
+
+    Args:
+        klines: K线数据
+        num_clusters: 返回的密集区数量
+
+    Returns:
+        成交密集区的价格列表（按成交量降序）
+    """
+    if not klines:
+        return []
+
+    valid_klines = [k for k in klines if k.high and k.low and k.volume and k.volume > 0]
+    if not valid_klines:
+        return []
+
+    all_highs = [k.high for k in valid_klines]
+    all_lows = [k.low for k in valid_klines]
+    price_min = min(all_lows)
+    price_max = max(all_highs)
+
+    price_range = price_max - price_min
+    if price_range == 0:
+        return [price_max]
+
+    num_bins = 20
+    bin_width = price_range / num_bins
+    bins = {i: 0.0 for i in range(num_bins)}
+
+    for k in valid_klines:
+        avg_price = (k.high + k.low) / 2
+        bin_idx = int((avg_price - price_min) / bin_width)
+        bin_idx = max(0, min(bin_idx, num_bins - 1))
+        bins[bin_idx] += k.volume
+
+    sorted_bins = sorted(bins.items(), key=lambda x: x[1], reverse=True)
+    clusters = []
+
+    for bin_idx, volume in sorted_bins[:num_clusters]:
+        cluster_price = price_min + (bin_idx + 0.5) * bin_width
+        clusters.append(round(cluster_price, 3))
+
+    clusters.sort(reverse=True)
+    return clusters
+
+
+def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> SupportResistance:
+    """计算支撑位、压力位和 ATR（增强版）
+
+    综合多种方法：
+    1. 摆动高低点（Swing High/Low）- 技术转折点
+    2. 枢轴点（Pivot Points）- 日内关键位
+    3. 成交密集区（Volume Profile）- 量价关键位
+    4. 区间极值 - 简单参考
+
+    Args:
+        klines: K线数据（按时间升序）
         lookback: 回看天数
 
     Returns:
-        SupportResistance 包含支撑、压力、ATR
+        SupportResistance 包含多种支撑压力位
     """
     if not klines:
         return SupportResistance()
 
     window = klines[-min(lookback, len(klines)):]
 
-    highs = [k.high for k in window if k.high is not None]
-    lows = [k.low for k in window if k.low is not None]
+    # 1. ATR 计算
+    atr = _calc_atr(window)
 
-    if not highs or not lows:
-        return SupportResistance()
+    # 2. 摆动高低点
+    swing_lows, swing_highs = _find_swing_points(window, left=3, right=3)
+    swing_supports = [round(p, 3) for p in swing_lows[-3:]] if swing_lows else []
+    swing_resistances = [round(p, 3) for p in swing_highs[-3:]] if swing_highs else []
 
-    resistance = max(highs)
-    support = min(lows)
+    # 3. 枢轴点（使用最后一根完整K线，排除当天）
+    pivot_supports = []
+    pivot_resistances = []
+    if len(window) >= 2:
+        prev_kline = window[-2]
+        if prev_kline.high and prev_kline.low and prev_kline.close:
+            p_supports, p_resistances = _calc_pivot_points(
+                prev_kline.high, prev_kline.low, prev_kline.close
+            )
+            pivot_supports = [round(p, 3) for p in p_supports]
+            pivot_resistances = [round(p, 3) for p in p_resistances]
 
-    # ATR 计算
-    true_ranges = []
-    for i in range(1, len(window)):
-        h = window[i].high
-        l = window[i].low
-        prev_c = window[i - 1].close
-        if h is not None and l is not None and prev_c is not None:
-            true_ranges.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+    # 4. 成交密集区
+    volume_clusters = _find_volume_clusters(window, num_clusters=3)
 
-    atr = round(sum(true_ranges) / len(true_ranges), 4) if true_ranges else None
+    # 5. 综合判断主支撑/压力位
+    all_supports = swing_supports + pivot_supports + volume_clusters
+    all_resistances = swing_resistances + pivot_resistances + volume_clusters
+
+    valid_supports = [s for s in all_supports if s is not None]
+    valid_resistances = [r for r in all_resistances if r is not None]
+
+    support = min(valid_supports) if valid_supports else None
+    resistance = max(valid_resistances) if valid_resistances else None
 
     return SupportResistance(
-        support=round(support, 3),
-        resistance=round(resistance, 3),
+        support=round(support, 3) if support else None,
+        resistance=round(resistance, 3) if resistance else None,
         atr=atr,
+        swing_supports=swing_supports,
+        swing_resistances=swing_resistances,
+        pivot_supports=pivot_supports,
+        pivot_resistances=pivot_resistances,
+        volume_clusters=volume_clusters,
     )
 
 
@@ -501,6 +678,11 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         kdj_signal=kdj.signal,
         support=sr.support,
         resistance=sr.resistance,
+        swing_supports=sr.swing_supports or [],
+        swing_resistances=sr.swing_resistances or [],
+        pivot_supports=sr.pivot_supports or [],
+        pivot_resistances=sr.pivot_resistances or [],
+        volume_clusters=sr.volume_clusters or [],
         atr=sr.atr,
         bb_upper=bb.upper,
         bb_middle=bb.middle,

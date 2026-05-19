@@ -240,6 +240,11 @@ class TechnicalSummary:
     kdj_signal: str = ""
     support: Optional[float] = None
     resistance: Optional[float] = None
+    swing_supports: list[float] = field(default_factory=list)
+    swing_resistances: list[float] = field(default_factory=list)
+    pivot_supports: list[float] = field(default_factory=list)
+    pivot_resistances: list[float] = field(default_factory=list)
+    volume_clusters: list[float] = field(default_factory=list)
     atr: Optional[float] = None
     bb_upper: Optional[float] = None
     bb_middle: Optional[float] = None
@@ -254,6 +259,74 @@ class TechnicalSummary:
 # ============================================================
 
 @dataclass
+class TechSnapshot:
+    """技术快照 —— 存储某时刻的关键技术指标值，供组合策略跨日对比"""
+    rsi: Optional[float] = None
+    macd_dif: Optional[float] = None
+    macd_dea: Optional[float] = None
+    macd_signal: str = ""
+    kdj_k: Optional[float] = None
+    kdj_d: Optional[float] = None
+    kdj_j: Optional[float] = None
+    kdj_signal: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "rsi": self.rsi,
+            "macd_dif": self.macd_dif,
+            "macd_dea": self.macd_dea,
+            "macd_signal": self.macd_signal,
+            "kdj_k": self.kdj_k,
+            "kdj_d": self.kdj_d,
+            "kdj_j": self.kdj_j,
+            "kdj_signal": self.kdj_signal,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "TechSnapshot":
+        return TechSnapshot(
+            rsi=d.get("rsi"),
+            macd_dif=d.get("macd_dif"),
+            macd_dea=d.get("macd_dea"),
+            macd_signal=d.get("macd_signal", ""),
+            kdj_k=d.get("kdj_k"),
+            kdj_d=d.get("kdj_d"),
+            kdj_j=d.get("kdj_j"),
+            kdj_signal=d.get("kdj_signal", ""),
+        )
+
+    @staticmethod
+    def from_technical_summary(tech: "TechnicalSummary") -> "TechSnapshot":
+        return TechSnapshot(
+            rsi=tech.rsi,
+            macd_dif=tech.macd_dif,
+            macd_dea=tech.macd_dea,
+            macd_signal=tech.macd_signal,
+            kdj_k=tech.kdj_k,
+            kdj_d=tech.kdj_d,
+            kdj_j=tech.kdj_j,
+            kdj_signal=tech.kdj_signal,
+        )
+
+
+def tech_snapshot_to_summary(snapshot: "TechSnapshot") -> "TechnicalSummary":
+    """将 TechSnapshot 转为 TechnicalSummary（用于作为 prev_tech 传入策略引擎）"""
+    from app.models import TechnicalSummary
+    return TechnicalSummary(
+        rsi=snapshot.rsi,
+        rsi_signal="",
+        macd_dif=snapshot.macd_dif,
+        macd_dea=snapshot.macd_dea,
+        macd_histogram=None,
+        macd_signal=snapshot.macd_signal,
+        kdj_k=snapshot.kdj_k,
+        kdj_d=snapshot.kdj_d,
+        kdj_j=snapshot.kdj_j,
+        kdj_signal=snapshot.kdj_signal,
+    )
+
+
+@dataclass
 class FundScanStatus:
     """单次扫描中某只基金的状态"""
     price: Optional[float] = None
@@ -262,6 +335,7 @@ class FundScanStatus:
     vol_ratio: Optional[float] = None  # 相对前日成交量倍率
     alerts: list[str] = field(default_factory=list)
     tech_signals: list[str] = field(default_factory=list)
+    tech_snapshot: Optional[TechSnapshot] = None
 
 
 @dataclass

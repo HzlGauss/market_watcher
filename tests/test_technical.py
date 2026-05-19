@@ -244,6 +244,54 @@ class TestSupportResistance:
         # 回看窗口更小，支撑/压力范围更窄
         assert result.resistance - result.support < 2.0
 
+    def test_sr_has_swing_points(self):
+        """测试摆动高低点计算"""
+        klines = _make_klines(30, 10.0, 0.05)
+        result = calc_support_resistance(klines)
+        # 应该有摆动点
+        assert result.swing_supports is not None
+        assert result.swing_resistances is not None
+
+    def test_sr_has_pivot_points(self):
+        """测试枢轴点计算"""
+        klines = _make_klines(30, 10.0, 0.05)
+        result = calc_support_resistance(klines)
+        # 应该有枢轴点
+        assert len(result.pivot_supports) == 3
+        assert len(result.pivot_resistances) == 3
+        # 枢轴支撑应该都小于枢轴压力
+        if result.pivot_supports and result.pivot_resistances:
+            assert max(result.pivot_supports) < min(result.pivot_resistances)
+
+    def test_sr_has_volume_clusters(self):
+        """测试成交密集区计算"""
+        klines = _make_klines(30, 10.0, 0.05)
+        result = calc_support_resistance(klines)
+        # 应该有成交密集区
+        assert result.volume_clusters is not None
+        assert len(result.volume_clusters) <= 3
+
+    def test_sr_comprehensive(self):
+        """测试综合支撑/压力位"""
+        klines = _make_klines(30, 10.0, 0.1)
+        result = calc_support_resistance(klines)
+        # 主支撑应该是所有支撑中的最小值
+        all_supports = (
+            (result.swing_supports or []) +
+            (result.pivot_supports or []) +
+            (result.volume_clusters or [])
+        )
+        if all_supports and result.support:
+            assert result.support <= min(all_supports)
+        # 主压力应该是所有压力中的最大值
+        all_resistances = (
+            (result.swing_resistances or []) +
+            (result.pivot_resistances or []) +
+            (result.volume_clusters or [])
+        )
+        if all_resistances and result.resistance:
+            assert result.resistance >= max(all_resistances)
+
 
 # ============================================================
 # 汇总函数 测试

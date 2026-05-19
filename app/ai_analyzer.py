@@ -69,6 +69,19 @@ def _build_prompt(
         for a in alerts:
             lines.append(f"- {a.name}({a.code}): {' | '.join(a.messages)}")
 
+    # 组合策略信号（从异动中提取）
+    strategy_signals = []
+    for a in alerts:
+        for msg in a.messages:
+            if "[趋势启动]" in msg or "[逃顶组合]" in msg or "[震荡套利]" in msg or "[双翼齐飞]" in msg:
+                strategy_signals.append(f"- {a.name}({a.code}): {msg}")
+
+    if strategy_signals:
+        lines.append("")
+        lines.append("## ⭐ 组合策略信号（多指标共振，高优先级）")
+        for sig in strategy_signals:
+            lines.append(sig)
+
     # 详细行情
     lines.append("")
     lines.append("## 全部标的涨跌幅")
@@ -92,9 +105,19 @@ def _build_prompt(
                 if tech.kdj_k is not None:
                     parts.append(f"KDJ:{tech.kdj_signal}")
                 if tech.support is not None:
-                    parts.append(f"支撑:{tech.support:.3f}")
+                    support_parts = [f"主支撑:{tech.support:.3f}"]
+                    if hasattr(tech, 'swing_supports') and tech.swing_supports:
+                        support_parts.append(f"摆动支撑:{tech.swing_supports[0]:.3f}")
+                    if hasattr(tech, 'pivot_supports') and tech.pivot_supports:
+                        support_parts.append(f"枢轴支撑:{tech.pivot_supports[0]:.3f}")
+                    parts.append(";".join(support_parts))
                 if tech.resistance is not None:
-                    parts.append(f"压力:{tech.resistance:.3f}")
+                    resistance_parts = [f"主压力:{tech.resistance:.3f}"]
+                    if hasattr(tech, 'swing_resistances') and tech.swing_resistances:
+                        resistance_parts.append(f"摆动压力:{tech.swing_resistances[0]:.3f}")
+                    if hasattr(tech, 'pivot_resistances') and tech.pivot_resistances:
+                        resistance_parts.append(f"枢轴压力:{tech.pivot_resistances[0]:.3f}")
+                    parts.append(";".join(resistance_parts))
                 if tech.bb_signal:
                     parts.append(f"布林带:{tech.bb_signal}")
                 lines.append(" ".join(parts))
@@ -111,10 +134,17 @@ def _build_prompt(
         "- 如果缩量上涨，需标注\"缩量上涨，持续性存疑\"",
         "- 如果放量下跌，需标注\"抛压较重，谨慎\"",
         "",
-        "### 第三步：异动解读",
+        "### 第三步：组合策略信号解读（如有）",
+        "如果存在组合策略信号，这是多指标共振的高胜率信号，需要重点解读：",
+        "- 趋势启动：MACD+RSI+KDJ共振做多，可信度高",
+        "- 逃顶组合：价格新高+顶背离+超买+死叉，立即减仓",
+        "- 震荡套利：布林带边界+RSI极值+KDJ交叉，适合短线",
+        "- 双翼齐飞：KDJ+RSI低位共振+放量，底部反弹信号",
+        "",
+        "### 第四步：异动解读",
         "对警报标的逐一说明：是技术性回调、资金驱动还是基本面因素？",
         "",
-        "### 第四步：关键技术位判断",
+        "### 第五步：关键技术位判断",
         "结合 RSI（超买/超卖）、MACD（金叉/死叉）、KDJ 的位置，给出交叉验证结论：",
         "- 多个指标是否指向同一方向？（如 RSI 超买 + KDJ 高位死叉 = 短期回调压力大）",
         "- 指标是否出现背离？（如价格新高但 RSI 未创新高 = 顶背离风险）",

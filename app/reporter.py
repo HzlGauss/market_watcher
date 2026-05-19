@@ -73,7 +73,76 @@ def _holdings_summary(
             total_cost += cost
             total_pnl += pnl
 
-    return results, total_pnl, total_cost
+    return results
+
+
+def _get_holdings_strategy_signals(
+    holdings: list[Holding],
+    quotes: list[Quote],
+) -> list[dict]:
+    """获取持仓的组合策略信号
+
+    返回每个持仓的组合策略信号列表。
+    网络异常时返回空列表。
+    """
+    from app.technical import (
+        fetch_historical_kline,
+        get_technical_summary,
+    )
+    from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    from app.models import TechSnapshot, tech_snapshot_to_summary
+    from app.analyzer import _load_scan_history
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: list[dict] = []
+    quotes_map = {q.code: q for q in quotes}
+
+    # 加载扫描历史，获取前一次技术快照
+    scan_history = _load_scan_history()
+    prev_tech_map: dict[str, "TechnicalSummary"] = {}
+    if scan_history:
+        last_record = scan_history[-1]
+        for code, status in last_record.funds_status.items():
+            if status.tech_snapshot:
+                prev_tech_map[code] = tech_snapshot_to_summary(status.tech_snapshot)
+
+    def _eval_one(h: Holding) -> dict | None:
+        quote = quotes_map.get(h.code)
+        if not quote:
+            return None
+
+        klines = fetch_historical_kline(h.code, h.market, days=60)
+        if not klines:
+            return None
+
+        tech = get_technical_summary(quote, klines)
+        prev_tech = prev_tech_map.get(h.code)
+        closes = [k.close for k in klines if k.close is not None]
+        dif_vals = calc_macd_dif_series(closes) if closes else None
+
+        signals = evaluate_all_strategies(tech, prev_tech, quote, klines, dif_vals, closes)
+        triggering = [s for s in signals if s.is_triggering]
+
+        if not triggering:
+            return None
+
+        return {
+            "name": h.name,
+            "code": h.code,
+            "signals": [s.to_alert_text() for s in triggering],
+        }
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(_eval_one, h): h.code for h in holdings}
+        for future in futures:
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                log.warning(f"组合策略评估失败 [{futures[future]}]: {e}")
+
+    return results
 
 
 def _get_holdings_tech_analysis(
@@ -123,6 +192,23 @@ def _get_holdings_tech_analysis(
         macd = calc_macd(closes)
         kdj = calc_kdj(highs, lows, closes)
 
+        # 综合支撑/压力位描述
+        support_parts = []
+        if sr.support:
+            support_parts.append(f"主支撑:{sr.support:.3f}")
+        if sr.swing_supports:
+            support_parts.append(f"摆动支撑:{','.join(f'{s:.3f}' for s in sr.swing_supports[:2])}")
+        if sr.pivot_supports:
+            support_parts.append(f"枢轴支撑:{sr.pivot_supports[0]:.3f}")
+
+        resistance_parts = []
+        if sr.resistance:
+            resistance_parts.append(f"主压力:{sr.resistance:.3f}")
+        if sr.swing_resistances:
+            resistance_parts.append(f"摆动压力:{','.join(f'{r:.3f}' for r in sr.swing_resistances[:2])}")
+        if sr.pivot_resistances:
+            resistance_parts.append(f"枢轴压力:{sr.pivot_resistances[0]:.3f}")
+
         return {
             "name": h.name,
             "code": h.code,
@@ -130,6 +216,8 @@ def _get_holdings_tech_analysis(
             "change_pct": quote.change_pct,
             "support": sr.support,
             "resistance": sr.resistance,
+            "support_desc": ";".join(support_parts) if support_parts else "数据不足",
+            "resistance_desc": ";".join(resistance_parts) if resistance_parts else "数据不足",
             "atr": sr.atr,
             "vol_price": vol_price,
             "rsi": rsi_val,
@@ -140,6 +228,7 @@ def _get_holdings_tech_analysis(
             "kdj_k": kdj.k,
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
+            "volume_clusters": sr.volume_clusters,
         }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -285,11 +374,22 @@ def generate_morning_brief(config: Config) -> Path | None:
                 for h in h_results[:5]:
                     data_lines.append(f"  - {h['name']}（昨收）")
 
+            # 组合策略信号展示
+            strat_sigs = _get_holdings_strategy_signals(holdings, quotes)
+            if strat_sigs:
+                data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振）")
+                for s in strat_sigs:
+                    for sig_text in s['signals']:
+                        data_lines.append(f"  - {s['name']}: {sig_text}")
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 4. Fetch technical analysis for holdings (for LLM prompt)
     holdings = config.holdings
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings and quotes else []
+
+    # 4.5. Fetch combination strategy signals for holdings
+    strategy_signals = _get_holdings_strategy_signals(holdings, quotes) if holdings and quotes else []
 
     # 5. Build LLM prompt (compact data format)
     llm_lines = [
@@ -329,16 +429,25 @@ def generate_morning_brief(config: Config) -> Path | None:
         llm_lines.append("\n[持仓技术分析]")
         for t in tech_data:
             parts = [f"  {t['name']}:"]
-            if t['support']:
-                parts.append(f"支撑:{t['support']:.3f}")
-            if t['resistance']:
-                parts.append(f"压力:{t['resistance']:.3f}")
+            if t.get('support_desc'):
+                parts.append(t['support_desc'])
+            if t.get('resistance_desc'):
+                parts.append(t['resistance_desc'])
+            if t.get('volume_clusters'):
+                clusters = t['volume_clusters']
+                parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
             llm_lines.append(" ".join(parts))
+
+    if strategy_signals:
+        llm_lines.append("\n[⭐ 组合策略信号（多指标共振，高优先级）]")
+        for s in strategy_signals:
+            for sig_text in s['signals']:
+                llm_lines.append(f"  {s['name']}: {sig_text}")
 
     llm_lines.append(f"""
 
@@ -465,23 +574,32 @@ def generate_midday_review(config: Config) -> Path | None:
 
     # Technical analysis for holdings
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings else []
+    strategy_signals = _get_holdings_strategy_signals(holdings, quotes) if holdings else []
     if tech_data:
         data_lines.append("\n## 五、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位 | 压力位 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|--------|--------|-----|----------|-----|------|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|--------|--------|")
         for t in tech_data:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
-            sup = f"{t['support']:.3f}" if t['support'] else "--"
-            res = f"{t['resistance']:.3f}" if t['resistance'] else "--"
+            sup = t.get('support_desc', '--')
+            res = t.get('resistance_desc', '--')
+            clusters = t.get('volume_clusters')
+            cluster_str = f"{','.join(f'{c:.3f}' for c in clusters[:2])}" if clusters else "--"
             atr = f"{t['atr']:.3f}" if t['atr'] else "--"
             rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
             macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
             kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+
+    if strategy_signals:
+        data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，下午操作参考）")
+        for s in strategy_signals:
+            for sig_text in s['signals']:
+                data_lines.append(f"  - {s['name']}: {sig_text}")
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -533,16 +651,25 @@ def generate_midday_review(config: Config) -> Path | None:
         llm_lines.append("\n[技术分析]")
         for t in tech_data:
             parts = [f"  {t['name']}:"]
-            if t['support']:
-                parts.append(f"支撑:{t['support']:.3f}")
-            if t['resistance']:
-                parts.append(f"压力:{t['resistance']:.3f}")
+            if t.get('support_desc'):
+                parts.append(t['support_desc'])
+            if t.get('resistance_desc'):
+                parts.append(t['resistance_desc'])
+            if t.get('volume_clusters'):
+                clusters = t['volume_clusters']
+                parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
             llm_lines.append(" ".join(parts))
+
+    if strategy_signals:
+        llm_lines.append("\n[⭐ 组合策略信号（多指标共振，高优先级）]")
+        for s in strategy_signals:
+            for sig_text in s['signals']:
+                llm_lines.append(f"  {s['name']}: {sig_text}")
 
     llm_lines.append(f"""
 
@@ -859,23 +986,32 @@ def generate_evening_review(config: Config) -> Path | None:
 
     # Technical analysis for holdings
     tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
+    strategy_signals_evening = _get_holdings_strategy_signals(holdings, quotes)
     if tech_data_evening:
         data_lines.append("\n## 四、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位 | 压力位 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|--------|--------|-----|----------|-----|------|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|--------|--------|")
         for t in tech_data_evening:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
-            sup = f"{t['support']:.3f}" if t['support'] else "--"
-            res = f"{t['resistance']:.3f}" if t['resistance'] else "--"
+            sup = t.get('support_desc', '--')
+            res = t.get('resistance_desc', '--')
+            clusters = t.get('volume_clusters')
+            cluster_str = f"{','.join(f'{c:.3f}' for c in clusters[:2])}" if clusters else "--"
             atr = f"{t['atr']:.3f}" if t['atr'] else "--"
             rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
             macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
             kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+
+    if strategy_signals_evening:
+        data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振，明日操作参考）")
+        for s in strategy_signals_evening:
+            for sig_text in s['signals']:
+                data_lines.append(f"  - {s['name']}: {sig_text}")
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -916,16 +1052,25 @@ def generate_evening_review(config: Config) -> Path | None:
         llm_lines.append("\n[技术分析]")
         for t in tech_data_evening:
             parts = [f"  {t['name']}:"]
-            if t['support']:
-                parts.append(f"支撑:{t['support']:.3f}")
-            if t['resistance']:
-                parts.append(f"压力:{t['resistance']:.3f}")
+            if t.get('support_desc'):
+                parts.append(t['support_desc'])
+            if t.get('resistance_desc'):
+                parts.append(t['resistance_desc'])
+            if t.get('volume_clusters'):
+                clusters = t['volume_clusters']
+                parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
             llm_lines.append(" ".join(parts))
+
+    if strategy_signals_evening:
+        llm_lines.append("\n[⭐ 组合策略信号（多指标共振，高优先级）]")
+        for s in strategy_signals_evening:
+            for sig_text in s['signals']:
+                llm_lines.append(f"  {s['name']}: {sig_text}")
 
     llm_lines.append(f"""
 
