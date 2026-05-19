@@ -282,9 +282,8 @@ def generate_morning_brief(config: Config) -> Path | None:
             h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
             if h_results:
                 data_lines.append(f"\n## 四、持仓概况（昨收，开盘前参考）")
-                data_lines.append(f"- 浮盈/亏合计: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
                 for h in h_results[:5]:
-                    data_lines.append(f"  - {h['name']}: {h['pnl_pct']:+.2f}%（昨收）")
+                    data_lines.append(f"  - {h['name']}（昨收）")
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -322,9 +321,9 @@ def generate_morning_brief(config: Config) -> Path | None:
 
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes) if holdings else ([], 0, 0)
         if h_results:
-            llm_lines.append(f"\n[持仓] 浮盈/亏: {total_pnl:+,.2f} ({total_pnl/total_cost*100:+.2f}%)")
+            llm_lines.append(f"\n[持仓]")
             for h in h_results[:5]:
-                llm_lines.append(f"  {h['name']}: {h['pnl_pct']:+.2f}%")
+                llm_lines.append(f"  {h['name']}")
 
     if tech_data:
         llm_lines.append("\n[持仓技术分析]")
@@ -461,10 +460,8 @@ def generate_midday_review(config: Config) -> Path | None:
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
         if h_results:
             data_lines.append(f"\n## 四、持仓午间扫描")
-            data_lines.append(f"- 总成本: {total_cost:,.2f} | 午间总盈亏: {total_pnl:+,.2f}")
             for h in h_results:
-                color = "🟢" if h["pnl"] >= 0 else "🔴"
-                data_lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%)")
+                data_lines.append(f"  - {h['name']}({h['code']}): {h['amount']}股")
 
     # Technical analysis for holdings
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings else []
@@ -528,9 +525,9 @@ def generate_midday_review(config: Config) -> Path | None:
     if holdings:
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
         if h_results:
-            llm_lines.append(f"\n[持仓] 总盈亏: {total_pnl:+,.2f}")
+            llm_lines.append(f"\n[持仓]")
             for h in h_results:
-                llm_lines.append(f"  {h['name']}: {h['pnl_pct']:+.2f}%")
+                llm_lines.append(f"  {h['name']}")
 
     if tech_data:
         llm_lines.append("\n[技术分析]")
@@ -618,56 +615,119 @@ def _simple_attribution(h_results: list[dict], market_return: float | None) -> d
     }
 
 
-def _analyze_capital_flow(quote: Quote) -> str:
-    """分析个股资金流向，判断主力/散户行为"""
+def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str:
+    """
+    分析个股资金流向，判断主力/散户行为
+
+    判断依据：
+    1. 真实成交量倍率：当日成交量 / 前日成交量（核心指标）
+    2. 量价关系：放量上涨倾向于主力入场，缩量上涨可能是散户行为
+    3. 开盘表现：高开高走且放量可能是主力
+    4. 日内位置：收盘接近高点且放量倾向于主力
+    5. 振幅与波动：大幅波动且放量可能是主力博弈
+
+    Args:
+        quote: 实时行情数据
+        prev_volume: 前一日成交量（用于计算倍率）
+    """
     if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
         return "数据不足"
 
     change_pct = quote.change_pct or 0
     amplitude = quote.amplitude or 0
+    volume = quote.volume or 0
     qtype = quote.type or ""
 
     is_etf = "ETF" in qtype
     is_index = "指数" in qtype
 
+    # 涨跌幅阈值（按标的类型调整）
     if is_index:
-        amp_high, amp_low, pct_high = 1.0, 0.3, 0.5
+        pct_high = 0.5
     elif is_etf:
-        amp_high, amp_low, pct_high = 1.5, 0.6, 1.0
+        pct_high = 1.0
     else:
-        amp_high, amp_low, pct_high = 4.0, 1.5, 2.0
+        pct_high = 2.0
 
+    # 计算成交量倍率（核心判断指标）
+    vol_ratio = None
+    if prev_volume and prev_volume > 0 and volume > 0:
+        vol_ratio = volume / prev_volume
+
+    # 放量/缩量判断阈值
+    VOL_EXPANSION_THRESHOLD = 1.5   # 成交量是前日的1.5倍以上为放量
+    VOL_SHRINK_THRESHOLD = 0.6      # 成交量不到前日的60%为缩量
+
+    # 日内位置百分比 (0-100)
     if quote.high > quote.low:
         position = ((quote.price - quote.low) / (quote.high - quote.low)) * 100
     else:
         position = 50
 
+    # 开盘溢价
     gap_up = quote.open > quote.pre_close
     gap_pct = ((quote.open - quote.pre_close) / quote.pre_close * 100) if gap_up else 0
+
     signals = []
 
-    if change_pct > pct_high and amplitude > amp_high:
-        signals.append("主力资金入场")
-    elif change_pct > pct_high * 0.7 and amplitude < amp_low:
-        signals.append("散户推动或锁仓上涨")
-    elif change_pct < -pct_high and amplitude > amp_high:
-        signals.append("主力资金出逃")
-    elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
-        signals.append("散户抛售或惜售")
+    # ---- 基于真实成交量的判断（优先）----
+    if vol_ratio is not None:
+        # 放量上涨 = 主力入场信号
+        if change_pct > pct_high and vol_ratio >= VOL_EXPANSION_THRESHOLD:
+            signals.append(f"放量上涨（{vol_ratio:.1f}倍），主力入场")
 
+        # 缩量上涨 = 散户行为或锁仓
+        elif change_pct > pct_high * 0.5 and vol_ratio <= VOL_SHRINK_THRESHOLD:
+            signals.append(f"缩量上涨（{vol_ratio:.1f}倍），买盘不强")
+
+        # 放量下跌 = 主力出逃
+        elif change_pct < -pct_high and vol_ratio >= VOL_EXPANSION_THRESHOLD:
+            signals.append(f"放量下跌（{vol_ratio:.1f}倍），主力出逃⚠️")
+
+        # 缩量下跌 = 散户抛售或惜售
+        elif change_pct < -pct_high * 0.5 and vol_ratio <= VOL_SHRINK_THRESHOLD:
+            signals.append(f"缩量下跌（{vol_ratio:.1f}倍），抛压减弱")
+
+        # 平盘放量
+        elif abs(change_pct) <= pct_high * 0.3 and vol_ratio >= VOL_EXPANSION_THRESHOLD:
+            signals.append(f"平盘放量（{vol_ratio:.1f}倍），资金博弈")
+
+    # ---- 没有历史成交量时，使用振幅作为辅助判断 ----
+    elif vol_ratio is None:
+        amp_high = 1.0 if is_index else (1.5 if is_etf else 4.0)
+        amp_low = 0.3 if is_index else (0.6 if is_etf else 1.5)
+
+        if change_pct > pct_high and amplitude > amp_high:
+            signals.append("振幅较大上涨，疑似放量（无历史数据）")
+        elif change_pct > pct_high * 0.7 and amplitude < amp_low:
+            signals.append("振幅较小上涨，疑似缩量（无历史数据）")
+        elif change_pct < -pct_high and amplitude > amp_high:
+            signals.append("振幅较大下跌，疑似放量（无历史数据）")
+        elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
+            signals.append("振幅较小下跌，疑似缩量（无历史数据）")
+
+    # ---- 辅助判断因素 ----
+
+    # 高位收盘 + 放量 = 强势主力
     if position > 80 and change_pct > pct_high * 0.7:
-        if not signals:
-            signals.append("强势资金主导")
-        else:
-            signals[0] = signals[0].replace("资金", "强势资金")
-    elif position < 20 and change_pct < -pct_high * 0.7:
-        if not signals:
-            signals.append("恐慌抛压")
+        if signals and "放量" in signals[0]:
+            signals[0] = signals[0].replace("主力", "强势主力")
+        elif not signals:
+            signals.append("强势资金主导（收盘接近日内高点）")
 
+    # 低位收盘 + 放量 = 恐慌抛盘
+    elif position < 20 and change_pct < -pct_high * 0.7:
+        if signals and "放量" in signals[0]:
+            signals[0] = signals[0].replace("出逃", "恐慌出逃")
+        elif not signals:
+            signals.append("恐慌抛压（收盘接近日内低点）")
+
+    # 高开低走 = 主力出货
     if gap_up and gap_pct > pct_high * 0.7 and change_pct < 0:
         signals.append("高开低走，疑似出货")
 
-    tail_amp = amp_low if is_etf else 2.0
+    # 尾盘拉升 = 主力做盘
+    tail_amp = 0.6 if is_etf else 2.0
     if position > 85 and change_pct > pct_high * 0.5 and amplitude > tail_amp:
         signals.append("尾盘拉升，主力做盘")
 
@@ -696,6 +756,18 @@ def generate_evening_review(config: Config) -> Path | None:
     if not quotes:
         log.warning("Evening review: No quote data")
         return None
+
+    # 加载历史成交量数据
+    prev_state = {}
+    try:
+        from pathlib import Path
+        state_path = Path(__file__).resolve().parent.parent / "state" / "monitor_state.json"
+        if state_path.exists():
+            import json
+            with open(state_path, "r", encoding="utf-8") as f:
+                prev_state = json.load(f)
+    except Exception as e:
+        log.warning(f"加载历史状态失败: {e}")
 
     # 获取大盘当日涨跌幅，用于 β/α 归因
     market_return = None
@@ -746,7 +818,9 @@ def generate_evening_review(config: Config) -> Path | None:
                     elif quote.change_pct < -2:
                         tech_info.append("走势疲软")
 
-                capital_flow = _analyze_capital_flow(quote)
+                # 获取前一日成交量
+                prev_volume = prev_state.get(h["code"], {}).get("volume")
+                capital_flow = _analyze_capital_flow(quote, prev_volume)
                 holdings_with_analysis.append({
                     **h,
                     "quote": quote,
@@ -755,13 +829,11 @@ def generate_evening_review(config: Config) -> Path | None:
                 })
 
         data_lines.append(f"\n## 三、持仓表现")
-        data_lines.append(f"- 总成本: {total_cost:,.2f} | 今日总盈亏: {total_pnl:+,.2f}")
 
         data_lines.append("\n### 3.1 持仓详情")
         for h in holdings_with_analysis:
-            color = "🟢" if h["pnl"] >= 0 else "🔴"
             tech_note = f" [{h['tech']}]" if h.get("tech") else ""
-            data_lines.append(f"  {color} {h['name']}({h['code']}): {h['amount']}股 | 盈亏: {h['pnl']:+,.2f} ({h['pnl_pct']:+.2f}%){tech_note}")
+            data_lines.append(f"  - {h['name']}({h['code']}): {h['amount']}股{tech_note}")
 
         has_rich = any(h.get("quote", {}).pe_ratio is not None for h in holdings_with_analysis)
         if has_rich:
@@ -820,27 +892,25 @@ def generate_evening_review(config: Config) -> Path | None:
 
     if h_results:
         attr = _simple_attribution(h_results, market_return)
-        if attr["beta_pnl"] is not None:
-            llm_lines.append(f"\n[持仓] 总成本: {total_cost:,.2f} | 总盈亏: {attr['total_pnl']:+,.2f} | β贡献: {attr['beta_pnl']:+,.2f} | α贡献: {attr['alpha_pnl']:+,.2f}")
-        else:
-            llm_lines.append(f"\n[持仓] 总成本: {total_cost:,.2f} | 总盈亏: {total_pnl:+,.2f}")
+        llm_lines.append(f"\n[持仓]")
     else:
         attr = {"beta_pnl": None, "alpha_pnl": None, "total_pnl": 0}
-        for h in h_results:
-            quote = next((q for q in quotes if q.code == h["code"]), None)
-            info = f"  {h['name']}: {h['pnl_pct']:+.2f}%"
-            if quote:
-                flow = _analyze_capital_flow(quote)
-                info += f" [{flow}]"
-                if quote.pe_ratio is not None:
-                    info += f" PE:{quote.pe_ratio:.1f}"
-                if quote.market_cap is not None:
-                    info += f" 市值:{quote.market_cap/1e4:.0f}亿"
-                if quote.turnover_rate is not None:
-                    info += f" 换手:{quote.turnover_rate:.2f}%"
-                if quote.change_pct and abs(quote.change_pct) > 2:
-                    info += f" {'走势强劲' if quote.change_pct > 0 else '走势疲软'}"
-            llm_lines.append(info)
+        llm_lines.append(f"\n[持仓]")
+    for h in h_results:
+        quote = next((q for q in quotes if q.code == h["code"]), None)
+        info = f"  {h['name']}"
+        if quote:
+            flow = _analyze_capital_flow(quote, prev_state.get(h["code"], {}).get("volume"))
+            info += f" [{flow}]"
+            if quote.pe_ratio is not None:
+                info += f" PE:{quote.pe_ratio:.1f}"
+            if quote.market_cap is not None:
+                info += f" 市值:{quote.market_cap/1e4:.0f}亿"
+            if quote.turnover_rate is not None:
+                info += f" 换手:{quote.turnover_rate:.2f}%"
+            if quote.change_pct and abs(quote.change_pct) > 2:
+                info += f" {'走势强劲' if quote.change_pct > 0 else '走势疲软'}"
+        llm_lines.append(info)
 
     if tech_data_evening:
         llm_lines.append("\n[技术分析]")
@@ -861,10 +931,9 @@ def generate_evening_review(config: Config) -> Path | None:
 
 请按以下结构生成晚报（约 700 字）：
 
-### 一、持仓全景归因
-- 今日总盈亏：{attr['total_pnl']:+,.2f}{" | β贡献: " + f"{attr['beta_pnl']:+,.2f}" + " | α贡献: " + f"{attr['alpha_pnl']:+,.2f}" if attr['beta_pnl'] is not None else ""}
-- 归因分析：多少来自市场整体涨跌（β），多少来自持仓自身表现（α）？
+### 一、持仓全景分析
 - 强弱分化：哪只最强/最弱，差距原因是什么？
+- 技术面综合评估：整体持仓的技术状态如何？
 
 ### 二、重点持仓深度点评（按重要性排序，不超过 3 只）
 对每只持仓输出：
@@ -882,7 +951,7 @@ def generate_evening_review(config: Config) -> Path | None:
 | 悲观 | 低开+放量下跌 | ... | 中 |
 
 ### 四、风控红线
-明日每只持仓的硬止损位和硬止盈位（具体价格或盈亏百分比）。
+明日每只持仓的硬止损位和硬止盈位（具体价格）。
 
 要求：必须使用条件格式（if-then），标注置信度。不输出与持仓无关的市场分析。
 

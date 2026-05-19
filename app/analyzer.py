@@ -3,11 +3,159 @@
 """
 
 from __future__ import annotations
+import json
 import statistics
+from pathlib import Path
 from typing import Optional
 
-from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData
+from app.models import (
+    Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary,
+    NorthFlowData, ScanRecord, FundScanStatus
+)
 from app.config import Config
+
+# 盯盘历史文件路径
+MONITOR_HISTORY_PATH = Path(__file__).resolve().parent.parent / "state" / "monitor_history.json"
+
+
+def _load_scan_history() -> list[ScanRecord]:
+    """加载盯盘扫描历史"""
+    if not MONITOR_HISTORY_PATH.exists():
+        return []
+
+    try:
+        with open(MONITOR_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        records = []
+        for item in data:
+            funds_status = {}
+            for code, status_data in item.get("funds_status", {}).items():
+                funds_status[code] = FundScanStatus(
+                    price=status_data.get("price"),
+                    change_pct=status_data.get("change_pct"),
+                    volume=status_data.get("volume"),
+                    vol_ratio=status_data.get("vol_ratio"),
+                    alerts=status_data.get("alerts", []),
+                    tech_signals=status_data.get("tech_signals", [])
+                )
+
+            records.append(ScanRecord(
+                scan_id=item.get("scan_id", 0),
+                time=item.get("time", ""),
+                timestamp=item.get("timestamp", 0),
+                market_sentiment=item.get("market_sentiment", {}),
+                alerts_summary=item.get("alerts_summary", {}),
+                funds_status=funds_status,
+                llm_analysis=item.get("llm_analysis")
+            ))
+
+        return records
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"加载扫描历史失败: {e}")
+        return []
+
+
+def _save_scan_history(records: list[ScanRecord]) -> None:
+    """保存盯盘扫描历史（保留最近20条，自动删除更早的记录）"""
+    try:
+        # records 已经包含了历史记录+新记录，直接截取最近20条
+        # 早于第20条的记录会被自动丢弃
+        if len(records) > 20:
+            # 删除早于前20条的记录
+            records_to_save = records[-20:]
+        else:
+            records_to_save = records
+
+        data = []
+        for record in records_to_save:
+            funds_status_dict = {}
+            for code, status in record.funds_status.items():
+                funds_status_dict[code] = {
+                    "price": status.price,
+                    "change_pct": status.change_pct,
+                    "volume": status.volume,
+                    "vol_ratio": status.vol_ratio,
+                    "alerts": status.alerts,
+                    "tech_signals": status.tech_signals
+                }
+
+            data.append({
+                "scan_id": record.scan_id,
+                "time": record.time,
+                "timestamp": record.timestamp,
+                "market_sentiment": record.market_sentiment,
+                "alerts_summary": record.alerts_summary,
+                "funds_status": funds_status_dict,
+                "llm_analysis": record.llm_analysis
+            })
+
+        MONITOR_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MONITOR_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"保存扫描历史失败: {e}")
+
+
+# ============================================================
+# 情绪拐点检测
+# ============================================================
+
+def _detect_sentiment_reversal(
+    scan_history: list[ScanRecord],
+    current_score: int,
+    min_consecutive: int = 3,
+    min_reversal_amount: int = 5
+) -> tuple[str | None, str]:
+    """
+    检测情绪拐点
+
+    Args:
+        scan_history: 扫描历史记录
+        current_score: 当前情绪分数
+        min_consecutive: 最少连续变化次数
+        min_reversal_amount: 最少反转幅度
+
+    Returns:
+        (拐点类型, 描述信息)
+        - ("bottom", "描述") - 底部拐点
+        - ("top", "描述") - 顶部拐点
+        - (None, "") - 无拐点
+    """
+    if not scan_history or len(scan_history) < min_consecutive:
+        return None, ""
+
+    # 获取最近N次的情绪分数
+    recent_scores = [
+        s.market_sentiment.get("score", 50)
+        for s in scan_history[-min_consecutive:]
+    ]
+
+    # 检测底部拐点：连续下降后首次回升
+    is_consecutive_down = all(
+        recent_scores[i] > recent_scores[i+1]
+        for i in range(len(recent_scores) - 1)
+    )
+
+    if is_consecutive_down and current_score > recent_scores[-1] + min_reversal_amount:
+        drop_amount = recent_scores[0] - recent_scores[-1]
+        rise_amount = current_score - recent_scores[-1]
+        return "bottom", f"📊 情绪拐点：连续{min_consecutive}期下跌（{recent_scores[0]}→{recent_scores[-1]}）后回升{rise_amount}分至{current_score}分，可能见底"
+
+    # 检测顶部拐点：连续上升后首次回落
+    is_consecutive_up = all(
+        recent_scores[i] < recent_scores[i+1]
+        for i in range(len(recent_scores) - 1)
+    )
+
+    if is_consecutive_up and current_score < recent_scores[-1] - min_reversal_amount:
+        rise_amount = recent_scores[-1] - recent_scores[0]
+        drop_amount = recent_scores[-1] - current_score
+        return "top", f"📊 情绪拐点：连续{min_consecutive}期上涨（{recent_scores[0]}→{recent_scores[-1]}）后回落{drop_amount}分至{current_score}分，可能见顶"
+
+    return None, ""
 
 
 # ============================================================
@@ -157,11 +305,25 @@ def analyze(
     config: Config,
     tech_summaries: dict[str, TechnicalSummary] | None = None,
     north_data: Optional["NorthFlowData"] = None,
+    scan_history: list[ScanRecord] | None = None,
 ) -> tuple[list[Alert], AnalysisStats]:
     """执行全部分析，返回异动列表和统计结果"""
     base = config.thresholds
     sentiment = calc_market_sentiment(quotes)
     thresholds = adjust_thresholds(base, sentiment, config)
+
+    # 检测情绪拐点
+    sentiment_reversal = None
+    sentiment_reversal_msg = ""
+    if scan_history and len(scan_history) >= 3:
+        reversal_type, reversal_msg = _detect_sentiment_reversal(
+            scan_history, sentiment.score
+        )
+        if reversal_type:
+            sentiment_reversal = reversal_type
+            sentiment_reversal_msg = reversal_msg
+            from app.utils import log
+            log.info(f"  {reversal_msg}")
 
     up_warn = thresholds["涨幅预警"]
     up_notice = thresholds["涨幅关注"]
@@ -257,6 +419,50 @@ def analyze(
             if tech.signals:
                 for sig in tech.signals:
                     items.append(f"📐 {sig}")
+
+        # ---- 历史趋势增强判断 ----
+        if scan_history and len(scan_history) >= 3 and cp is not None:
+            # 获取最近3次扫描中该基金的涨跌幅
+            changes = [
+                s.funds_status.get(q.code, {}).get("change_pct", 0)
+                for s in scan_history[-3:]
+                if s.funds_status.get(q.code)
+            ]
+
+            if len(changes) >= 3:
+                # 连续3次上涨且幅度扩大 → 加速上涨预警
+                if all(c > 0 for c in changes) and changes[0] < changes[1] < changes[2]:
+                    items.append(f"🚀 加速上涨（连续3期放大）")
+                    alert_count += 1
+
+                # 连续3次下跌且幅度扩大 → 加速下跌预警
+                elif all(c < 0 for c in changes) and abs(changes[0]) < abs(changes[1]) < abs(changes[2]):
+                    items.append(f"📉 加速下跌（连续3期放大）⚠️")
+                    alert_count += 1
+
+            # 量能连续放大 → 资金持续关注
+            vol_ratios = [
+                s.funds_status.get(q.code, {}).get("vol_ratio", 1)
+                for s in scan_history[-3:]
+                if s.funds_status.get(q.code) and s.funds_status[q.code].vol_ratio
+            ]
+
+            if len(vol_ratios) >= 3 and all(v >= 1.5 for v in vol_ratios):
+                items.append(f"💰 量能持续放大（资金持续关注）")
+
+            # 同一警报连续触发3次 → 警报升级
+            fund_alerts_history = []
+            for s in scan_history[-3:]:
+                if q.code in s.funds_status:
+                    fund_alerts_history.extend(s.funds_status[q.code].alerts)
+
+            # 统计相同类型的警报出现次数
+            from collections import Counter
+            alert_counts = Counter(fund_alerts_history)
+            for alert_msg, count in alert_counts.items():
+                if count >= 3 and alert_msg not in items:
+                    items.append(f"🔁 {alert_msg}（连续3次触发）")
+                    alert_count += 1
 
         if items:
             alerts.append(Alert(code=q.code, name=q.name, messages=items))

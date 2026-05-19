@@ -101,10 +101,10 @@ def _wait_until_next_slot(interval: int) -> None:
         time.sleep(1)
 
 
-def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = True) -> None:
+def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = True, scan_count: int = 0) -> None:
     """Run one scan cycle"""
     from app.data_fetcher import fetch_quotes
-    from app.analyzer import analyze
+    from app.analyzer import analyze, _load_scan_history, _save_scan_history
     from app.ai_analyzer import analyze as analyze_with_llm
     from app.notifier import push_alert
     from app.presenter import (
@@ -112,6 +112,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         print_llm_result, print_tail, save_brief
     )
     from app.technical import fetch_historical_kline, get_technical_summary
+    from app.models import ScanRecord, FundScanStatus
+    import time
 
     log.info("Scanning market data (Holdings + Watchlist)...")
 
@@ -180,8 +182,15 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         except Exception as e:
             log.warning(f"读取状态文件失败: {e}")
 
-    # Analyze all quotes together (with technical signals)
-    alerts, stats = analyze(quotes, prev_state, config, tech_summaries, north_data=north_fetcher.fetch())
+    # 加载扫描历史
+    scan_history = _load_scan_history()
+
+    # Analyze all quotes together (with technical signals and history)
+    alerts, stats = analyze(
+        quotes, prev_state, config, tech_summaries,
+        north_data=north_fetcher.fetch(),
+        scan_history=scan_history
+    )
     print_sentiment(stats)
 
     # 保存当前成交量，供下一周期量价分析
@@ -190,6 +199,43 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         log.warning(f"保存状态文件失败: {e}")
+
+    # 构建本次扫描记录
+    funds_status = {}
+    quote_map = {q.code: q for q in quotes}
+    alert_map = {a.code: a.messages for a in alerts}
+
+    for q in quotes:
+        prev_vol = prev_state.get(q.code, {}).get("volume")
+        vol_ratio = None
+        if prev_vol and prev_vol > 0 and q.volume and q.volume > 0:
+            vol_ratio = q.volume / prev_vol
+
+        funds_status[q.code] = FundScanStatus(
+            price=q.price,
+            change_pct=q.change_pct,
+            volume=q.volume,
+            vol_ratio=vol_ratio,
+            alerts=alert_map.get(q.code, []),
+            tech_signals=tech_summaries.get(q.code, []).signals if tech_summaries and q.code in tech_summaries else []
+        )
+
+    scan_record = ScanRecord(
+        scan_id=scan_count,
+        time=datetime.now().strftime("%H:%M"),
+        timestamp=int(time.time()),
+        market_sentiment={
+            "score": stats.sentiment.score,
+            "label": stats.sentiment.label
+        },
+        alerts_summary={
+            "total_alerts": len(alerts),
+            "critical_alerts": stats.alert_count,
+            "funds_with_alerts": [a.code for a in alerts]
+        },
+        funds_status=funds_status,
+        llm_analysis=None  # 将在后面填充
+    )
 
     # Print separate statistics
     if holdings_quotes:
@@ -209,6 +255,9 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
 
+            # 保存LLM分析结果到扫描记录
+            scan_record.llm_analysis = llm_result
+
             if config.push_enabled and config.sct_sendkey:
                 push_alert(alerts, stats, config, llm_result)
         else:
@@ -218,6 +267,10 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                 push_alert(alerts, stats, config)
     else:
         log.info("No alerts triggered")
+
+    # 保存扫描历史
+    scan_history.append(scan_record)
+    _save_scan_history(scan_history)
 
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
@@ -238,7 +291,7 @@ def _run_monitoring_loop(config: Config,
                 scan_count += 1
                 # LLM 每两次扫描执行一次（第 2、4、6... 次）
                 call_llm = (scan_count % 2 == 0)
-                _run_once(config, north_fetcher, call_llm=call_llm)
+                _run_once(config, north_fetcher, call_llm=call_llm, scan_count=scan_count)
             else:
                 now = datetime.now()
                 if first_run or now.minute % 15 == 0:

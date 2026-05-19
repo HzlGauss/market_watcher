@@ -250,6 +250,33 @@ class TechnicalSummary:
 
 
 # ============================================================
+# 盯盘历史模型
+# ============================================================
+
+@dataclass
+class FundScanStatus:
+    """单次扫描中某只基金的状态"""
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    volume: Optional[float] = None
+    vol_ratio: Optional[float] = None  # 相对前日成交量倍率
+    alerts: list[str] = field(default_factory=list)
+    tech_signals: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScanRecord:
+    """单次扫描记录"""
+    scan_id: int = 0
+    time: str = ""  # HH:MM格式
+    timestamp: int = 0
+    market_sentiment: dict = field(default_factory=dict)
+    alerts_summary: dict = field(default_factory=dict)
+    funds_status: dict = field(default_factory=dict)  # code -> FundScanStatus
+    llm_analysis: str | None = None
+
+
+# ============================================================
 # 常量
 # ============================================================
 
