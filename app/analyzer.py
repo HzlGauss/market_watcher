@@ -274,3 +274,166 @@ def analyze(
         north_flow=north_data,
     )
     return alerts, stats
+
+
+# ============================================================
+# 扫描历史持久化
+# ============================================================
+
+def _load_scan_history() -> list["ScanRecord"]:
+    """加载扫描历史（从 JSON 文件）
+
+    Returns:
+        扫描记录列表，如果文件不存在或读取失败则返回空列表
+    """
+    import json
+    from pathlib import Path
+
+    state_dir = Path(__file__).resolve().parent.parent / "state"
+    history_file = state_dir / "scan_history.json"
+
+    if not history_file.exists():
+        return []
+
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        records: list["ScanRecord"] = []
+        from app.models import ScanRecord, FundScanStatus, TechSnapshot
+
+        for item in data:
+            funds_status = {}
+            for code, status_data in item.get("funds_status", {}).items():
+                tech_snapshot = None
+                if status_data.get("tech_snapshot"):
+                    tech_data = status_data["tech_snapshot"]
+                    tech_snapshot = TechSnapshot(
+                        rsi=tech_data.get("rsi"),
+                        rsi_signal=tech_data.get("rsi_signal", ""),
+                        macd_dif=tech_data.get("macd_dif"),
+                        macd_dea=tech_data.get("macd_dea"),
+                        macd_histogram=tech_data.get("macd_histogram"),
+                        macd_signal=tech_data.get("macd_signal", ""),
+                        kdj_k=tech_data.get("kdj_k"),
+                        kdj_d=tech_data.get("kdj_d"),
+                        kdj_j=tech_data.get("kdj_j"),
+                        kdj_signal=tech_data.get("kdj_signal", ""),
+                        support=tech_data.get("support"),
+                        resistance=tech_data.get("resistance"),
+                        swing_supports=tech_data.get("swing_supports", []),
+                        swing_resistances=tech_data.get("swing_resistances", []),
+                        pivot_supports=tech_data.get("pivot_supports", []),
+                        pivot_resistances=tech_data.get("pivot_resistances", []),
+                        volume_clusters=tech_data.get("volume_clusters", []),
+                        atr=tech_data.get("atr"),
+                        bb_upper=tech_data.get("bb_upper"),
+                        bb_middle=tech_data.get("bb_middle"),
+                        bb_lower=tech_data.get("bb_lower"),
+                        bb_width=tech_data.get("bb_width"),
+                        bb_signal=tech_data.get("bb_signal", ""),
+                        signals=tech_data.get("signals", []),
+                    )
+
+                funds_status[code] = FundScanStatus(
+                    price=status_data.get("price"),
+                    change_pct=status_data.get("change_pct"),
+                    volume=status_data.get("volume"),
+                    vol_ratio=status_data.get("vol_ratio"),
+                    alerts=status_data.get("alerts", []),
+                    tech_signals=status_data.get("tech_signals", []),
+                    tech_snapshot=tech_snapshot,
+                )
+
+            records.append(ScanRecord(
+                scan_id=item.get("scan_id", 0),
+                time=item.get("time", ""),
+                timestamp=item.get("timestamp", 0),
+                market_sentiment=item.get("market_sentiment", {}),
+                alerts_summary=item.get("alerts_summary", {}),
+                funds_status=funds_status,
+                llm_analysis=item.get("llm_analysis"),
+            ))
+
+        return records
+
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"加载扫描历史失败: {e}")
+        return []
+
+
+def _save_scan_history(scan_history: list["ScanRecord"]) -> None:
+    """保存扫描历史到 JSON 文件
+
+    Args:
+        scan_history: 扫描记录列表
+    """
+    import json
+    from pathlib import Path
+
+    state_dir = Path(__file__).resolve().parent.parent / "state"
+    history_file = state_dir / "scan_history.json"
+
+    try:
+        data = []
+        for record in scan_history:
+            funds_status = {}
+            for code, status in record.funds_status.items():
+                tech_snapshot_data = None
+                if status.tech_snapshot:
+                    ts = status.tech_snapshot
+                    tech_snapshot_data = {
+                        "rsi": ts.rsi,
+                        "rsi_signal": ts.rsi_signal,
+                        "macd_dif": ts.macd_dif,
+                        "macd_dea": ts.macd_dea,
+                        "macd_histogram": ts.macd_histogram,
+                        "macd_signal": ts.macd_signal,
+                        "kdj_k": ts.kdj_k,
+                        "kdj_d": ts.kdj_d,
+                        "kdj_j": ts.kdj_j,
+                        "kdj_signal": ts.kdj_signal,
+                        "support": ts.support,
+                        "resistance": ts.resistance,
+                        "swing_supports": ts.swing_supports,
+                        "swing_resistances": ts.swing_resistances,
+                        "pivot_supports": ts.pivot_supports,
+                        "pivot_resistances": ts.pivot_resistances,
+                        "volume_clusters": ts.volume_clusters,
+                        "atr": ts.atr,
+                        "bb_upper": ts.bb_upper,
+                        "bb_middle": ts.bb_middle,
+                        "bb_lower": ts.bb_lower,
+                        "bb_width": ts.bb_width,
+                        "bb_signal": ts.bb_signal,
+                        "signals": ts.signals,
+                    }
+
+                funds_status[code] = {
+                    "price": status.price,
+                    "change_pct": status.change_pct,
+                    "volume": status.volume,
+                    "vol_ratio": status.vol_ratio,
+                    "alerts": status.alerts,
+                    "tech_signals": status.tech_signals,
+                    "tech_snapshot": tech_snapshot_data,
+                }
+
+            data.append({
+                "scan_id": record.scan_id,
+                "time": record.time,
+                "timestamp": record.timestamp,
+                "market_sentiment": record.market_sentiment,
+                "alerts_summary": record.alerts_summary,
+                "funds_status": funds_status,
+                "llm_analysis": record.llm_analysis,
+            })
+
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with open(history_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"保存扫描历史失败: {e}")

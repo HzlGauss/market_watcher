@@ -250,53 +250,20 @@ class TechnicalSummary:
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
     bb_width: Optional[float] = None
-            "kdj_d": self.kdj_d,
-            "kdj_j": self.kdj_j,
-            "kdj_signal": self.kdj_signal,
-        }
+    bb_signal: str = ""
+    signals: list[str] = field(default_factory=list)
 
-    @staticmethod
-    def from_dict(d: dict) -> "TechSnapshot":
-        return TechSnapshot(
-            rsi=d.get("rsi"),
-            macd_dif=d.get("macd_dif"),
-            macd_dea=d.get("macd_dea"),
-            macd_signal=d.get("macd_signal", ""),
-            kdj_k=d.get("kdj_k"),
-            kdj_d=d.get("kdj_d"),
-            kdj_j=d.get("kdj_j"),
-            kdj_signal=d.get("kdj_signal", ""),
-        )
 
-    @staticmethod
-    def from_technical_summary(tech: "TechnicalSummary") -> "TechSnapshot":
-        return TechSnapshot(
-            rsi=tech.rsi,
-            macd_dif=tech.macd_dif,
-            macd_dea=tech.macd_dea,
-            macd_signal=tech.macd_signal,
-            kdj_k=tech.kdj_k,
-            kdj_d=tech.kdj_d,
-            kdj_j=tech.kdj_j,
-            kdj_signal=tech.kdj_signal,
-        )
+# TechSnapshot 是 TechnicalSummary 的别名，向后兼容
+TechSnapshot = TechnicalSummary
 
 
 def tech_snapshot_to_summary(snapshot: "TechSnapshot") -> "TechnicalSummary":
-    """将 TechSnapshot 转为 TechnicalSummary（用于作为 prev_tech 传入策略引擎）"""
-    from app.models import TechnicalSummary
-    return TechnicalSummary(
-        rsi=snapshot.rsi,
-        rsi_signal="",
-        macd_dif=snapshot.macd_dif,
-        macd_dea=snapshot.macd_dea,
-        macd_histogram=None,
-        macd_signal=snapshot.macd_signal,
-        kdj_k=snapshot.kdj_k,
-        kdj_d=snapshot.kdj_d,
-        kdj_j=snapshot.kdj_j,
-        kdj_signal=snapshot.kdj_signal,
-    )
+    """将 TechSnapshot 转为 TechnicalSummary（用于作为 prev_tech 传入策略引擎）
+
+    由于 TechSnapshot 现在是 TechnicalSummary 的别名，直接返回即可。
+    """
+    return snapshot
 
 
 @dataclass

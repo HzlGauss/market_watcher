@@ -203,10 +203,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     # Analyze all quotes together (with technical signals and history)
     alerts, stats = analyze(
         quotes, prev_state, config, tech_summaries,
-        north_data=north_fetcher.fetch(),
-        scan_history=scan_history,
-        prev_tech_summaries=prev_tech_summaries,
-        klines_map=klines_map
+        north_data=north_fetcher.fetch()
     )
     print_sentiment(stats)
 
@@ -230,7 +227,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 
         tech_snapshot = None
         if tech_summaries and q.code in tech_summaries:
-            tech_snapshot = TechSnapshot.from_technical_summary(tech_summaries[q.code])
+            tech_snapshot = tech_summaries[q.code]
 
         funds_status[q.code] = FundScanStatus(
             price=q.price,
