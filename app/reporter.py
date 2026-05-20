@@ -161,6 +161,7 @@ def _get_holdings_tech_analysis(
         calc_rsi,
         calc_macd,
         calc_kdj,
+        calc_obv,
         rsi_signal,
     )
     from concurrent.futures import ThreadPoolExecutor
@@ -191,6 +192,7 @@ def _get_holdings_tech_analysis(
         rsi_val = calc_rsi(closes)
         macd = calc_macd(closes)
         kdj = calc_kdj(highs, lows, closes)
+        obv = calc_obv(klines)
 
         # 综合支撑/压力位描述
         support_parts = []
@@ -226,6 +228,8 @@ def _get_holdings_tech_analysis(
             "macd_dif": macd.dif,
             "kdj_signal": kdj.signal,
             "kdj_k": kdj.k,
+            "obv": obv.obv,
+            "obv_signal": obv.signal,
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
             "volume_clusters": sr.volume_clusters,
@@ -441,6 +445,8 @@ def generate_morning_brief(config: Config) -> Path | None:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
+            if t.get('obv') is not None:
+                parts.append(f"OBV:{t['obv']:.0f}({t['obv_signal']})")
             llm_lines.append(" ".join(parts))
 
     if strategy_signals:
@@ -579,8 +585,8 @@ def generate_midday_review(config: Config) -> Path | None:
     if tech_data:
         data_lines.append("\n## 五、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|-----|--------|--------|")
         for t in tech_data:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
@@ -592,9 +598,10 @@ def generate_midday_review(config: Config) -> Path | None:
             rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
             macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
             kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
+            obv_val = f"{t['obv']:.0f}({t['obv_signal']})" if t.get('obv') is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals:
         data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，下午操作参考）")
@@ -664,6 +671,8 @@ def generate_midday_review(config: Config) -> Path | None:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
+            if t.get('obv') is not None:
+                parts.append(f"OBV:{t['obv']:.0f}({t['obv_signal']})")
             llm_lines.append(" ".join(parts))
 
     if strategy_signals:
@@ -991,8 +1000,8 @@ def generate_evening_review(config: Config) -> Path | None:
     if tech_data_evening:
         data_lines.append("\n## 四、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|-----|--------|--------|")
         for t in tech_data_evening:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
@@ -1004,9 +1013,10 @@ def generate_evening_review(config: Config) -> Path | None:
             rsi = f"{t['rsi']:.1f}({t['rsi_signal']})" if t['rsi'] else "--"
             macd = f"DIF:{t['macd_dif']:.4f}({t['macd_signal']})" if t['macd_dif'] is not None else "--"
             kdj = f"K:{t['kdj_k']:.1f}({t['kdj_signal']})" if t['kdj_k'] is not None else "--"
+            obv_val = f"{t['obv']:.0f}({t['obv_signal']})" if t.get('obv') is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {vol} | {tr} |")
+            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals_evening:
         data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振，明日操作参考）")
@@ -1065,6 +1075,8 @@ def generate_evening_review(config: Config) -> Path | None:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
             parts.append(f"KDJ:{t['kdj_signal']}")
+            if t.get('obv') is not None:
+                parts.append(f"OBV:{t['obv']:.0f}({t['obv_signal']})")
             llm_lines.append(" ".join(parts))
 
     if strategy_signals_evening:

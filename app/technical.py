@@ -581,6 +581,201 @@ def calc_bollinger(closes: list[float], period: int = 20, multiplier: float = 2.
 
 
 # ============================================================
+# OBV —— 能量潮指标
+# ============================================================
+
+@dataclass
+class OBVResult:
+    obv: Optional[float] = None
+    signal: str = ""
+
+
+def calc_obv(klines: list[KlineData]) -> OBVResult:
+    """计算 OBV（On Balance Volume，能量潮）
+
+    OBV 将成交量与价格走势结合：
+    - 当日收盘价 > 前日收盘价，OBV = 前日 OBV + 当日成交量
+    - 当日收盘价 < 前日收盘价，OBV = 前日 OBV - 当日成交量
+    - 当日收盘价 == 前日收盘价，OBV = 前日 OBV
+
+    Args:
+        klines: K线数据（按时间升序）
+
+    Returns:
+        OBVResult 包含最新 OBV 值和趋势信号
+    """
+    if len(klines) < 2:
+        return OBVResult(signal="数据不足")
+
+    valid_klines = [k for k in klines if k.close is not None and k.volume is not None]
+    if len(valid_klines) < 2:
+        return OBVResult(signal="数据不足")
+
+    obv = 0.0
+    obv_series = [obv]
+
+    for i in range(1, len(valid_klines)):
+        prev_close = valid_klines[i - 1].close
+        curr_close = valid_klines[i].close
+        curr_volume = valid_klines[i].volume
+
+        if curr_close > prev_close:
+            obv += curr_volume
+        elif curr_close < prev_close:
+            obv -= curr_volume
+        # 相等时不变
+
+        obv_series.append(obv)
+
+    # 判断 OBV 趋势：对比近期 OBV 斜率
+    signal = "中性"
+    if len(obv_series) >= 10:
+        recent = obv_series[-5:]
+        earlier = obv_series[-10:-5]
+        recent_slope = (recent[-1] - recent[0]) / len(recent)
+        earlier_slope = (earlier[-1] - earlier[0]) / len(earlier)
+
+        if recent_slope > 0 and earlier_slope > 0 and recent_slope > earlier_slope:
+            signal = "放量上涨"
+        elif recent_slope > 0 and earlier_slope > 0:
+            signal = "温和放量"
+        elif recent_slope < 0 and earlier_slope < 0 and recent_slope < earlier_slope:
+            signal = "放量下跌"
+        elif recent_slope < 0 and earlier_slope < 0:
+            signal = "温和缩量"
+        elif recent_slope > 0 and earlier_slope < 0:
+            signal = "资金入场"
+        elif recent_slope < 0 and earlier_slope > 0:
+            signal = "资金离场"
+
+    return OBVResult(
+        obv=round(obv, 2),
+        signal=signal,
+    )
+
+
+# ============================================================
+# 辅助判断函数
+# ============================================================
+
+def is_stagflation(quote: Quote, klines: list[KlineData], price_threshold: float = 0.5, vol_threshold: float = 1.5) -> bool:
+    """判断滞涨：涨幅小但放量
+
+    价格上涨幅度很小但成交量明显放大，可能预示主力出货或上方抛压沉重。
+
+    Args:
+        quote: 当前行情
+        klines: 历史K线
+        price_threshold: 涨幅阈值（百分比），低于此值认为是小涨幅
+        vol_threshold: 量比阈值，高于此值认为是放量
+
+    Returns:
+        True 表示存在滞涨现象
+    """
+    if quote.change_pct is None or quote.volume is None:
+        return False
+
+    if quote.change_pct < 0:
+        return False
+
+    if quote.change_pct > price_threshold:
+        return False
+
+    hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
+    if len(hist) < 3:
+        return False
+
+    avg_vol = sum(hist) / len(hist)
+    if avg_vol <= 0:
+        return False
+
+    ratio = quote.volume / avg_vol
+    return ratio >= vol_threshold
+
+
+def is_above_ma_support(price: Optional[float], klines: list[KlineData], period: int = 20) -> bool:
+    """判断股价站稳均线支撑
+
+    检查当前价格是否站在 N 日均线之上，且均线呈上行趋势。
+
+    Args:
+        price: 当前价格
+        klines: 历史K线
+        period: 均线周期
+
+    Returns:
+        True 表示站稳均线支撑
+    """
+    if price is None or len(klines) < period + 1:
+        return False
+
+    closes = [k.close for k in klines if k.close is not None]
+    if len(closes) < period + 1:
+        return False
+
+    # 计算当前均线和前一日均线
+    curr_ma = sum(closes[-period:]) / period
+    prev_ma = sum(closes[-(period + 1):-1]) / period
+
+    # 价格在均线之上，且均线走平或向上
+    return price >= curr_ma and prev_ma >= curr_ma * 0.998
+
+
+def is_breakabove_bb_middle(price: Optional[float], klines: list[KlineData], period: int = 20) -> bool:
+    """判断股价突破布林带中轨
+
+    检查当前价格是否从下方突破布林带中轨（MA20），
+    表示可能进入强势区间。
+
+    Args:
+        price: 当前价格
+        klines: 历史K线
+        period: 布林带中轨周期（MA20）
+
+    Returns:
+        True 表示从下方突破中轨
+    """
+    if price is None or len(klines) < period + 1:
+        return False
+
+    closes = [k.close for k in klines if k.close is not None]
+    if len(closes) < period + 1:
+        return False
+
+    middle = sum(closes[-period:]) / period
+
+    # 前一日价格在布林中轨下方，当日在上方
+    prev_price = closes[-2]
+    return prev_price < middle and price >= middle
+
+
+def is_low_volume(klines: list[KlineData], lookback: int = 20) -> bool:
+    """判断地量：成交量创近期新低
+
+    检查当日成交量是否为近期 lookback 天内的最低值附近。
+
+    Args:
+        klines: 历史K线（含当日）
+        lookback: 回看天数
+
+    Returns:
+        True 表示成交量处于近期地量水平
+    """
+    if len(klines) < lookback:
+        return False
+
+    volumes = [k.volume for k in klines[-lookback:] if k.volume is not None and k.volume > 0]
+    if len(volumes) < 5:
+        return False
+
+    curr_volume = volumes[-1]
+    min_volume = min(volumes)
+
+    # 当日成交量在近期最低量的 1.2 倍以内
+    return curr_volume <= min_volume * 1.2
+
+
+# ============================================================
 # 量价关系分析
 # ============================================================
 
@@ -649,6 +844,7 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
     kdj = calc_kdj(highs, lows, closes)
     sr = calc_support_resistance(klines)
     bb = calc_bollinger(closes)
+    obv = calc_obv(klines)
 
     signals = []
     if rsi and rsi_signal(rsi) in ("超买", "严重超买"):
@@ -664,6 +860,8 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         signals.append(f"布林触及上轨(带宽{bb.width}%)")
     elif bb.signal == "触及下轨":
         signals.append(f"布林触及下轨(带宽{bb.width}%)")
+    if obv.signal and obv.signal not in ("中性", "数据不足"):
+        signals.append(f"OBV{obv.signal}")
 
     return TechnicalSummary(
         rsi=rsi,
@@ -689,5 +887,6 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         bb_lower=bb.lower,
         bb_width=bb.width,
         bb_signal=bb.signal,
+        obv=obv.obv,
         signals=signals,
     )

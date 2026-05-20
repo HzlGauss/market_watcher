@@ -73,7 +73,11 @@ def _build_prompt(
     strategy_signals = []
     for a in alerts:
         for msg in a.messages:
-            if "[趋势启动]" in msg or "[逃顶组合]" in msg or "[震荡套利]" in msg or "[双翼齐飞]" in msg:
+            if any(tag in msg for tag in [
+                "[趋势启动]", "[逃顶组合]", "[震荡套利]", "[双翼齐飞]",
+                "[低位放量启动]", "[高位放量滞警]", "[缩量洗盘]",
+                "[放量突破确认]", "[地量地价反转]",
+            ]):
                 strategy_signals.append(f"- {a.name}({a.code}): {msg}")
 
     if strategy_signals:
@@ -120,6 +124,8 @@ def _build_prompt(
                     parts.append(";".join(resistance_parts))
                 if tech.bb_signal:
                     parts.append(f"布林带:{tech.bb_signal}")
+                if tech.obv is not None:
+                    parts.append(f"OBV:{tech.obv:.0f}")
                 lines.append(" ".join(parts))
 
     lines.extend([
@@ -140,6 +146,11 @@ def _build_prompt(
         "- 逃顶组合：价格新高+顶背离+超买+死叉，立即减仓",
         "- 震荡套利：布林带边界+RSI极值+KDJ交叉，适合短线",
         "- 双翼齐飞：KDJ+RSI低位共振+放量，底部反弹信号",
+        "- 低位放量启动：低位盘整后放量上涨+OBV资金入场，趋势反转信号",
+        "- 高位放量滞警：高位放量但滞涨+RSI超买+OBV资金离场，主力出货风险",
+        "- 缩量洗盘：上涨趋势中缩量回调+未破支撑，洗盘结束可加仓",
+        "- 放量突破确认：放量突破布林中轨+OBV资金入场，突破有效确认",
+        "- 地量地价反转：长期下跌后地量+RSI超卖+KDJ超卖，底部反转信号",
         "",
         "### 第四步：异动解读",
         "对警报标的逐一说明：是技术性回调、资金驱动还是基本面因素？",

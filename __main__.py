@@ -189,16 +189,38 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         except Exception as e:
             log.warning(f"读取状态文件失败: {e}")
 
-    # 加载扫描历史
+    # 加载扫描历史，构建前一次技术快照
     scan_history = _load_scan_history()
-
-    # 构建前一次扫描的技术快照（用于组合策略跨周期对比）
     prev_tech_summaries: dict[str, "TechnicalSummary"] = {}
     if scan_history:
         last_record = scan_history[-1]
         for code, status in last_record.funds_status.items():
             if status.tech_snapshot:
                 prev_tech_summaries[code] = tech_snapshot_to_summary(status.tech_snapshot)
+
+    # 展示组合策略信号（盯盘实时）
+    from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    all_strategy_signals: list[tuple[str, str, str]] = []  # (name, code, signal_text)
+    for code in quote_map:
+        quote = quote_map[code]
+        klines = klines_map.get(code)
+        if not klines or code not in tech_summaries:
+            continue
+        tech = tech_summaries[code]
+        prev_tech = prev_tech_summaries.get(code)
+        closes = [k.close for k in klines if k.close is not None]
+        dif_vals = calc_macd_dif_series(closes) if closes else None
+        signals = evaluate_all_strategies(tech, prev_tech, quote, klines, dif_vals, closes)
+        for s in signals:
+            if s.is_triggering:
+                all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code, s.to_alert_text()))
+
+    if all_strategy_signals:
+        from app.presenter import Color
+        print(f"\n{Color.BOLD}{Color.YELLOW}═══ 组合策略信号 ═══{Color.RESET}")
+        for name, code, sig_text in all_strategy_signals:
+            print(f"  {Color.BOLD}{name}({code}){Color.RESET}  →  {sig_text}")
+        print()
 
     # Analyze all quotes together (with technical signals and history)
     alerts, stats = analyze(

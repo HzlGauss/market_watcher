@@ -10,6 +10,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from app.models import KlineData, Quote, TechnicalSummary
+from app.technical import (
+    is_stagflation,
+    is_above_ma_support,
+    is_breakabove_bb_middle,
+    is_low_volume,
+    calc_obv,
+)
 
 
 # ============================================================
@@ -395,6 +402,294 @@ def check_double_wing_bottom(
 
 
 # ============================================================
+# 策略 5: 低位放量启动（量价配合）
+# ============================================================
+
+def check_low_volume_breakout(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """
+    低位放量启动策略
+
+    股价在低位盘整后，突然放量上涨，配合技术指标共振。
+    条件：
+    1. 成交量放大（量比 ≥ 1.5）
+    2. 股价上涨（涨幅 > 0）
+    3. OBV 趋势为资金入场或放量上涨
+    4. 站稳均线支撑（MA20）
+    """
+    sig = CombinationSignal(
+        strategy_name="低位放量启动",
+        direction="buy",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 成交量放大
+    if _is_volume_amplifying(quote, klines, 1.5):
+        sig.matched_conditions += 1
+        conditions.append("成交量显著放大")
+
+    # 条件2: 股价上涨
+    if quote.change_pct is not None and quote.change_pct > 0:
+        sig.matched_conditions += 1
+        conditions.append(f"股价上涨({quote.change_pct:.2f}%)")
+
+    # 条件3: OBV 资金入场
+    obv_result = calc_obv(klines)
+    if obv_result.signal in ("资金入场", "放量上涨"):
+        sig.matched_conditions += 1
+        conditions.append(f"OBV{obv_result.signal}")
+
+    # 条件4: 站稳均线支撑
+    if is_above_ma_support(quote.price, klines, 20):
+        sig.matched_conditions += 1
+        conditions.append("站稳MA20支撑")
+
+    # 置信度判断
+    if sig.matched_conditions >= 3:
+        sig.confidence = "high" if sig.matched_conditions == 4 else "medium"
+    else:
+        sig.confidence = "low"
+
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 6: 高位放量滞警（量价配合）
+# ============================================================
+
+def check_high_volume_stagflation(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """
+    高位放量滞警策略
+
+    股价处于高位，成交量放大但价格涨幅很小，警惕主力出货。
+    条件：
+    1. 滞涨现象（涨幅小但放量）
+    2. RSI > 70（超买区域）
+    3. 股价处于布林带上轨附近或之上
+    4. OBV 趋势为资金离场或放量下跌
+    """
+    sig = CombinationSignal(
+        strategy_name="高位放量滞警",
+        direction="sell",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 滞涨
+    if is_stagflation(quote, klines):
+        sig.matched_conditions += 1
+        conditions.append("滞涨(涨幅小但放量)")
+
+    # 条件2: RSI 超买
+    if tech.rsi is not None and tech.rsi > 70:
+        sig.matched_conditions += 1
+        conditions.append(f"RSI超买({tech.rsi})")
+
+    # 条件3: 触及布林带上轨
+    if tech.bb_signal == "触及上轨":
+        sig.matched_conditions += 1
+        conditions.append("触及布林上轨")
+
+    # 条件4: OBV 资金离场
+    obv_result = calc_obv(klines)
+    if obv_result.signal in ("资金离场", "放量下跌"):
+        sig.matched_conditions += 1
+        conditions.append(f"OBV{obv_result.signal}")
+
+    # 置信度判断
+    if sig.matched_conditions >= 3:
+        sig.confidence = "high" if sig.matched_conditions == 4 else "medium"
+    else:
+        sig.confidence = "low"
+
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 7: 缩量洗盘识别（量价配合）
+# ============================================================
+
+def check_shrinking_volume_washout(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """
+    缩量洗盘识别策略
+
+    上升趋势中短暂回调，成交量明显萎缩，可能是主力洗盘。
+    条件：
+    1. 股价下跌（涨幅 < 0）
+    2. 成交量萎缩（量比 ≤ 0.6）
+    3. 股价仍在均线之上（未破支撑）
+    4. RSI 未进入超卖区（> 30）
+    """
+    sig = CombinationSignal(
+        strategy_name="缩量洗盘",
+        direction="buy",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 股价下跌
+    if quote.change_pct is not None and quote.change_pct < 0:
+        sig.matched_conditions += 1
+        conditions.append(f"股价回调({quote.change_pct:.2f}%)")
+
+    # 条件2: 成交量萎缩
+    if quote.volume is not None and quote.volume > 0:
+        hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
+        if len(hist) >= 3:
+            avg_vol = sum(hist) / len(hist)
+            ratio = quote.volume / avg_vol if avg_vol > 0 else 1.0
+            if ratio <= 0.6:
+                sig.matched_conditions += 1
+                conditions.append(f"缩量(量比{ratio:.2f})")
+
+    # 条件3: 站稳均线支撑
+    if is_above_ma_support(quote.price, klines, 20):
+        sig.matched_conditions += 1
+        conditions.append("未破MA20支撑")
+
+    # 条件4: RSI 未超卖
+    if tech.rsi is not None and tech.rsi > 30:
+        sig.matched_conditions += 1
+        conditions.append(f"RSI未超卖({tech.rsi})")
+
+    # 置信度判断
+    if sig.matched_conditions >= 3:
+        sig.confidence = "high" if sig.matched_conditions == 4 else "medium"
+    else:
+        sig.confidence = "low"
+
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 8: 放量突破确认（量价配合）
+# ============================================================
+
+def check_volume_breakout(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """
+    放量突破确认策略
+
+    放量突破关键价位（如布林带中轨、前期高点等），确认突破有效性。
+    条件：
+    1. 成交量显著放大（量比 ≥ 1.8）
+    2. 股价明显上涨（涨幅 > 1%）
+    3. 突破布林带中轨
+    4. OBV 趋势为资金入场或放量上涨
+    """
+    sig = CombinationSignal(
+        strategy_name="放量突破确认",
+        direction="buy",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 成交量显著放大
+    if _is_volume_amplifying(quote, klines, 1.8):
+        sig.matched_conditions += 1
+        conditions.append("成交量显著放大(≥1.8倍)")
+
+    # 条件2: 股价明显上涨
+    if quote.change_pct is not None and quote.change_pct > 1:
+        sig.matched_conditions += 1
+        conditions.append(f"股价大涨({quote.change_pct:.2f}%)")
+
+    # 条件3: 突破布林带中轨
+    if is_breakabove_bb_middle(quote.price, klines, 20):
+        sig.matched_conditions += 1
+        conditions.append("突破布林中轨")
+
+    # 条件4: OBV 资金入场
+    obv_result = calc_obv(klines)
+    if obv_result.signal in ("资金入场", "放量上涨"):
+        sig.matched_conditions += 1
+        conditions.append(f"OBV{obv_result.signal}")
+
+    # 置信度判断
+    if sig.matched_conditions >= 3:
+        sig.confidence = "high" if sig.matched_conditions == 4 else "medium"
+    else:
+        sig.confidence = "low"
+
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 9: 地量地价反转（量价配合）
+# ============================================================
+
+def check_low_volume_reversal(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """
+    地量地价反转策略
+
+    长期下跌后成交量缩至地量水平，价格企稳，可能出现反转。
+    条件：
+    1. 地量（成交量创近期新低）
+    2. 股价止跌企稳（涨跌幅在 ±1% 以内）
+    3. RSI 超卖后回升（< 30 或从超卖区回升）
+    4. KDJ 超卖或金叉
+    """
+    sig = CombinationSignal(
+        strategy_name="地量地价反转",
+        direction="buy",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 地量
+    if is_low_volume(klines, 20):
+        sig.matched_conditions += 1
+        conditions.append("成交量地量")
+
+    # 条件2: 股价止跌企稳
+    if quote.change_pct is not None and abs(quote.change_pct) <= 1:
+        sig.matched_conditions += 1
+        conditions.append(f"股价企稳({quote.change_pct:.2f}%)")
+
+    # 条件3: RSI 超卖
+    if tech.rsi is not None and tech.rsi <= 30:
+        sig.matched_conditions += 1
+        conditions.append(f"RSI超卖({tech.rsi})")
+
+    # 条件4: KDJ 超卖或金叉
+    if tech.kdj_signal in ("超卖", "金叉"):
+        sig.matched_conditions += 1
+        conditions.append(f"KDJ{tech.kdj_signal}")
+
+    # 置信度判断
+    if sig.matched_conditions >= 3:
+        sig.confidence = "high" if sig.matched_conditions == 4 else "medium"
+    else:
+        sig.confidence = "low"
+
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
 # 统一入口：评估所有策略
 # ============================================================
 
@@ -443,6 +738,31 @@ def evaluate_all_strategies(
     bottom_sig = check_double_wing_bottom(tech, prev_tech, quote, klines)
     if bottom_sig.is_triggering:
         signals.append(bottom_sig)
+
+    # 策略5: 低位放量启动
+    low_vol_sig = check_low_volume_breakout(tech, quote, klines)
+    if low_vol_sig.is_triggering:
+        signals.append(low_vol_sig)
+
+    # 策略6: 高位放量滞警
+    stag_sig = check_high_volume_stagflation(tech, quote, klines)
+    if stag_sig.is_triggering:
+        signals.append(stag_sig)
+
+    # 策略7: 缩量洗盘识别
+    washout_sig = check_shrinking_volume_washout(tech, quote, klines)
+    if washout_sig.is_triggering:
+        signals.append(washout_sig)
+
+    # 策略8: 放量突破确认
+    breakout_sig = check_volume_breakout(tech, quote, klines)
+    if breakout_sig.is_triggering:
+        signals.append(breakout_sig)
+
+    # 策略9: 地量地价反转
+    reversal_sig = check_low_volume_reversal(tech, quote, klines)
+    if reversal_sig.is_triggering:
+        signals.append(reversal_sig)
 
     return signals
 

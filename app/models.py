@@ -251,6 +251,7 @@ class TechnicalSummary:
     bb_lower: Optional[float] = None
     bb_width: Optional[float] = None
     bb_signal: str = ""
+    obv: Optional[float] = None
     signals: list[str] = field(default_factory=list)
 
 
