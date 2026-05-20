@@ -250,33 +250,6 @@ class TechnicalSummary:
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
     bb_width: Optional[float] = None
-    bb_signal: str = ""
-    signals: list[str] = field(default_factory=list)
-
-
-# ============================================================
-# 盯盘历史模型
-# ============================================================
-
-@dataclass
-class TechSnapshot:
-    """技术快照 —— 存储某时刻的关键技术指标值，供组合策略跨日对比"""
-    rsi: Optional[float] = None
-    macd_dif: Optional[float] = None
-    macd_dea: Optional[float] = None
-    macd_signal: str = ""
-    kdj_k: Optional[float] = None
-    kdj_d: Optional[float] = None
-    kdj_j: Optional[float] = None
-    kdj_signal: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "rsi": self.rsi,
-            "macd_dif": self.macd_dif,
-            "macd_dea": self.macd_dea,
-            "macd_signal": self.macd_signal,
-            "kdj_k": self.kdj_k,
             "kdj_d": self.kdj_d,
             "kdj_j": self.kdj_j,
             "kdj_signal": self.kdj_signal,

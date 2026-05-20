@@ -44,10 +44,10 @@ def _get_unique_items(config: Config) -> list[WatchItem]:
 def _holdings_summary(
     holdings: list[Holding],
     quotes: list[Quote],
-) -> list[dict]:
+) -> tuple[list[dict], float, float]:
     """
     Match holdings with real-time quotes, calculate P&L
-    Returns for each holding: name, amount, cost, current price, P&L amount, P&L %
+    Returns: (results, total_pnl, total_cost)
     """
     results = []
     total_cost = 0
@@ -73,7 +73,7 @@ def _holdings_summary(
             total_cost += cost
             total_pnl += pnl
 
-    return results
+    return results, total_pnl, total_cost
 
 
 def _get_holdings_strategy_signals(
@@ -354,9 +354,9 @@ def generate_morning_brief(config: Config) -> Path | None:
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
 
     if quotes:
-        watchlist_codes = {item.code for item in config.watch_items}
-        watch_quotes = [q for q in quotes if q.code in watchlist_codes]
-        sentiment = calc_market_sentiment(watch_quotes)
+        # 使用全部标的（持仓+自选）计算情绪评分
+        all_quotes = [q for q in quotes if q.change_pct is not None]
+        sentiment = calc_market_sentiment(all_quotes)
         data_lines.append(f"\n## 三、昨日A股收盘数据")
         data_lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
 
@@ -408,9 +408,9 @@ def generate_morning_brief(config: Config) -> Path | None:
             llm_lines.append(f"  [{n.time}] {n.title}")
 
     if quotes:
-        watchlist_codes = {item.code for item in config.watch_items}
-        watch_quotes = [q for q in quotes if q.code in watchlist_codes]
-        sentiment = calc_market_sentiment(watch_quotes)
+        # 使用全部标的（持仓+自选）计算情绪评分
+        all_quotes_llm = [q for q in quotes if q.change_pct is not None]
+        sentiment = calc_market_sentiment(all_quotes_llm)
         llm_lines.append(f"\n[昨日A股] 情绪: {sentiment.score}/100 ({sentiment.label})")
 
         index_quotes = [q for q in quotes if q.type == "指数"]
@@ -519,9 +519,9 @@ def generate_midday_review(config: Config) -> Path | None:
         log.warning("Midday review: No quote data")
         return None
 
-    watchlist_codes = {item.code for item in config.watch_items}
-    watch_quotes = [q for q in quotes if q.code in watchlist_codes]
-    _, stats = analyze(watch_quotes, {}, config)
+    # 使用全部标的（持仓+自选）进行统计和排行
+    all_quotes = [q for q in quotes if q.change_pct is not None]
+    _, stats = analyze(all_quotes, {}, config)
     from app.data_fetcher import fetch_market_news
     morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
 
@@ -538,31 +538,32 @@ def generate_midday_review(config: Config) -> Path | None:
     data_lines.append(f"- 情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
     data_lines.append(f"- 涨/跌/平: {stats.up} / {stats.down} / {stats.flat}")
 
-    sorted_q = sorted(watch_quotes, key=lambda q: (q.change_pct or 0), reverse=True)
-    data_lines.append("\n## 三、自选标的排行")
+    sorted_q = sorted(all_quotes, key=lambda q: q.change_pct, reverse=True)
+    data_lines.append("\n## 三、全部标的排行")
+
+    # 涨幅前5：取涨幅最大的5个
     data_lines.append("### 涨幅前5:")
     for q in sorted_q[:5]:
-        if q.change_pct is not None:
-            detail = f"- {q.name}: {q.change_pct:+.2f}%"
-            if q.pe_ratio is not None:
-                detail += f" | PE:{q.pe_ratio:.1f}"
-            if q.market_cap is not None:
-                detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
-            if q.turnover_rate is not None:
-                detail += f" | 换手:{q.turnover_rate:.2f}%"
-            data_lines.append(detail)
+        detail = f"- {q.name}: {q.change_pct:+.2f}%"
+        if q.pe_ratio is not None:
+            detail += f" | PE:{q.pe_ratio:.1f}"
+        if q.market_cap is not None:
+            detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
+        if q.turnover_rate is not None:
+            detail += f" | 换手:{q.turnover_rate:.2f}%"
+        data_lines.append(detail)
 
+    # 跌幅前5：取跌幅最大的5个（即涨幅最小的5个）
     data_lines.append("### 跌幅前5:")
     for q in sorted_q[-5:]:
-        if q.change_pct is not None:
-            detail = f"- {q.name}: {q.change_pct:+.2f}%"
-            if q.pe_ratio is not None:
-                detail += f" | PE:{q.pe_ratio:.1f}"
-            if q.market_cap is not None:
-                detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
-            if q.turnover_rate is not None:
-                detail += f" | 换手:{q.turnover_rate:.2f}%"
-            data_lines.append(detail)
+        detail = f"- {q.name}: {q.change_pct:+.2f}%"
+        if q.pe_ratio is not None:
+            detail += f" | PE:{q.pe_ratio:.1f}"
+        if q.market_cap is not None:
+            detail += f" | 市值:{q.market_cap/1e4:.0f}亿"
+        if q.turnover_rate is not None:
+            detail += f" | 换手:{q.turnover_rate:.2f}%"
+        data_lines.append(detail)
 
     holdings = config.holdings
     if holdings:
