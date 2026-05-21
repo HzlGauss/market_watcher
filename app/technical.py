@@ -96,6 +96,74 @@ def _sf(val) -> Optional[float]:
 
 
 # ============================================================
+# 近期走势计算
+# ============================================================
+
+@dataclass
+class PeriodReturn:
+    """指定周期涨跌幅"""
+    label: str = ""
+    days: int = 0
+    return_pct: Optional[float] = None
+    start_price: Optional[float] = None
+    end_price: Optional[float] = None
+    high_price: Optional[float] = None
+    low_price: Optional[float] = None
+
+
+def calc_period_returns(klines: list[KlineData], periods: list[tuple[int, str]] = None) -> list[PeriodReturn]:
+    """计算多个周期的涨跌幅
+
+    Args:
+        klines: K线数据（按时间升序）
+        periods: [(天数, 标签), ...] 如 [(5, "近1周"), (10, "近半月")]
+
+    Returns:
+        PeriodReturn 列表
+    """
+    if periods is None:
+        periods = [
+            (5, "近1周"),
+            (10, "近半月"),
+            (20, "近1月"),
+            (40, "近两月"),
+        ]
+
+    results: list[PeriodReturn] = []
+
+    for days, label in periods:
+        if len(klines) < days + 1:
+            continue
+
+        # 取最近 days 个交易日的区间
+        window = klines[-(days + 1):]
+        start_kline = window[0]
+        end_kline = window[-1]
+
+        if start_kline.close is None or end_kline.close is None:
+            continue
+
+        # 计算区间最高/最低
+        closes = [k.close for k in window if k.close is not None]
+        high_price = max(closes) if closes else None
+        low_price = min(closes) if closes else None
+
+        return_pct = ((end_kline.close - start_kline.close) / start_kline.close) * 100
+
+        results.append(PeriodReturn(
+            label=label,
+            days=days,
+            return_pct=round(return_pct, 2),
+            start_price=start_kline.close,
+            end_price=end_kline.close,
+            high_price=high_price,
+            low_price=low_price,
+        ))
+
+    return results
+
+
+# ============================================================
 # EMA 辅助
 # ============================================================
 
@@ -590,6 +658,54 @@ class OBVResult:
     signal: str = ""
 
 
+def _calc_linear_slope(series: list[float]) -> float:
+    """用最小二乘法计算线性回归斜率，比首尾两点更稳健
+
+    Args:
+        series: 数值序列
+
+    Returns:
+        斜率值
+    """
+    n = len(series)
+    if n < 2:
+        return 0.0
+
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(series) / n
+
+    numerator = sum((i - x_mean) * (series[i] - y_mean) for i in range(n))
+    denominator = sum((i - x_mean) ** 2 for i in range(n))
+
+    return numerator / denominator if denominator > 0 else 0.0
+
+
+def _price_trend(klines: list[KlineData], period: int) -> str:
+    """判断价格在给定周期内的趋势
+
+    Returns:
+        "up", "down", 或 "flat"
+    """
+    if len(klines) < period:
+        return "flat"
+
+    recent = klines[-period:]
+    start_price = recent[0].close
+    end_price = recent[-1].close
+
+    if start_price is None or end_price is None:
+        return "flat"
+
+    change_pct = (end_price - start_price) / start_price * 100
+
+    if change_pct > 2:
+        return "up"
+    elif change_pct < -2:
+        return "down"
+    else:
+        return "flat"
+
+
 def calc_obv(klines: list[KlineData]) -> OBVResult:
     """计算 OBV（On Balance Volume，能量潮）
 
@@ -597,6 +713,12 @@ def calc_obv(klines: list[KlineData]) -> OBVResult:
     - 当日收盘价 > 前日收盘价，OBV = 前日 OBV + 当日成交量
     - 当日收盘价 < 前日收盘价，OBV = 前日 OBV - 当日成交量
     - 当日收盘价 == 前日收盘价，OBV = 前日 OBV
+
+    信号判断逻辑：
+    1. 量价背离（最有价值）：价格上涨但 OBV 下降 → 顶背离/主力出货
+                        价格下跌但 OBV 上升 → 底背离/主力吸筹
+    2. OBV 趋势加速：资金加速流入/流出
+    3. OBV 趋势拐点：资金流向发生变化
 
     Args:
         klines: K线数据（按时间升序）
@@ -627,26 +749,76 @@ def calc_obv(klines: list[KlineData]) -> OBVResult:
 
         obv_series.append(obv)
 
-    # 判断 OBV 趋势：对比近期 OBV 斜率
+    # 需要足够的历史数据才能判断趋势
     signal = "中性"
-    if len(obv_series) >= 10:
-        recent = obv_series[-5:]
-        earlier = obv_series[-10:-5]
-        recent_slope = (recent[-1] - recent[0]) / len(recent)
-        earlier_slope = (earlier[-1] - earlier[0]) / len(earlier)
+    min_length = 15  # 至少需要 15 个交易日
 
-        if recent_slope > 0 and earlier_slope > 0 and recent_slope > earlier_slope:
-            signal = "放量上涨"
-        elif recent_slope > 0 and earlier_slope > 0:
-            signal = "温和放量"
-        elif recent_slope < 0 and earlier_slope < 0 and recent_slope < earlier_slope:
-            signal = "放量下跌"
-        elif recent_slope < 0 and earlier_slope < 0:
-            signal = "温和缩量"
-        elif recent_slope > 0 and earlier_slope < 0:
-            signal = "资金入场"
-        elif recent_slope < 0 and earlier_slope > 0:
-            signal = "资金离场"
+    if len(obv_series) >= min_length:
+        # 使用线性回归斜率，更稳健
+        # 近期：最近 5 天，远期：前 10 天
+        recent_period = 5
+        earlier_period = 10
+
+        recent_obv = obv_series[-recent_period:]
+        earlier_obv = obv_series[-(recent_period + earlier_period): -recent_period]
+
+        recent_slope = _calc_linear_slope(recent_obv)
+        earlier_slope = _calc_linear_slope(earlier_obv)
+
+        # 计算 OBV 变化百分比（避免绝对值大小影响判断）
+        obv_mid = obv_series[-(recent_period + earlier_period)]
+        obv_end = obv_series[-1]
+        obv_change_pct = ((obv_end - obv_mid) / abs(obv_mid)) * 100 if obv_mid != 0 else 0
+
+        # ========== 优先判断量价背离（最有价值的信号）==========
+        recent_price_trend = _price_trend(valid_klines, recent_period)
+
+        # 计算近期 OBV 的整体方向
+        obv_recent_change = (obv_series[-1] - obv_series[-recent_period])
+        obv_trend = "up" if obv_recent_change > 0 else "down"
+
+        # 顶背离：价格上涨，但 OBV 下降
+        if recent_price_trend == "up" and obv_trend == "down":
+            signal = "顶背离⚠️"
+        # 底背离：价格下跌，但 OBV 上升
+        elif recent_price_trend == "down" and obv_trend == "up":
+            signal = "底背离"
+
+        # ========== 无量价背离时，判断 OBV 趋势 ==========
+        else:
+            # 使用斜率的方向和相对大小来判断
+            recent_dir = 1 if recent_slope > 0 else -1
+            earlier_dir = 1 if earlier_slope > 0 else -1
+
+            recent_abs = abs(recent_slope)
+            earlier_abs = abs(earlier_slope)
+
+            # 加速：方向相同，近期斜率绝对值更大
+            if recent_dir == earlier_dir and recent_abs > earlier_abs * 1.2:
+                if recent_dir == 1:
+                    signal = "资金加速流入"
+                else:
+                    signal = "资金加速流出"
+
+            # 减速：方向相同，近期斜率绝对值更小
+            elif recent_dir == earlier_dir and recent_abs < earlier_abs * 0.8:
+                if recent_dir == 1:
+                    signal = "资金流入放缓"
+                else:
+                    signal = "资金流出放缓"
+
+            # 拐点：方向相反
+            elif recent_dir != earlier_dir:
+                if recent_dir == 1:
+                    signal = "资金转向流入"
+                else:
+                    signal = "资金转向流出"
+
+            # 持续：方向和强度都差不多
+            elif recent_dir == 1:
+                signal = "资金持续流入"
+            else:
+                signal = "资金持续流出"
 
     return OBVResult(
         obv=round(obv, 2),

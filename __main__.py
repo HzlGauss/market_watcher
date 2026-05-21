@@ -64,15 +64,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}4{Color.RESET}. Monitor Mode (15 min interval)")
     print(f"  {Color.CYAN}5{Color.RESET}. Fund Analysis (Rating + Style + Manager Review)")
     print(f"  {Color.CYAN}6{Color.RESET}. Update Holdings from Broker (东方财富)")
+    print(f"  {Color.CYAN}7{Color.RESET}. Query Period Returns (近期走势)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-6]: ").strip()
-            if choice in ("0", "1", "2", "3", "4", "5", "6"):
+            choice = input(f" Enter option [0-7]: ").strip()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-6{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-7{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -88,6 +89,96 @@ def _gen_report(report_type: str, config: Config) -> None:
     elif report_type == "Evening Review":
         log.info("Generating evening review...")
         generate_evening_review(config)
+
+
+def _query_period_returns(config: Config) -> None:
+    """查询股票/基金的近期走势"""
+    from app.technical import fetch_historical_kline, calc_period_returns
+    from app.models import WatchItem
+    from app.data_fetcher import fetch_quotes
+
+    print(f"\n{Color.BOLD}{Color.CYAN}═══ 近期走势查询 ═══{Color.RESET}")
+    code = input(f"  请输入股票/基金代码 (如 601899): ").strip()
+
+    if not code:
+        print(f"  {Color.YELLOW}已取消{Color.RESET}")
+        return
+
+    # 尝试从 holdings/watchlist 中获取市场信息
+    market = "SH"  # 默认上海
+    name = ""
+
+    for h in config.holdings:
+        if h.code == code:
+            market = h.market
+            name = h.name
+            break
+
+    if not name:
+        for w in config.watch_items:
+            if w.code == code:
+                market = w.market
+                name = w.name
+                break
+
+    # 如果找不到，尝试获取实时行情来得到名称
+    if not name:
+        items = [WatchItem(name="", code=code, market=market, type="查询")]
+        quotes = fetch_quotes(items)
+        if quotes:
+            name = quotes[0].name
+            market = quotes[0].code[:2].upper() in ("SH", "SZ", "HK") and quotes[0].code[:2] or market
+
+    # 获取 K 线数据（需要 60 天才能计算 40 日周期）
+    klines = fetch_historical_kline(code, market, days=60)
+
+    if not klines:
+        print(f"  {Color.RED}❌ 无法获取 {code} 的K线数据{Color.RESET}")
+        return
+
+    # 获取最新价格
+    latest_price = klines[-1].close
+    latest_date = klines[-1].date
+
+    if name:
+        print(f"\n  {Color.BOLD}{name}({code}){Color.RESET}  最新价: {Color.CYAN}{latest_price:.2f}{Color.RESET}  ({latest_date})")
+    else:
+        print(f"\n  {Color.BOLD}{code}{Color.RESET}  最新价: {Color.CYAN}{latest_price:.2f}{Color.RESET}  ({latest_date})")
+
+    # 计算各周期涨跌幅
+    returns = calc_period_returns(klines)
+
+    if not returns:
+        print(f"  {Color.YELLOW}历史数据不足，无法计算近期走势{Color.RESET}")
+        return
+
+    # 输出结果
+    print(f"  {Color.BOLD}📊 近期走势:{Color.RESET}")
+    print(f"  {'-' * 60}")
+
+    for ret in returns:
+        if ret.return_pct is None:
+            continue
+
+        # 根据涨跌选择颜色
+        color = Color.GREEN if ret.return_pct > 0 else (Color.RED if ret.return_pct < 0 else Color.YELLOW)
+        arrow = "↑" if ret.return_pct > 0 else ("↓" if ret.return_pct < 0 else "—")
+
+        label = f"{ret.label}({ret.days}日)"
+        change_str = f"{color}{arrow} {ret.return_pct:+.2f}%{Color.RESET}"
+
+        # 区间高低点
+        range_str = ""
+        if ret.high_price and ret.low_price:
+            range_str = f"  区间: {ret.low_price:.2f} ~ {ret.high_price:.2f}"
+
+        # 起始价格
+        price_str = f"({ret.start_price:.2f} → {ret.end_price:.2f})"
+
+        print(f"    {label:12s}  {change_str:15s}  {price_str}{range_str}")
+
+    print(f"  {'-' * 60}")
+    print()
 
 
 def _wait_until_next_slot(interval: int) -> None:
@@ -391,6 +482,8 @@ def main() -> None:
                 print(f"{Color.GREEN}✅ Holdings updated successfully!{Color.RESET}")
             else:
                 print(f"{Color.RED}❌ Failed to update holdings{Color.RESET}")
+        elif choice == "7":
+            _query_period_returns(config)
 
 
 if __name__ == "__main__":

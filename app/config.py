@@ -221,8 +221,8 @@ class Config:
 
     @property
     def sessions(self) -> dict[str, list[str]]:
-        """A 股交易时段配置"""
-        return self._raw.get("盯盘设置", {}).get("A 股交易时段", {
+        """A股交易时段配置"""
+        return self._raw.get("盯盘设置", {}).get("A股交易时段", {
             "上午": ["09:30", "11:30"],
             "下午": ["13:00", "15:00"]
         })

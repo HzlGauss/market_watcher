@@ -215,37 +215,29 @@ def analyze(
             elif cp < 0:
                 down_count += 1
 
-        # ---- 量价关系 ----
-        prev = prev_state.get(q.code, {})
-        prev_vol = prev.get("volume")
-
-        if cp is not None and vol is not None and prev_vol and prev_vol > 0:
-            vol_change = vol / prev_vol
-            if cp > 0 and vol_change >= vol_ratio:
-                items.append(f"📈💪 放量上涨 {vol_change:.1f}倍")
-            elif cp > 0 and vol_change <= shrink_ratio:
-                items.append(f"📈🤏 缩量上涨（买盘不强）")
-            elif cp < 0 and vol_change >= vol_ratio:
-                items.append(f"📉💥 放量下跌 {vol_change:.1f}倍⚠️")
-                alert_count += 1
-            elif cp < 0 and vol_change <= shrink_ratio:
-                items.append(f"📉🤫 缩量下跌（抛压减弱）")
-            elif vol_change >= vol_ratio:
-                items.append(f"📊 量放 {vol_change:.1f}倍")
-
-        # ---- 板块异动 ----
-        dev = sector_dev.get(q.code)
-        if dev and cp is not None and abs(dev["deviation"]) >= sector_threshold:
-            direction = "领涨" if dev["deviation"] > 0 else "领跌"
-            items.append(f"🏷️ {dev['sector']}中{direction} {dev['deviation']:+.2f}%")
+        # ---- 量价关系（使用 turnover_rate 估算量比）----
+        # 注意：不能直接用当前成交量除以上一次扫描的成交量，
+        # 因为成交量是当日累计值，会随时间不断增加。
+        # 正确的量比应该用：当前成交量 / 过去 N 日平均成交量
+        # 这个分析已经在技术指标中通过 analyze_volume_price() 完成
+        # 这里只保留 turnover_rate（换手率）作为辅助判断
+        if q.turnover_rate is not None and q.turnover_rate > 5:
+            items.append(f"🔥 高换手 {q.turnover_rate:.2f}%")
 
         # ---- 趋势变化 ----
+        prev = prev_state.get(q.code, {})
         if cp is not None and prev.get("change_pct") is not None:
             prev_cp = prev["change_pct"]
             if cp > 0 and prev_cp < 0:
                 items.append("🔄 由跌转涨")
             elif cp < 0 and prev_cp > 0:
                 items.append("🔄 由涨转跌")
+
+        # ---- 板块异动 ----
+        dev = sector_dev.get(q.code)
+        if dev and cp is not None and abs(dev["deviation"]) >= sector_threshold:
+            direction = "领涨" if dev["deviation"] > 0 else "领跌"
+            items.append(f"🏷️ {dev['sector']}中{direction} {dev['deviation']:+.2f}%")
 
         # ---- 振幅异常 ----
         if amp is not None and amp >= amp_warn:
