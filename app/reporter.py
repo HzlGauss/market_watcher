@@ -969,8 +969,28 @@ def generate_evening_review(config: Config) -> Path | None:
 
         data_lines.append("\n### 3.1 持仓详情")
         for h in holdings_with_analysis:
+            quote = h.get("quote")
+            parts = [f"  - {h['name']}({h['code']}):"]
+            # 收盘价
+            if quote and quote.price:
+                parts.append(f"收盘{quote.price:.3f}")
+            # 涨跌幅
+            if quote and quote.change_pct is not None:
+                parts.append(f"涨跌{quote.change_pct:+.2f}%")
+            # 量比（当日成交量/前日成交量）
+            if quote and quote.volume and quote.volume > 0:
+                prev_vol = prev_state.get(h["code"], {}).get("volume")
+                if prev_vol and prev_vol > 0:
+                    ratio = quote.volume / prev_vol
+                    parts.append(f"量比{ratio:.2f}")
+            # 主力净流入
+            capital = h.get("capital_flow", "")
+            if capital and capital != "数据不足":
+                parts.append(f"资金{capital}")
+            # 技术状态
             tech_note = f" [{h['tech']}]" if h.get("tech") else ""
-            data_lines.append(f"  - {h['name']}({h['code']}): {h['amount']}股{tech_note}")
+            parts.append(tech_note)
+            data_lines.append(" ".join(parts))
 
         has_rich = any(h.get("quote", {}).pe_ratio is not None for h in holdings_with_analysis)
         if has_rich:
