@@ -44,10 +44,11 @@ def print_quotes_table(quotes: list[Quote]) -> None:
     header = (
         f"{'代码':>8} {'名称':<12} {'最新价':>8} "
         f"{'涨跌幅':>8} {'涨跌额':>8} {'成交量':>10} "
-        f"{'成交额':>12} {'振幅':>7}"
+        f"{'成交额':>12} {'振幅':>7} {'量比':>6} "
+        f"{'主力净流入':>14} {'换手率':>8}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 70}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 90}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -72,9 +73,44 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         if q.amplitude is not None and q.amplitude >= 5:
             amp_str = f"{Color.YELLOW}{amp_str}{Color.RESET}"
 
+        # 量比
+        if q.volume_ratio is not None:
+            vr_str = f"{q.volume_ratio:.2f}"
+            if q.volume_ratio >= 1.5:
+                vr_str = f"{Color.RED}{vr_str}{Color.RESET}"
+            elif q.volume_ratio <= 0.5:
+                vr_str = f"{Color.GREEN}{vr_str}{Color.RESET}"
+        else:
+            vr_str = f"{Color.DIM}--{Color.RESET}"
+
+        # 主力净流入
+        if q.main_net_inflow is not None:
+            mni = q.main_net_inflow
+            if abs(mni) >= 1e8:
+                mni_str = f"{mni/1e8:+.2f}亿"
+            elif abs(mni) >= 1e4:
+                mni_str = f"{mni/1e4:+.2f}万"
+            else:
+                mni_str = f"{mni:+.2f}"
+            if mni > 0:
+                mni_str = f"{Color.RED}{mni_str}{Color.RESET}"
+            elif mni < 0:
+                mni_str = f"{Color.GREEN}{mni_str}{Color.RESET}"
+        else:
+            mni_str = f"{Color.DIM}--{Color.RESET}"
+
+        # 换手率
+        if q.turnover_rate is not None:
+            tr_str = f"{q.turnover_rate:.2f}%"
+            if q.turnover_rate >= 10:
+                tr_str = f"{Color.YELLOW}{tr_str}{Color.RESET}"
+        else:
+            tr_str = f"{Color.DIM}--{Color.RESET}"
+
         line = (
             f"{q.code:>8} {q.name:<12} {price:>8} {cp:>8} {ca:>8} "
-            f"{vol_str:>10} {amt_str:>12} {amp_str:>7}"
+            f"{vol_str:>10} {amt_str:>12} {amp_str:>7} {vr_str:>6} "
+            f"{mni_str:>14} {tr_str:>8}"
         )
         print(f"  {line}")
 

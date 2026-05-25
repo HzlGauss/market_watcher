@@ -95,7 +95,7 @@ def _query_period_returns(config: Config) -> None:
     """查询股票/基金的近期走势"""
     from app.technical import fetch_historical_kline, calc_period_returns
     from app.models import WatchItem
-    from app.data_fetcher import fetch_quotes
+    from app.data_fetcher import fetch_quotes, enrich_quotes_with_flow
 
     print(f"\n{Color.BOLD}{Color.CYAN}═══ 近期走势查询 ═══{Color.RESET}")
     code = input(f"  请输入股票/基金代码 (如 601899): ").strip()
@@ -202,6 +202,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         print_quotes_table, print_sentiment, print_alerts,
         print_llm_result, print_tail, save_brief, print_key_levels
     )
+    from app.data_fetcher import fetch_quotes, BackgroundDataCache
     from app.technical import fetch_historical_kline, get_technical_summary
     from app.models import ScanRecord, FundScanStatus, TechSnapshot
     from app.models import tech_snapshot_to_summary
@@ -246,6 +247,18 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     if not quotes:
         log.warning("No quote data received")
         return
+
+    # 从后台缓存获取量比、换手率、主力净流入（不阻塞主循环）
+    if hasattr(_run_once, '_bg_cache') and _run_once._bg_cache.is_fresh():
+        for q in quotes:
+            cached = _run_once._bg_cache.get_data(q.code)
+            if cached:
+                if cached.get("volume_ratio") is not None:
+                    q.volume_ratio = cached["volume_ratio"]
+                if cached.get("turnover_rate") is not None:
+                    q.turnover_rate = cached["turnover_rate"]
+                if cached.get("main_net_inflow") is not None:
+                    q.main_net_inflow = cached["main_net_inflow"]
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -415,6 +428,30 @@ def _run_monitoring_loop(config: Config,
     log.info(f"Press Ctrl+C to return to menu")
     print()
 
+    # Build monitor items for background cache
+    from app.models import WatchItem
+    monitor_items = []
+    for h in config.holdings:
+        monitor_items.append(WatchItem(name=h.name, code=h.code, market=h.market, type="持仓"))
+    holding_codes = {h.code for h in config.holdings}
+    for item in config.watch_items:
+        if item.code not in holding_codes:
+            monitor_items.append(WatchItem(name=item.name, code=item.code, market=item.market, type=item.type))
+
+    # Start background data cache (refreshes every 60 seconds)
+    from app.data_fetcher import BackgroundDataCache
+    bg_cache = BackgroundDataCache(monitor_items, refresh_interval=60)
+    bg_cache.start()
+    # Attach to _run_once so it can access the cache
+    _run_once._bg_cache = bg_cache
+
+    # Wait for initial data to be ready (up to 5 seconds)
+    log.info("Initializing background data cache (volume_ratio, turnover_rate)...")
+    for _ in range(5):
+        if bg_cache.is_fresh():
+            break
+        time.sleep(1)
+
     first_run = True
     scan_count = 0
     try:
@@ -435,6 +472,10 @@ def _run_monitoring_loop(config: Config,
 
     except KeyboardInterrupt:
         log.info("Returning to menu...")
+    finally:
+        bg_cache.stop()
+        if hasattr(_run_once, '_bg_cache'):
+            delattr(_run_once, '_bg_cache')
 
 
 def main() -> None:

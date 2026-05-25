@@ -73,6 +73,8 @@ class Quote:
         pb_ratio: 市净率
         market_cap: 总市值（元）
         turnover_rate: 换手率 (%)
+        volume_ratio: 量比
+        main_net_inflow: 主力净流入（元）
         upper_limit: 涨停价
         lower_limit: 跌停价
     """
@@ -93,6 +95,8 @@ class Quote:
     pb_ratio: Optional[float] = None
     market_cap: Optional[float] = None
     turnover_rate: Optional[float] = None
+    volume_ratio: Optional[float] = None
+    main_net_inflow: Optional[float] = None
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
 

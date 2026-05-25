@@ -19,6 +19,8 @@ from app.http_client import sina_client, eastmoney_client
 
 SINA_API = "https://hq.sinajs.cn/list="
 NORTH_FLOW_API = "https://push2.eastmoney.com/api/qt/kamt.kline/get"
+STOCK_FLOW_API = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+TENCENT_API = "https://qt.gtimg.cn/q="
 
 
 # ============================================================
@@ -48,7 +50,7 @@ def _parse_float(val: str | None) -> Optional[float]:
 
 
 def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
-    """批量获取实时行情（新浪财经）
+    """批量获取实时行情（新浪财经 + 腾讯财经量比/换手率）
 
     Args:
         items: 盯盘标的列表
@@ -109,9 +111,7 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
 
             name = fields[0].strip() if fields[0] else ""
 
-            # 换手率在 fields[37]，需要足够字段数
-            turnover = _parse_float(fields[37]) if len(fields) > 37 else None
-
+            # 量比在 fields[35]，换手率在 fields[37]
             results.append(Quote(
                 code=item.code,
                 name=name,
@@ -126,14 +126,177 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                 volume=_parse_float(fields[8]),
                 amount=_parse_float(fields[9]),
                 amplitude=amplitude,
-                turnover_rate=turnover,
+                # 新浪API不提供量比和换手率，稍后从腾讯API补充
+                turnover_rate=None,
+                volume_ratio=None,
             ))
+
+        # 从腾讯财经补充量比和换手率
+        try:
+            tencent_data = fetch_tencent_data(items)
+            code_map = {q.code: q for q in results}
+            for code, data in tencent_data.items():
+                if code in code_map:
+                    q = code_map[code]
+                    if data.get("volume_ratio") is not None:
+                        q.volume_ratio = data["volume_ratio"]
+                    if data.get("turnover_rate") is not None:
+                        q.turnover_rate = data["turnover_rate"]
+        except Exception:
+            pass  # 腾讯API失败时忽略，不影响主流程
 
         return results
 
     except Exception as e:
         log.error(f"数据解析异常: {e}")
         return []
+
+
+# ============================================================
+# 腾讯财经数据源（量比、换手率）
+# ============================================================
+
+def _build_tencent_codes(items: list[WatchItem]) -> str:
+    """构建腾讯财经API的代码列表 (sh510300,sz159915,...)"""
+    codes = []
+    for item in items:
+        prefix = MARKET_PREFIX.get(item.market, "sh")
+        codes.append(f"{prefix}{item.code}")
+    return ",".join(codes)
+
+
+def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[float]]]:
+    """从腾讯财经API获取量比和换手率
+
+    Returns:
+        {code: {volume_ratio: x, turnover_rate: y}}
+    """
+    if not items:
+        return {}
+
+    tencent_codes = _build_tencent_codes(items)
+    url = f"{TENCENT_API}{tencent_codes}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://stockapp.finance.qq.com/",
+    }
+
+    try:
+        resp = sina_client._session.get(url, headers=headers, timeout=10)
+        if resp is None:
+            return {}
+        resp.encoding = "gbk"
+        text = resp.text.strip()
+    except Exception:
+        return {}
+
+    result: dict[str, dict[str, Optional[float]]] = {}
+
+    try:
+        import re
+        lines = text.strip().split("\n")
+
+        for i, line in enumerate(lines):
+            if i >= len(items):
+                break
+
+            match = re.search(r'="(.*)"', line)
+            if not match:
+                continue
+
+            fields = match.group(1).split('~')
+            if len(fields) < 50:
+                continue
+
+            code = items[i].code
+
+            # 换手率在 fields[38]，量比在 fields[49]
+            turnover = _parse_float(fields[38]) if len(fields) > 38 else None
+            volume_ratio = _parse_float(fields[49]) if len(fields) > 49 else None
+
+            result[code] = {
+                "volume_ratio": volume_ratio,
+                "turnover_rate": turnover,
+            }
+
+        return result
+
+    except Exception as e:
+        log.warning(f"腾讯财经数据解析异常: {e}")
+        return {}
+
+
+# ============================================================
+# 个股资金流（东方财富）
+# ============================================================
+
+def _get_secid(code: str, market: str) -> str:
+    """将股票代码转换为东方财富 secid
+
+    上海市场 secid=1.{code}，深圳市场 secid=0.{code}
+    """
+    prefix = "1" if market.upper() == "SH" else "0"
+    return f"{prefix}.{code}"
+
+
+def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
+    """获取个股主力净流入（元）
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+
+    Returns:
+        主力净流入金额（元），失败返回 None（静默失败，不记录日志）
+    """
+    secid = _get_secid(code, market)
+    url = (f"{STOCK_FLOW_API}?secid={secid}"
+           f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
+
+    # 使用无重试的session，避免产生大量WARNING日志
+    import requests
+    try:
+        resp = requests.get(url, timeout=3, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://data.eastmoney.com/",
+        })
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("data") is None or not data["data"].get("f52"):
+            return None
+        return _parse_float(data["data"]["f52"])
+    except Exception:
+        return None  # 静默失败
+
+
+def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
+    """为 Quote 列表批量补充主力净流入（原地修改）
+
+    使用线程池并发请求，每只股票独立请求东方财富资金流接口。
+    """
+    if not quotes:
+        return
+
+    def _fetch_one(q: Quote) -> tuple[str, Optional[float]]:
+        flow = fetch_main_net_inflow(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
+        return (q.code, flow)
+
+    try:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(_fetch_one, q) for q in quotes]
+            for fut in futures:
+                try:
+                    code, flow = fut.result(timeout=5)
+                    for q in quotes:
+                        if q.code == code:
+                            q.main_net_inflow = flow
+                            break
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning(f"资金流批量获取失败: {e}")
 
 
 # ============================================================
@@ -173,6 +336,7 @@ def _fetch_quotes_akshare(items: list[WatchItem]) -> list[Quote]:
             pb_ratio=_parse_float(row.get("市净率")),
             market_cap=_parse_float(row.get("总市值")),
             turnover_rate=_parse_float(row.get("换手率")),
+            volume_ratio=_parse_float(row.get("量比")),
             upper_limit=_parse_float(row.get("涨停价")),
             lower_limit=_parse_float(row.get("跌停价")),
         ))
@@ -493,3 +657,149 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
             break
 
     return news_list
+
+
+# ============================================================
+# 后台数据缓存器（量比、换手率、主力净流入）
+# ============================================================
+
+import threading
+from typing import Dict, Optional
+
+class BackgroundDataCache:
+    """后台数据缓存器：持续获取量比、换手率、主力净流入
+
+    独立于盯盘循环运行，每隔一定时间刷新数据。
+    盯盘时直接从缓存读取，不阻塞主循环。
+    """
+
+    def __init__(self, items: list[WatchItem], refresh_interval: int = 60) -> None:
+        """
+        Args:
+            items: 盯盘标的列表
+            refresh_interval: 刷新间隔（秒），默认60秒
+        """
+        self._items = items
+        self._refresh_interval = refresh_interval
+        self._lock = threading.Lock()
+
+        # 缓存数据: {code: {volume_ratio: x, turnover_rate: y, main_net_inflow: z}}
+        self._cache: Dict[str, Dict[str, Optional[float]]] = {}
+        self._last_update: float = 0.0
+
+        # 控制线程
+        self._stop_event = threading.Event()
+        self._tencent_thread: Optional[threading.Thread] = None  # 量比、换手率线程
+        self._flow_thread: Optional[threading.Thread] = None     # 主力净流入线程
+
+    def start(self) -> None:
+        """启动后台刷新线程"""
+        if self._tencent_thread and self._tencent_thread.is_alive():
+            return
+        if self._flow_thread and self._flow_thread.is_alive():
+            return
+        self._stop_event.clear()
+        # 启动两个独立线程：一个获取量比/换手率，一个获取主力净流入
+        self._tencent_thread = threading.Thread(target=self._run_tencent, daemon=True)
+        self._tencent_thread.start()
+        self._flow_thread = threading.Thread(target=self._run_flow, daemon=True)
+        self._flow_thread.start()
+        # 立即获取一次量比和换手率
+        self._refresh_tencent()
+
+    def stop(self) -> None:
+        """停止后台刷新线程"""
+        self._stop_event.set()
+        if self._tencent_thread:
+            self._tencent_thread.join(timeout=3)
+        if self._flow_thread:
+            self._flow_thread.join(timeout=3)
+
+    def get_data(self, code: str) -> Dict[str, Optional[float]]:
+        """获取指定代码的缓存数据"""
+        with self._lock:
+            return self._cache.get(code, {}).copy()
+
+    def get_all_data(self) -> Dict[str, Dict[str, Optional[float]]]:
+        """获取所有缓存数据"""
+        with self._lock:
+            return {k: v.copy() for k, v in self._cache.items()}
+
+    def is_fresh(self) -> bool:
+        """检查缓存是否已更新过"""
+        return self._last_update > 0
+
+    def _run_tencent(self) -> None:
+        """后台刷新循环：量比和换手率（腾讯财经）"""
+        while not self._stop_event.is_set():
+            try:
+                self._refresh_tencent()
+            except Exception as e:
+                log.warning(f"腾讯数据刷新异常: {e}")
+            # 等待下一个刷新周期
+            for _ in range(self._refresh_interval):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    def _run_flow(self) -> None:
+        """后台刷新循环：主力净流入（东方财富）"""
+        # 首次等待10秒再开始，避免启动时请求过多
+        for _ in range(10):
+            if self._stop_event.is_set():
+                return
+            time.sleep(1)
+        # 主力净流入刷新间隔更长（300秒=5分钟），因为API容易被屏蔽
+        flow_interval = 300
+        while not self._stop_event.is_set():
+            try:
+                self._refresh_flow()
+            except Exception:
+                pass  # 静默失败
+            # 等待下一个刷新周期
+            for _ in range(flow_interval):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    def _refresh_tencent(self) -> None:
+        """刷新量比和换手率（腾讯财经）"""
+        if not self._items:
+            return
+
+        # 从腾讯财经获取量比和换手率
+        try:
+            tencent_data = fetch_tencent_data(self._items)
+        except Exception as e:
+            log.warning(f"腾讯数据获取失败: {e}")
+            return
+
+        # 更新缓存（只更新量比和换手率，不覆盖主力净流入）
+        with self._lock:
+            for code, data in tencent_data.items():
+                if code not in self._cache:
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None}
+                if data.get("volume_ratio") is not None:
+                    self._cache[code]["volume_ratio"] = data["volume_ratio"]
+                if data.get("turnover_rate") is not None:
+                    self._cache[code]["turnover_rate"] = data["turnover_rate"]
+            self._last_update = time.time()
+
+    def _refresh_flow(self) -> None:
+        """刷新主力净流入（东方财富，静默失败）"""
+        if not self._items:
+            return
+
+        for item in self._items:
+            if self._stop_event.is_set():
+                return
+            code = item.code
+            # 每只股票单独请求，加延迟避免限流
+            flow = fetch_main_net_inflow(code, item.market)
+            with self._lock:
+                if code not in self._cache:
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None}
+                if flow is not None:
+                    self._cache[code]["main_net_inflow"] = flow
+            time.sleep(0.5)  # 请求间隔
+
