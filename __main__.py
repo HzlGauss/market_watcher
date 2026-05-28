@@ -315,9 +315,13 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         closes = [k.close for k in klines if k.close is not None]
         dif_vals = calc_macd_dif_series(closes) if closes else None
         signals = evaluate_all_strategies(tech, prev_tech, quote, klines, dif_vals, closes)
-        for s in signals:
-            if s.is_triggering:
+        triggering = [s for s in signals if s.is_triggering]
+        if triggering:
+            for s in triggering:
                 all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code, s.to_alert_text()))
+        else:
+            # 没有触发信号时显示"无信号"
+            all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code, "⚪ [无信号]"))
 
     if all_strategy_signals:
         from app.presenter import Color

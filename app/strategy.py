@@ -16,6 +16,7 @@ from app.technical import (
     is_breakabove_bb_middle,
     is_low_volume,
     calc_obv,
+    estimate_full_day_volume,
 )
 
 
@@ -126,7 +127,8 @@ def _is_macd_below_zero_flattening(dif: Optional[float], dea: Optional[float],
 def _is_volume_moderately_increasing(quote: Quote, klines: list[KlineData],
                                       lower: float = 1.2, upper: float = 1.8) -> bool:
     """成交量温和放大：当日量比在 [lower, upper] 区间内"""
-    if not klines or quote.volume is None or quote.volume <= 0:
+    vol = estimate_full_day_volume(quote)
+    if not klines or vol is None or vol <= 0:
         return False
     hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
     if len(hist) < 3:
@@ -134,13 +136,14 @@ def _is_volume_moderately_increasing(quote: Quote, klines: list[KlineData],
     avg_vol = sum(hist) / len(hist)
     if avg_vol <= 0:
         return False
-    ratio = quote.volume / avg_vol
+    ratio = vol / avg_vol
     return lower <= ratio <= upper
 
 
 def _is_volume_amplifying(quote: Quote, klines: list[KlineData], threshold: float = 1.2) -> bool:
     """成交量放大：当日量比 ≥ threshold"""
-    if not klines or quote.volume is None or quote.volume <= 0:
+    vol = estimate_full_day_volume(quote)
+    if not klines or vol is None or vol <= 0:
         return False
     hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
     if len(hist) < 3:
@@ -148,7 +151,7 @@ def _is_volume_amplifying(quote: Quote, klines: list[KlineData], threshold: floa
     avg_vol = sum(hist) / len(hist)
     if avg_vol <= 0:
         return False
-    ratio = quote.volume / avg_vol
+    ratio = vol / avg_vol
     return ratio >= threshold
 
 
@@ -546,12 +549,13 @@ def check_shrinking_volume_washout(
         sig.matched_conditions += 1
         conditions.append(f"股价回调({quote.change_pct:.2f}%)")
 
-    # 条件2: 成交量萎缩
-    if quote.volume is not None and quote.volume > 0:
+    # 条件2: 成交量萎缩（使用估算的全天量，避免午盘半天量导致量比虚低）
+    vol = estimate_full_day_volume(quote)
+    if vol is not None and vol > 0:
         hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
         if len(hist) >= 3:
             avg_vol = sum(hist) / len(hist)
-            ratio = quote.volume / avg_vol if avg_vol > 0 else 1.0
+            ratio = vol / avg_vol if avg_vol > 0 else 1.0
             if ratio <= 0.6:
                 sig.matched_conditions += 1
                 conditions.append(f"缩量(量比{ratio:.2f})")

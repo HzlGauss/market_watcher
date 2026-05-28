@@ -296,6 +296,110 @@ class ScanRecord:
 
 
 # ============================================================
+# 龙虎榜模型
+# ============================================================
+
+@dataclass
+class DragonTigerSeat:
+    """
+    龙虎榜买卖席位
+
+    Attributes:
+        seat_name: 营业部名称（如"机构专用"、"深股通专用"、"华泰证券...")
+        buy_amount: 买入金额（元）
+        sell_amount: 卖出金额（元）
+        net_amount: 净买入金额（元）
+        is_institution: 是否机构专用席位
+        is_hsgt: 是否沪深股通席位
+    """
+    seat_name: str = ""
+    buy_amount: float = 0.0
+    sell_amount: float = 0.0
+    net_amount: float = 0.0
+    is_institution: bool = False
+    is_hsgt: bool = False
+
+
+@dataclass
+class DragonTigerRecord:
+    """
+    单只个股龙虎榜数据
+
+    Attributes:
+        code: 股票代码
+        name: 股票名称
+        reason: 上榜原因
+        change_pct: 涨跌幅(%)
+        total_buy: 龙虎榜总买入额（元）
+        total_sell: 龙虎榜总卖出额（元）
+        net_buy: 龙虎榜净买入额（元）
+        turnover_rate: 换手率(%)
+        total_trade: 龙虎榜总成交额（元）
+        industry: 所属行业
+        sector: 所属地域板块
+        buy_seats: 买入前5席位
+        sell_seats: 卖出前5席位
+        main_net_inflow: 主力净流入（元）
+    """
+    code: str = ""
+    name: str = ""
+    reason: str = ""
+    change_pct: Optional[float] = None
+    total_buy: float = 0.0
+    total_sell: float = 0.0
+    net_buy: float = 0.0
+    turnover_rate: Optional[float] = None
+    total_trade: float = 0.0
+    industry: str = ""
+    sector: str = ""
+    buy_seats: list[DragonTigerSeat] = field(default_factory=list)
+    sell_seats: list[DragonTigerSeat] = field(default_factory=list)
+    main_net_inflow: Optional[float] = None
+
+    @property
+    def buy_sell_ratio(self) -> Optional[float]:
+        """买卖金额比（>1 表示买方力量更强）"""
+        if self.total_sell > 0:
+            return round(self.total_buy / self.total_sell, 2)
+        return None
+
+    @property
+    def institution_net(self) -> float:
+        """机构席位净买入额"""
+        return sum(s.net_amount for s in self.buy_seats + self.sell_seats if s.is_institution)
+
+    @property
+    def hsgt_net(self) -> float:
+        """沪深股通席位净买入额"""
+        return sum(s.net_amount for s in self.buy_seats + self.sell_seats if s.is_hsgt)
+
+
+@dataclass
+class DragonTigerSummary:
+    """
+    龙虎榜综合分析结果
+
+    Attributes:
+        date: 数据日期
+        total_count: 上榜个股总数
+        records: 完整龙虎榜记录列表
+        institutional_focus: 机构资金重点关注个股（机构净买入>0 且排名靠前）
+        institutional_risk: 机构资金出逃个股（机构净卖出较大）
+        hot_money_track: 知名游资动向追踪
+        sector_flow: 板块资金流向汇总
+        overall_assessment: 整体研判结论
+    """
+    date: str = ""
+    total_count: int = 0
+    records: list[DragonTigerRecord] = field(default_factory=list)
+    institutional_focus: list[dict] = field(default_factory=list)
+    institutional_risk: list[dict] = field(default_factory=list)
+    hot_money_track: list[dict] = field(default_factory=list)
+    sector_flow: list[dict] = field(default_factory=list)
+    overall_assessment: str = ""
+
+
+# ============================================================
 # 常量
 # ============================================================
 

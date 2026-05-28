@@ -14,6 +14,12 @@ from app.analyzer import analyze, calc_market_sentiment
 from app.utils import log
 from app.http_client import serverchan_client
 from app.llm_client import get_llm_client, SYSTEM_PROMPTS
+from app.dragon_tiger import (
+    fetch_dragon_tiger_list,
+    analyze_dragon_tiger,
+    format_dragon_tiger_report,
+    build_llm_context,
+)
 
 
 # ============================================================
@@ -123,14 +129,20 @@ def _get_holdings_strategy_signals(
         signals = evaluate_all_strategies(tech, prev_tech, quote, klines, dif_vals, closes)
         triggering = [s for s in signals if s.is_triggering]
 
-        if not triggering:
-            return None
-
-        return {
-            "name": h.name,
-            "code": h.code,
-            "signals": [s.to_alert_text() for s in triggering],
-        }
+        # 显示所有持仓状态，即使没有触发信号
+        if triggering:
+            return {
+                "name": h.name,
+                "code": h.code,
+                "signals": [s.to_alert_text() for s in triggering],
+            }
+        else:
+            # 没有触发信号时显示"无信号"
+            return {
+                "name": h.name,
+                "code": h.code,
+                "signals": ["⚪ [无信号] 当前无满足条件的策略"],
+            }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(_eval_one, h): h.code for h in holdings}
@@ -767,12 +779,15 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
         quote: 实时行情数据
         prev_volume: 前一日成交量（用于计算倍率）
     """
+    from app.technical import estimate_full_day_volume
+
     if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
         return "数据不足"
 
     change_pct = quote.change_pct or 0
     amplitude = quote.amplitude or 0
-    volume = quote.volume or 0
+    # 估算全天量，避免午盘半日量导致量比失真
+    volume = estimate_full_day_volume(quote) or 0
     qtype = quote.type or ""
 
     is_etf = "ETF" in qtype
@@ -921,6 +936,20 @@ def generate_evening_review(config: Config) -> Path | None:
     from app.data_fetcher import fetch_market_news
     day_news = fetch_market_news(start_hour=9, end_hour=16, max_count=10)
 
+    # 获取龙虎榜数据
+    dragon_tiger_summary = None
+    dragon_tiger_report = ""
+    dragon_tiger_llm = ""
+    try:
+        dt_records = fetch_dragon_tiger_list(max_count=30)
+        if dt_records:
+            dragon_tiger_summary = analyze_dragon_tiger(dt_records)
+            dragon_tiger_report = format_dragon_tiger_report(dragon_tiger_summary)
+            dragon_tiger_llm = build_llm_context(dragon_tiger_summary)
+            log.info(f"龙虎榜数据分析完成: {len(dt_records)} 只个股")
+    except Exception as e:
+        log.warning(f"龙虎榜数据获取/分析失败: {e}")
+
     # 2. Build data section
     data_lines = []
 
@@ -930,7 +959,11 @@ def generate_evening_review(config: Config) -> Path | None:
             cat = f" [{n.category}]" if n.category else ""
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
 
-    data_lines.append(f"\n## 二、市场背景")
+    if dragon_tiger_report:
+        data_lines.append(f"\n## 二、龙虎榜资金分析")
+        data_lines.append(f"\n{dragon_tiger_report}")
+
+    data_lines.append(f"\n## 三、市场背景")
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     if h_results:
@@ -965,7 +998,7 @@ def generate_evening_review(config: Config) -> Path | None:
                     "capital_flow": capital_flow,
                 })
 
-        data_lines.append(f"\n## 三、持仓表现")
+        data_lines.append(f"\n## 四、持仓表现")
 
         data_lines.append("\n### 3.1 持仓详情")
         for h in holdings_with_analysis:
@@ -977,12 +1010,18 @@ def generate_evening_review(config: Config) -> Path | None:
             # 涨跌幅
             if quote and quote.change_pct is not None:
                 parts.append(f"涨跌{quote.change_pct:+.2f}%")
-            # 量比（当日成交量/前日成交量）
+            # 量比（使用估算全天量，避免午盘半日量失真）
             if quote and quote.volume and quote.volume > 0:
-                prev_vol = prev_state.get(h["code"], {}).get("volume")
-                if prev_vol and prev_vol > 0:
-                    ratio = quote.volume / prev_vol
-                    parts.append(f"量比{ratio:.2f}")
+                from app.technical import estimate_full_day_volume
+                est_vol = estimate_full_day_volume(quote)
+                if est_vol and est_vol > 0:
+                    # 用报告生成时间估算全天量，并取估算全天量与均量的比
+                    prev_vol = prev_state.get(h["code"], {}).get("volume")
+                    # 若 prev_vol 存在且为今早半日量（>0），用它估算昨日全天量
+                    if prev_vol and prev_vol > 0:
+                        prev_est = prev_vol * 2  # 假设上午量≈下午量估算昨日全天量
+                        ratio = est_vol / prev_est if prev_est > 0 else 1.0
+                        parts.append(f"量比{ratio:.2f}")
             # 主力净流入
             capital = h.get("capital_flow", "")
             if capital and capital != "数据不足":
@@ -1018,7 +1057,7 @@ def generate_evening_review(config: Config) -> Path | None:
     tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
     strategy_signals_evening = _get_holdings_strategy_signals(holdings, quotes)
     if tech_data_evening:
-        data_lines.append("\n## 四、持仓技术分析")
+        data_lines.append("\n## 五、持仓技术分析")
         data_lines.append("")
         data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
         data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|-----|--------|--------|")
@@ -1039,7 +1078,7 @@ def generate_evening_review(config: Config) -> Path | None:
             data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals_evening:
-        data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振，明日操作参考）")
+        data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，明日操作参考）")
         for s in strategy_signals_evening:
             for sig_text in s['signals']:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
@@ -1105,22 +1144,30 @@ def generate_evening_review(config: Config) -> Path | None:
             for sig_text in s['signals']:
                 llm_lines.append(f"  {s['name']}: {sig_text}")
 
+    if dragon_tiger_llm:
+        llm_lines.append(f"\n{dragon_tiger_llm}")
+
     llm_lines.append(f"""
 
 请按以下结构生成晚报（约 700 字）：
 
-### 一、持仓全景分析
+### 一、龙虎榜资金动向（简要）
+- 大资金整体取向：偏多/偏空/分歧
+- 如果龙虎榜数据中有与持仓同板块/同行业的个股出现异常资金流动，请重点提醒
+- 市场短线情绪判断（游资活跃度）
+
+### 二、持仓全景分析
 - 强弱分化：哪只最强/最弱，差距原因是什么？
 - 技术面综合评估：整体持仓的技术状态如何？
 
-### 二、重点持仓深度点评（按重要性排序，不超过 3 只）
+### 三、重点持仓深度点评（按重要性排序，不超过 3 只）
 对每只持仓输出：
 - **技术状态**：价在均线什么位置？RSI/MACD/KDJ 是否同向？
 - **资金行为**：主力主导还是散户主导？有无异常放量/缩量？
 - **估值水平**：结合 PE/PB 判断贵贱（标注置信度）
 - **核心判断**：一句话结论（如："短期超买，明日有回调需求"）
 
-### 三、明日多情景预案
+### 四、明日多情景预案
 
 | 情景 | 触发条件 | 应对动作 | 置信度 |
 |------|---------|---------|--------|
@@ -1128,7 +1175,7 @@ def generate_evening_review(config: Config) -> Path | None:
 | 基准 | 平开震荡 | ... | 高 |
 | 悲观 | 低开+放量下跌 | ... | 中 |
 
-### 四、风控红线
+### 五、风控红线
 明日每只持仓的硬止损位和硬止盈位（具体价格）。
 
 要求：必须使用条件格式（if-then），标注置信度。不输出与持仓无关的市场分析。

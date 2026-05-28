@@ -7,11 +7,29 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 from app.models import KlineData, Quote, TechnicalSummary
 from app.http_client import sina_client
 from app.utils import log
+
+
+def estimate_full_day_volume(quote: Quote) -> Optional[float]:
+    """估算全天成交量（用于午盘时段）
+
+    午盘时 quote.volume 只有半天量，直接与历史全日均量对比会导致量比虚低。
+    如果当前是午盘（< 12:30），将当前量乘以 2 作为全天量估算。
+
+    Returns:
+        估算的全天成交量，如果已是收盘后则返回原始 volume
+    """
+    if quote.volume is None or quote.volume <= 0:
+        return None
+    now = datetime.now()
+    if now.hour < 12 or (now.hour == 12 and now.minute < 30):
+        return quote.volume * 2
+    return quote.volume
 
 
 # ============================================================
@@ -844,13 +862,17 @@ def is_stagflation(quote: Quote, klines: list[KlineData], price_threshold: float
     Returns:
         True 表示存在滞涨现象
     """
-    if quote.change_pct is None or quote.volume is None:
+    if quote.change_pct is None:
         return False
 
     if quote.change_pct < 0:
         return False
 
     if quote.change_pct > price_threshold:
+        return False
+
+    vol = estimate_full_day_volume(quote)
+    if vol is None or vol <= 0:
         return False
 
     hist = [k.volume for k in klines[:-1] if k.volume and k.volume > 0][-10:]
@@ -861,7 +883,7 @@ def is_stagflation(quote: Quote, klines: list[KlineData], price_threshold: float
     if avg_vol <= 0:
         return False
 
-    ratio = quote.volume / avg_vol
+    ratio = vol / avg_vol
     return ratio >= vol_threshold
 
 
@@ -964,7 +986,10 @@ def analyze_volume_price(quote: Quote, klines: list[KlineData]) -> str:
     Returns:
         量价关系描述字符串，如 "放量上涨", "缩量下跌", "平量震荡" 等
     """
-    if not klines or quote.volume is None or quote.volume <= 0:
+    if not klines:
+        return "数据不足"
+    vol = estimate_full_day_volume(quote)
+    if vol is None or vol <= 0:
         return "数据不足"
 
     # 取近 10 日（不含当日）的平均成交量作为基准
@@ -973,7 +998,7 @@ def analyze_volume_price(quote: Quote, klines: list[KlineData]) -> str:
         return "数据不足"
 
     avg_vol = sum(hist) / len(hist)
-    ratio = quote.volume / avg_vol if avg_vol > 0 else 1.0
+    ratio = vol / avg_vol if avg_vol > 0 else 1.0
     change_pct = quote.change_pct or 0
 
     # 量比标注
