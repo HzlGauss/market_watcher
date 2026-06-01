@@ -36,24 +36,32 @@ def estimate_full_day_volume(quote: Quote) -> Optional[float]:
 # K线数据获取
 # ============================================================
 
-def fetch_historical_kline(code: str, market: str, days: int = 30) -> list[KlineData]:
-    """获取日K线数据（新浪主源 + AKShare 兜底）
+def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 240) -> list[KlineData]:
+    """获取K线数据（新浪主源 + AKShare 兜底）
 
     Args:
         code: 股票代码
         market: 市场标识 (SH/SZ/HK)
-        days: 获取天数
+        days: 获取多少天的数据
+        scale: K线周期。240=日线, 60=60分钟, 30=30分钟, 15=15分钟, 5=5分钟
 
     Returns:
-        K线数据列表（按日期升序）
+        K线数据列表（按时间升序）
     """
     prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
     sina_code = f"{prefix}{code}"
 
+    # 分钟线需要更多 bar 数来覆盖足够天数
+    if scale < 240:
+        bars_per_day = 240 // scale
+        datalen = max(days * bars_per_day, 120)
+    else:
+        datalen = days
+
     url = (
         f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-        f"CN_MarketData.getKLineData?symbol={sina_code}&scale=240&"
-        f"&ma=no&datalen={days}"
+        f"CN_MarketData.getKLineData?symbol={sina_code}&scale={scale}&"
+        f"&ma=no&datalen={datalen}"
     )
 
     resp = sina_client.get(url)

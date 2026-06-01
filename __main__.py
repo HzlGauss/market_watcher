@@ -274,7 +274,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         item = item_map.get(code)
         if not item:
             continue
-        klines = fetch_historical_kline(code, item.market, days=60)
+        klines = fetch_historical_kline(code, item.market, days=60, scale=60)
         if klines:
             klines_map[code] = klines
             tech_summaries[code] = get_technical_summary(quote_map[code], klines)
