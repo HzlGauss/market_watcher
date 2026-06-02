@@ -435,7 +435,17 @@ def generate_morning_brief(config: Config) -> Path | None:
             chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
             llm_lines.append(f"  {idx.name}: {close} ({chg})")
 
-        h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes) if holdings else ([], 0, 0)
+        # 给指数计算支撑压力位（用于波动区间参考）
+        if index_quotes:
+            from app.technical import fetch_historical_kline, calc_support_resistance
+            llm_lines.append("\n[指数支撑压力]")
+            for idx in index_quotes[:3]:  # 最多显示3个主要指数
+                klines = fetch_historical_kline(idx.code, idx.market, days=60)
+                if klines:
+                    sr = calc_support_resistance(klines)
+                    support = f"{sr.support:.2f}" if sr.support else "--"
+                    resistance = f"{sr.resistance:.2f}" if sr.resistance else "--"
+                    llm_lines.append(f"  {idx.name}: 支撑={support} 压力={resistance}")
         if h_results:
             llm_lines.append(f"\n[持仓]")
             for h in h_results[:5]:

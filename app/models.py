@@ -97,6 +97,8 @@ class Quote:
     turnover_rate: Optional[float] = None
     volume_ratio: Optional[float] = None
     main_net_inflow: Optional[float] = None
+    bid_volume: Optional[float] = None  # 外盘（主动买入）
+    ask_volume: Optional[float] = None  # 内盘（主动卖出）
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
 
