@@ -259,6 +259,12 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     q.turnover_rate = cached["turnover_rate"]
                 if cached.get("main_net_inflow") is not None:
                     q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("bid_volume") is not None:
+                    q.bid_volume = cached["bid_volume"]
+                if cached.get("ask_volume") is not None:
+                    q.ask_volume = cached["ask_volume"]
+                if cached.get("bid_ask_ratio") is not None:
+                    q.bid_ask_ratio = cached["bid_ask_ratio"]
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]

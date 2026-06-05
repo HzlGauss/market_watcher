@@ -18,7 +18,7 @@ from typing import Optional, Literal
 class WatchItem:
     """
     配置文件中的单个盯盘标的
-    
+
     Attributes:
         name: 标的名称
         code: 股票代码
@@ -35,7 +35,7 @@ class WatchItem:
 class Holding:
     """
     用户持仓信息
-    
+
     Attributes:
         name: 持仓名称
         code: 股票代码
@@ -54,7 +54,7 @@ class Holding:
 class Quote:
     """
     单个标的的实时行情快照
-    
+
     Attributes:
         code: 股票代码
         name: 标的名称
@@ -99,6 +99,7 @@ class Quote:
     main_net_inflow: Optional[float] = None
     bid_volume: Optional[float] = None  # 外盘（主动买入）
     ask_volume: Optional[float] = None  # 内盘（主动卖出）
+    bid_ask_ratio: Optional[float] = None  # 委比
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
 
@@ -107,7 +108,7 @@ class Quote:
 class Alert:
     """
     单条异动提醒
-    
+
     Attributes:
         code: 股票代码
         name: 标的名称
@@ -116,11 +117,11 @@ class Alert:
     code: str = ""
     name: str = ""
     messages: list[str] = field(default_factory=list)
-    
+
     def add_message(self, message: str) -> None:
         """添加异动消息"""
         self.messages.append(message)
-    
+
     def has_messages(self) -> bool:
         """检查是否有异动消息"""
         return len(self.messages) > 0
@@ -134,7 +135,7 @@ class Alert:
 class SentimentResult:
     """
     市场情绪评估结果
-    
+
     Attributes:
         score: 情绪评分 (0-100)
         label: 情绪标签
@@ -153,7 +154,7 @@ class SentimentResult:
 class AnalysisStats:
     """
     单次扫描的统计结果
-    
+
     Attributes:
         total: 总标的数
         up: 上涨标的数
@@ -194,7 +195,7 @@ class MarketNews:
 class NorthFlowData:
     """
     北向资金数据
-    
+
     Attributes:
         hk2sh_net: 沪股通净流入 (亿元)
         hk2sz_net: 深股通净流入 (亿元)
@@ -209,7 +210,7 @@ class NorthFlowData:
     hk2sh_quota: float = 0.0
     hk2sz_quota: float = 0.0
     date: str = ""
-    
+
     @property
     def is_significant(self) -> bool:
         """判断北向资金是否显著 (净流入/流出超过 50 亿)"""

@@ -142,6 +142,12 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                         q.volume_ratio = data["volume_ratio"]
                     if data.get("turnover_rate") is not None:
                         q.turnover_rate = data["turnover_rate"]
+                    if data.get("bid_volume") is not None:
+                        q.bid_volume = data["bid_volume"]
+                    if data.get("ask_volume") is not None:
+                        q.ask_volume = data["ask_volume"]
+                    if data.get("bid_ask_ratio") is not None:
+                        q.bid_ask_ratio = data["bid_ask_ratio"]
         except Exception:
             pass  # 腾讯API失败时忽略，不影响主流程
 
@@ -212,12 +218,20 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
             code = items[i].code
 
             # 换手率在 fields[38]，量比在 fields[49]
+            # 外盘（主动买入）在 fields[6]，内盘（主动卖出）在 fields[7]
+            # 委比在 fields[33]（百分比形式）
             turnover = _parse_float(fields[38]) if len(fields) > 38 else None
             volume_ratio = _parse_float(fields[49]) if len(fields) > 49 else None
+            bid_volume = _parse_float(fields[6]) if len(fields) > 6 else None
+            ask_volume = _parse_float(fields[7]) if len(fields) > 7 else None
+            bid_ask_ratio = _parse_float(fields[33]) if len(fields) > 33 and fields[33] else None
 
             result[code] = {
                 "volume_ratio": volume_ratio,
                 "turnover_rate": turnover,
+                "bid_volume": bid_volume,
+                "ask_volume": ask_volume,
+                "bid_ask_ratio": bid_ask_ratio,
             }
 
         return result
@@ -618,7 +632,12 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
     url = "https://www.eastmoney.com/commweb/api/newsFlow"
     params = {"client": "web", "channel": "65", "pageSize": str(max_count * 2)}
 
-    resp = eastmoney_client.get(url, params=params)
+    try:
+        resp = eastmoney_client.get(url, params=params)
+    except Exception as e:
+        log.debug(f"快讯获取失败: {e}")
+        return []
+
     if resp is None:
         return []
 
@@ -774,15 +793,21 @@ class BackgroundDataCache:
             log.warning(f"腾讯数据获取失败: {e}")
             return
 
-        # 更新缓存（只更新量比和换手率，不覆盖主力净流入）
+        # 更新缓存（只更新量比、换手率、外盘、内盘、委比，不覆盖主力净流入）
         with self._lock:
             for code, data in tencent_data.items():
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None}
                 if data.get("volume_ratio") is not None:
                     self._cache[code]["volume_ratio"] = data["volume_ratio"]
                 if data.get("turnover_rate") is not None:
                     self._cache[code]["turnover_rate"] = data["turnover_rate"]
+                if data.get("bid_volume") is not None:
+                    self._cache[code]["bid_volume"] = data["bid_volume"]
+                if data.get("ask_volume") is not None:
+                    self._cache[code]["ask_volume"] = data["ask_volume"]
+                if data.get("bid_ask_ratio") is not None:
+                    self._cache[code]["bid_ask_ratio"] = data["bid_ask_ratio"]
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
@@ -798,7 +823,7 @@ class BackgroundDataCache:
             flow = fetch_main_net_inflow(code, item.market)
             with self._lock:
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None}
                 if flow is not None:
                     self._cache[code]["main_net_inflow"] = flow
             time.sleep(0.5)  # 请求间隔

@@ -44,10 +44,10 @@ def print_quotes_table(quotes: list[Quote]) -> None:
     header = (
         f"{'代码':>8} {'名称':<12} {'最新价':>8} "
         f"{'涨跌幅':>8} {'外盘':>10} {'内盘':>10} "
-        f"{'量比':>6} {'成交量':>10} {'换手率':>8} {'振幅':>7}"
+        f"{'委比':>6} {'量比':>6} {'成交量':>10} {'换手率':>8} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 85}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 95}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -88,6 +88,16 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         # 内盘（主动卖出）
         ask_vol_str = format_volume(q.ask_volume) if q.ask_volume else f"{Color.DIM}--{Color.RESET}"
 
+        # 委比
+        if q.bid_ask_ratio is not None:
+            bar_str = f"{q.bid_ask_ratio:+.1f}%"
+            if q.bid_ask_ratio > 30:
+                bar_str = f"{Color.RED}{bar_str}{Color.RESET}"
+            elif q.bid_ask_ratio < -30:
+                bar_str = f"{Color.GREEN}{bar_str}{Color.RESET}"
+        else:
+            bar_str = f"{Color.DIM}--{Color.RESET}"
+
         # 换手率
         if q.turnover_rate is not None:
             tr_str = f"{q.turnover_rate:.2f}%"
@@ -99,7 +109,7 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         line = (
             f"{q.code:>8} {q.name:<12} {price:>8} {cp:>8} "
             f"{bid_vol_str:>10} {ask_vol_str:>10} "
-            f"{vr_str:>6} {vol_str:>10} {tr_str:>8} {amp_str:>7}"
+            f"{bar_str:>6} {vr_str:>6} {vol_str:>10} {tr_str:>8} {amp_str:>7}"
         )
         print(f"  {line}")
 
