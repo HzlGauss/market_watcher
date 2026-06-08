@@ -17,6 +17,10 @@ from app.broker_api import auto_update_holdings
 from app.presenter import Color
 from app.utils import log, ensure_dirs, load_env
 from app.helpers import is_trading_time
+from app.data_pool import SharedDataPool
+from app.data_fetcher_thread import DataFetcherThread
+from app.t0_monitor import T0MonitorThread
+from app.models import WatchItem
 
 # Path definitions
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,7 +33,7 @@ REPORT_DIR = BASE_DIR / "investment_reports"
 
 # Logging setup
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S"
 )
@@ -259,6 +263,12 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     q.turnover_rate = cached["turnover_rate"]
                 if cached.get("main_net_inflow") is not None:
                     q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("bid_volume") is not None:
+                    q.bid_volume = cached["bid_volume"]
+                if cached.get("ask_volume") is not None:
+                    q.ask_volume = cached["ask_volume"]
+                if cached.get("bid_ask_ratio") is not None:
+                    q.bid_ask_ratio = cached["bid_ask_ratio"]
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -425,15 +435,159 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     print_tail(config.scan_interval)
 
 
-def _run_monitoring_loop(config: Config,
-                         north_fetcher: NorthFlowFetcher) -> None:
-    """Monitoring main loop"""
+def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
+                  call_llm: bool = False, scan_count: int = 0) -> None:
+    """Run one scan cycle using shared data pool"""
+    from app.analyzer import analyze, _load_scan_history, _save_scan_history
+    from app.ai_analyzer import analyze as analyze_with_llm
+    from app.notifier import push_alert
+    from app.presenter import (
+        print_quotes_table, print_sentiment, print_alerts,
+        print_llm_result, print_tail, save_brief, print_key_levels
+    )
+    from app.technical import get_technical_summary, TechnicalSummary
+    from app.models import ScanRecord, FundScanStatus, TechSnapshot
+
+    log.info("Scanning market data (from shared pool)...")
+
+    # Get data from shared pool
+    quotes = list(data_pool.get_all_quotes().values())
+    if not quotes:
+        log.warning("No quote data available in data pool")
+        return
+
+    # Get K-line data from shared pool
+    klines_map = {}
+    for q in quotes:
+        klines = data_pool.get_klines(q.code)
+        if klines:
+            # Convert KLine objects to dict format for technical analysis
+            klines_map[q.code] = [{
+                'day': k.date,
+                'open': k.open,
+                'high': k.high,
+                'low': k.low,
+                'close': k.close,
+                'volume': k.volume
+            } for k in klines]
+
+    # Separate quotes by type for statistics
+    holdings_quotes = [q for q in quotes if q.type == "持仓"]
+    watchlist_quotes = [q for q in quotes if q.type != "持仓"]
+
+    # Calculate technical summaries
+    tech_summaries: dict[str, TechnicalSummary] = {}
+    quote_map = {q.code: q for q in quotes}
+
+    for code in quote_map:
+        klines = klines_map.get(code)
+        if klines:
+            tech_summaries[code] = get_technical_summary(quote_map[code], klines)
+
+    print_quotes_table(quotes)
+
+    # Show key levels (support/resistance)
+    if tech_summaries:
+        print_key_levels(tech_summaries, quotes)
+
+    # Load previous state for volume comparison
+    prev_state: dict = {}
+    if STATE_PATH.exists():
+        try:
+            prev_state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.warning(f"读取状态文件失败: {e}")
+
+    # Load scan history
+    scan_history = _load_scan_history()
+    prev_tech_summaries: dict[str, TechnicalSummary] = {}
+    if scan_history:
+        last_record = scan_history[-1]
+        for code, status in last_record.funds_status.items():
+            if status.tech_snapshot:
+                from app.models import tech_snapshot_to_summary
+                prev_tech_summaries[code] = tech_snapshot_to_summary(status.tech_snapshot)
+
+    # Evaluate strategy signals
+    from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    all_strategy_signals: list[tuple[str, str, str]] = []
+    for code in quote_map:
+        quote = quote_map[code]
+        klines = klines_map.get(code)
+        if not klines:
+            continue
+
+        try:
+            dif_vals = calc_macd_dif_series([k['close'] for k in klines])
+            closes = [k['close'] for k in klines]
+            prev_tech = prev_tech_summaries.get(code)
+            tech = tech_summaries.get(code)
+
+            if tech:
+                signals = evaluate_all_strategies(tech, prev_tech, quote, klines, dif_vals, closes)
+                if signals:
+                    for s in signals:
+                        all_strategy_signals.append((quote.name, code, s.to_alert_text()))
+                else:
+                    # Show "no signal" for all holdings
+                    all_strategy_signals.append((quote.name, code, "⚪ [无信号]"))
+        except Exception as e:
+            log.warning(f"Strategy evaluation failed for {code}: {e}")
+
+    # Analyze market
+    alerts, stats = analyze(config, holdings_quotes, watchlist_quotes, tech_summaries)
+
+    # Print sentiment and alerts
+    print_sentiment(stats)
+    print_alerts(alerts, config)
+
+    # LLM analysis
+    llm_result = ""
+    if call_llm and config.llm_enabled:
+        try:
+            llm_result = analyze_with_llm(config, quotes, stats)
+            print_llm_result(llm_result)
+        except Exception as e:
+            log.error(f"LLM analysis failed: {e}")
+
+    # Push alerts if enabled
+    if config.push_enabled and alerts:
+        try:
+            push_alert(alerts, config.sct_sendkey)
+        except Exception as e:
+            log.error(f"Push notification failed: {e}")
+
+    # Save scan record
+    funds_status = {}
+    for code in quote_map:
+        tech = tech_summaries.get(code)
+        snapshot = TechSnapshot.from_summary(tech) if tech else None
+        funds_status[code] = FundScanStatus(
+            name=quote_map[code].name,
+            tech_snapshot=snapshot,
+            strategy_signals=[s[2] for s in all_strategy_signals if s[1] == code]
+        )
+
+    scan_record = ScanRecord(
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        funds_status=funds_status,
+        llm_analysis=llm_result
+    )
+
+    scan_history.append(scan_record)
+    _save_scan_history(scan_history)
+
+    save_brief(quotes, alerts, stats, BRIEF_DIR)
+    print_tail(config.scan_interval)
+
+
+def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> None:
+    """Monitoring main loop with shared data architecture"""
     log.info(f"Entering monitor mode, scan every {config.scan_interval} minutes")
     log.info(f"Press Ctrl+C to return to menu")
     print()
 
-    # Build monitor items for background cache
-    from app.models import WatchItem
+    # Build monitor items
     monitor_items = []
     for h in config.holdings:
         monitor_items.append(WatchItem(name=h.name, code=h.code, market=h.market, type="持仓"))
@@ -442,17 +596,27 @@ def _run_monitoring_loop(config: Config,
         if item.code not in holding_codes:
             monitor_items.append(WatchItem(name=item.name, code=item.code, market=item.market, type=item.type))
 
-    # Start background data cache (refreshes every 60 seconds)
-    from app.data_fetcher import BackgroundDataCache
-    bg_cache = BackgroundDataCache(monitor_items, refresh_interval=60)
-    bg_cache.start()
-    # Attach to _run_once so it can access the cache
-    _run_once._bg_cache = bg_cache
+    # Initialize shared data pool
+    data_pool = SharedDataPool()
 
-    # Wait for initial data to be ready (up to 5 seconds)
-    log.info("Initializing background data cache (volume_ratio, turnover_rate)...")
-    for _ in range(5):
-        if bg_cache.is_fresh():
+    # Start data fetcher thread (producer)
+    fetcher_thread = DataFetcherThread(monitor_items, data_pool, interval=30)
+    fetcher_thread.start()
+
+    # Start T+0 monitor thread if enabled
+    t0_thread = None
+    if hasattr(config, 't0_enabled') and config.t0_enabled:
+        enable_push = getattr(config, 't0_push_enabled', False)
+        t0_interval = getattr(config, 't0_interval', 30)
+        t0_thread = T0MonitorThread(monitor_items, data_pool, interval=t0_interval,
+                                    enable_sound=True, enable_push=enable_push)
+        t0_thread.start()
+
+    # Wait for initial data to be ready (up to 10 seconds)
+    log.info("Initializing data pool...")
+    for _ in range(10):
+        if data_pool.is_fresh(max_age=30):
+            log.info(f"Data pool ready, {data_pool.update_count} updates received")
             break
         time.sleep(1)
 
@@ -462,9 +626,8 @@ def _run_monitoring_loop(config: Config,
         while True:
             if is_trading_time(datetime.now(), config.sessions)[0]:
                 scan_count += 1
-                # LLM 每两次扫描执行一次（第 2、4、6... 次）
                 call_llm = (scan_count % 2 == 0)
-                _run_once(config, north_fetcher, call_llm=call_llm, scan_count=scan_count)
+                _run_once_new(config, north_fetcher, data_pool, call_llm=call_llm, scan_count=scan_count)
             else:
                 now = datetime.now()
                 if first_run or now.minute % 15 == 0:
@@ -477,9 +640,11 @@ def _run_monitoring_loop(config: Config,
     except KeyboardInterrupt:
         log.info("Returning to menu...")
     finally:
-        bg_cache.stop()
-        if hasattr(_run_once, '_bg_cache'):
-            delattr(_run_once, '_bg_cache')
+        # Stop threads
+        if t0_thread:
+            t0_thread.stop()
+        fetcher_thread.stop()
+        log.info("All threads stopped")
 
 
 def main() -> None:

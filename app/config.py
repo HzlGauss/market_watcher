@@ -338,6 +338,24 @@ class Config:
         value = self._raw.get("北向资金", {}).get("更新间隔分钟", self.DEFAULT_NORTH_FLOW_INTERVAL)
         return max(1, safe_int(value, self.DEFAULT_NORTH_FLOW_INTERVAL))
 
+    # ---- 做T监控 ----
+
+    @property
+    def t0_enabled(self) -> bool:
+        """是否启用做T监控"""
+        return self._raw.get("做T监控", {}).get("启用", False)
+
+    @property
+    def t0_push_enabled(self) -> bool:
+        """是否启用做T信号微信推送"""
+        return self._raw.get("做T监控", {}).get("推送微信", False)
+
+    @property
+    def t0_interval(self) -> int:
+        """做T监控扫描间隔（秒）"""
+        value = self._raw.get("做T监控", {}).get("扫描间隔秒", 30)
+        return max(10, safe_int(value, 30))
+
     # ---- Investment Reports ----
 
     @property

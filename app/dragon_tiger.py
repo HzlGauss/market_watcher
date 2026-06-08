@@ -47,7 +47,7 @@ def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
         import akshare as ak
         import pandas as pd
     except ImportError:
-        log.warning("AKShare 未安装，无法获取龙虎榜数据")
+        log.debug("AKShare 未安装，无法获取龙虎榜数据")
         return []
 
     today = datetime.now().strftime("%Y%m%d")

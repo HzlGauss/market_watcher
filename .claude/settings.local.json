@@ -39,7 +39,7 @@
     ],
     "deny": []
   },
-  "model": "opus",
+  "model": "sonnet",
   "effortLevel": "medium",
   "version": 1
 }
