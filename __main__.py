@@ -201,7 +201,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     from app.data_fetcher import fetch_quotes
     from app.analyzer import analyze, _load_scan_history, _save_scan_history
     from app.ai_analyzer import analyze as analyze_with_llm
-    from app.notifier import push_alert
+    from app.notifier import push_alert, send_desktop_notification
     from app.presenter import (
         print_quotes_table, print_sentiment, print_alerts,
         print_llm_result, print_tail, save_brief, print_key_levels
@@ -409,6 +409,15 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 
     if alerts:
         print_alerts(alerts)
+        
+        # 发送桌面通知
+        alert_summary = " | ".join([f"{a.name}: {', '.join(a.messages)}" for a in alerts[:3]])
+        if len(alerts) > 3:
+            alert_summary += f" | ...还有 {len(alerts)-3} 条"
+        send_desktop_notification(
+            title=f"📈 盯盘提醒 | {stats.sentiment.label} {stats.up}涨{stats.down}跌",
+            message=alert_summary
+        )
 
         if call_llm and config.llm_enabled and config.deepseek_key:
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
@@ -440,7 +449,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     """Run one scan cycle using shared data pool"""
     from app.analyzer import analyze, _load_scan_history, _save_scan_history
     from app.ai_analyzer import analyze as analyze_with_llm
-    from app.notifier import push_alert
+    from app.notifier import push_alert, send_desktop_notification
     from app.presenter import (
         print_quotes_table, print_sentiment, print_alerts,
         print_llm_result, print_tail, save_brief, print_key_levels
@@ -540,6 +549,16 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # Print sentiment and alerts
     print_sentiment(stats)
     print_alerts(alerts, config)
+    
+    # 发送桌面通知
+    if alerts:
+        alert_summary = " | ".join([f"{a.name}: {', '.join(a.messages)}" for a in alerts[:3]])
+        if len(alerts) > 3:
+            alert_summary += f" | ...还有 {len(alerts)-3} 条"
+        send_desktop_notification(
+            title=f"📈 盯盘提醒 | {stats.sentiment.label} {stats.up}涨{stats.down}跌",
+            message=alert_summary
+        )
 
     # LLM analysis
     llm_result = ""
