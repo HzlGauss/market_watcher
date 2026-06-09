@@ -60,7 +60,7 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
 
     url = (
         f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-        f"CN_MarketData.getKLineData?symbol={sina_code}&scale={scale}&"
+        f"CN_MarketData.getKLineData?symbol={sina_code}&scale={scale}"
         f"&ma=no&datalen={datalen}"
     )
 

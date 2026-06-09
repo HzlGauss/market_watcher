@@ -280,10 +280,12 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     quote_map = {q.code: q for q in quotes}
     item_map = {item.code: item for item in monitor_items}
 
-    for code in quote_map:
+    for i, code in enumerate(quote_map):
         item = item_map.get(code)
         if not item:
             continue
+        if i > 0:
+            time.sleep(0.5)
         klines = fetch_historical_kline(code, item.market, days=60, scale=60)
         if klines:
             klines_map[code] = klines
@@ -409,7 +411,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 
     if alerts:
         print_alerts(alerts)
-        
+
         # 发送桌面通知
         alert_summary = " | ".join([f"{a.name}: {', '.join(a.messages)}" for a in alerts[:3]])
         if len(alerts) > 3:
@@ -470,15 +472,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     for q in quotes:
         klines = data_pool.get_klines(q.code)
         if klines:
-            # Convert KLine objects to dict format for technical analysis
-            klines_map[q.code] = [{
-                'day': k.date,
-                'open': k.open,
-                'high': k.high,
-                'low': k.low,
-                'close': k.close,
-                'volume': k.volume
-            } for k in klines]
+            klines_map[q.code] = klines
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -527,8 +521,8 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             continue
 
         try:
-            dif_vals = calc_macd_dif_series([k['close'] for k in klines])
-            closes = [k['close'] for k in klines]
+            dif_vals = calc_macd_dif_series([k.close for k in klines])
+            closes = [k.close for k in klines]
             prev_tech = prev_tech_summaries.get(code)
             tech = tech_summaries.get(code)
 
@@ -544,12 +538,12 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             log.warning(f"Strategy evaluation failed for {code}: {e}")
 
     # Analyze market
-    alerts, stats = analyze(config, holdings_quotes, watchlist_quotes, tech_summaries)
+    alerts, stats = analyze(holdings_quotes, prev_state, config, tech_summaries)
 
     # Print sentiment and alerts
     print_sentiment(stats)
-    print_alerts(alerts, config)
-    
+    print_alerts(alerts)
+
     # 发送桌面通知
     if alerts:
         alert_summary = " | ".join([f"{a.name}: {', '.join(a.messages)}" for a in alerts[:3]])
@@ -572,7 +566,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # Push alerts if enabled
     if config.push_enabled and alerts:
         try:
-            push_alert(alerts, config.sct_sendkey)
+            push_alert(alerts, stats, config)
         except Exception as e:
             log.error(f"Push notification failed: {e}")
 
@@ -580,11 +574,12 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     funds_status = {}
     for code in quote_map:
         tech = tech_summaries.get(code)
-        snapshot = TechSnapshot.from_summary(tech) if tech else None
+        snapshot = tech if tech else None
         funds_status[code] = FundScanStatus(
-            name=quote_map[code].name,
+            price=quote_map[code].price,
+            change_pct=quote_map[code].change_pct,
+            volume=quote_map[code].volume,
             tech_snapshot=snapshot,
-            strategy_signals=[s[2] for s in all_strategy_signals if s[1] == code]
         )
 
     scan_record = ScanRecord(

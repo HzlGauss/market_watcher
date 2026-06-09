@@ -9,7 +9,6 @@ import logging
 from typing import Dict, List
 
 from .data_pool import SharedDataPool, KLine
-from .data_fetcher import fetch_tencent_data
 from .technical import fetch_historical_kline
 from .models import Quote, WatchItem
 
@@ -42,6 +41,8 @@ class DataFetcherThread(threading.Thread):
         self._interval = interval
         self._running = False
         self._error_count = 0
+        self._kline_counter = 0
+        self._klines_initialized = False
 
     @property
     def running(self) -> bool:
@@ -78,7 +79,7 @@ class DataFetcherThread(threading.Thread):
         """获取数据并更新到数据池"""
         log.debug("开始获取市场数据...")
 
-        # 获取实时行情
+        # 获取实时行情（每轮都刷新）
         quotes = self._fetch_quotes()
 
         if quotes:
@@ -87,26 +88,34 @@ class DataFetcherThread(threading.Thread):
         else:
             log.warning("未获取到行情数据")
 
-        # 获取K线数据（分批获取，避免超时）
-        klines = self._fetch_klines()
+        # K线数据较稳定，首次初始化后每10轮（5分钟）刷新一次
+        refresh_klines = not self._klines_initialized
+        self._kline_counter += 1
+        if self._kline_counter >= 10:
+            refresh_klines = True
+            self._kline_counter = 0
 
-        if klines:
-            self._data_pool.update_klines(klines)
-            log.debug(f"K线数据已更新，共 {len(klines)} 个标的")
+        if refresh_klines:
+            klines = self._fetch_klines()
+            if klines:
+                self._data_pool.update_klines(klines)
+                log.debug(f"K线数据已更新，共 {len(klines)} 个标的")
+                self._klines_initialized = True
 
         log.debug(f"数据更新完成，第 {self._data_pool.update_count} 次更新")
 
     def _fetch_quotes(self) -> Dict[str, Quote]:
         """获取实时行情数据"""
         try:
-            result = fetch_tencent_data(self._watch_items)
-            return {code: Quote(**data) for code, data in result.items()}
+            from .data_fetcher import fetch_quotes
+            quotes = fetch_quotes(self._watch_items)
+            return {q.code: q for q in quotes}
         except Exception as e:
             log.error(f"获取行情数据失败: {e}")
             return {}
 
     def _fetch_klines(self) -> Dict[str, List[KLine]]:
-        """获取K线数据"""
+        """获取K线数据（带间隔，避免触发频率限制）"""
         klines = {}
 
         for item in self._watch_items:
@@ -114,16 +123,18 @@ class DataFetcherThread(threading.Thread):
                 klines_data = fetch_historical_kline(item.code, item.market, days=60, scale=60)
                 if klines_data:
                     klines[item.code] = [
-                        KLine(
-                            date=k.get('day', ''),
-                            open=float(k.get('open', 0)),
-                            high=float(k.get('high', 0)),
-                            low=float(k.get('low', 0)),
-                            close=float(k.get('close', 0)),
-                            volume=float(k.get('volume', 0))
-                        )
-                        for k in klines_data
-                    ]
+                    KLine(
+                        date=k.date or '',
+                        open=float(k.open or 0),
+                        high=float(k.high or 0),
+                        low=float(k.low or 0),
+                        close=float(k.close or 0),
+                        volume=float(k.volume or 0)
+                    )
+                    for k in klines_data
+                ]
+                # 每次请求后等待，避免触发新浪频率限制
+                time.sleep(0.5)
             except Exception as e:
                 log.warning(f"获取 {item.code} K线数据失败: {e}")
 

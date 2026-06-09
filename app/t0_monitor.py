@@ -15,9 +15,6 @@ from .models import Quote, WatchItem
 from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary
 from .http_client import serverchan_client
 
-API_BASE = "https://sctapi.ftqq.com"
-
-
 log = logging.getLogger(__name__)
 
 
@@ -116,6 +113,7 @@ class T0MonitorThread(threading.Thread):
 
         log.debug("开始做T信号扫描...")
 
+        new_signals: list[T0Signal] = []
         for item in self._watch_items:
             quote = self._data_pool.get_quote(item.code)
             klines = self._data_pool.get_klines(item.code)
@@ -126,7 +124,20 @@ class T0MonitorThread(threading.Thread):
             signal = self._evaluate_signal(item, quote, klines)
 
             if signal and signal.signal_type != T0Signal.SIGNAL_NONE:
-                self._handle_signal(signal)
+                # 检查是否重复信号（5分钟内相同类型的信号不重复提示）
+                last_signal = self._last_signals.get(signal.code)
+                if last_signal and last_signal.signal_type == signal.signal_type and last_signal.is_valid():
+                    log.debug(f"跳过重复信号: {signal.code} {signal.signal_type}")
+                    continue
+                # 更新最后信号记录
+                self._last_signals[signal.code] = signal
+                new_signals.append(signal)
+
+        if new_signals:
+            self._print_signals_batch(new_signals)
+            if self._enable_push:
+                for signal in new_signals:
+                    self._push_signal(signal)
 
     def _evaluate_signal(self, item: WatchItem, quote: Quote, klines: List[KLine]) -> Optional[T0Signal]:
         """评估单个标的的做T信号"""
@@ -199,7 +210,7 @@ class T0MonitorThread(threading.Thread):
             reasons.append(f"RSI超卖({tech.rsi:.1f})")
 
         # 条件3：KDJ超卖
-        if tech.k and tech.k < 20:
+        if tech.kdj_k and tech.kdj_k < 20:
             reasons.append("KDJ超卖")
 
         # 条件4：量能萎缩（量比<0.6）
@@ -224,7 +235,7 @@ class T0MonitorThread(threading.Thread):
             reasons.append(f"RSI超买({tech.rsi:.1f})")
 
         # 条件3：KDJ超买
-        if tech.k and tech.k > 80:
+        if tech.kdj_k and tech.kdj_k > 80:
             reasons.append("KDJ超买")
 
         # 条件4：量能放大（量比>1.5）
@@ -234,42 +245,58 @@ class T0MonitorThread(threading.Thread):
         # 需要至少2个条件满足
         return reasons if len(reasons) >= 2 else []
 
-    def _handle_signal(self, signal: T0Signal):
-        """处理信号"""
-        # 检查是否重复信号（5分钟内相同类型的信号不重复提示）
-        last_signal = self._last_signals.get(signal.code)
-        if last_signal and last_signal.signal_type == signal.signal_type and last_signal.is_valid():
-            log.debug(f"跳过重复信号: {signal.code} {signal.signal_type}")
-            return
+    def _print_signals_batch(self, signals: list[T0Signal]):
+        """批量打印做T信号汇总（表格形式）"""
+        buy_signals = [s for s in signals if s.signal_type == T0Signal.SIGNAL_BUY]
+        sell_signals = [s for s in signals if s.signal_type == T0Signal.SIGNAL_SELL]
 
-        # 更新最后信号记录
-        self._last_signals[signal.code] = signal
+        # 找最长名称用于列宽
+        max_name_len = max((len(f"{s.name}({s.code})") for s in signals), default=0)
+        name_width = max(max_name_len + 2, 16)
+        reason_width = 42
 
-        # 输出信号提示
-        self._print_signal(signal)
+        sep = "─" * (name_width + reason_width + 40)
 
-        # 播放提示音（已禁用）
-        # if self._enable_sound:
-        #     self._play_sound(signal.signal_type)
+        print(f"\n  📊 做T信号汇总")
+        print(f"  {sep}")
 
-        # 微信推送
-        if self._enable_push:
-            self._push_signal(signal)
+        # 表头
+        type_col_width = 8
+        price_col_width = 10
+        sr_col_width = 18
+        header = (
+            f"  │ {'类型':<{type_col_width}}"
+            f"│ {'标的':<{name_width}}"
+            f"│ {'当前价':>{price_col_width}}"
+            f"│ {'支撑/压力':^{sr_col_width}}"
+            f"│ {'触发条件':<{reason_width}}│"
+        )
+        print(header)
+        print(f"  │{'─' * (type_col_width + name_width + price_col_width + sr_col_width + reason_width + 6)}│")
 
-    def _print_signal(self, signal: T0Signal):
-        """打印信号提示"""
-        signal_icon = "🟢" if signal.signal_type == T0Signal.SIGNAL_BUY else "🔴"
-        signal_text = "买入信号" if signal.signal_type == T0Signal.SIGNAL_BUY else "卖出信号"
+        for s in signals:
+            icon = "🟢 买入" if s.signal_type == T0Signal.SIGNAL_BUY else "🔴 卖出"
+            name = f"{s.name}({s.code})"
+            price_str = f"{s.price:.3f}"
+            sr_str = f"{s.support:.3f}/{s.resistance:.3f}"
+            # 截断过长的触发条件
+            reason = s.reason if len(s.reason) <= reason_width else s.reason[:reason_width - 3] + "..."
 
-        print(f"\n{'='*50}")
-        print(f"[{signal_icon} 做T信号] {signal.name}({signal.code})")
-        print(f"类型: {signal_text}")
-        print(f"触发条件: {signal.reason}")
-        print(f"当前价: {signal.price:.2f} | 支撑: {signal.support:.2f} | 压力: {signal.resistance:.2f}")
-        print(f"建议: {'可考虑买入做T，目标压力位附近卖出' if signal.signal_type == T0Signal.SIGNAL_BUY else '可考虑卖出做T，回落支撑位附近买回'}")
-        print(f"{'='*50}\n")
+            row = (
+                f"  │ {icon:<{type_col_width}}"
+                f"│ {name:<{name_width}}"
+                f"│ {price_str:>{price_col_width}}"
+                f"│ {sr_str:^{sr_col_width}}"
+                f"│ {reason:<{reason_width}}│"
+            )
+            print(row)
 
-        log.info(f"做T信号: {signal.name}({signal.code}) - {signal_text}: {signal.reason}")
+        print(f"  {sep}")
+        print(f"  建议: 买入→目标压力位附近卖出  |  卖出→回落支撑位附近买回\n")
+
+        for s in signals:
+            signal_text = "买入信号" if s.signal_type == T0Signal.SIGNAL_BUY else "卖出信号"
+            log.info(f"做T信号: {s.name}({s.code}) - {signal_text}: {s.reason}")
 
     def _play_sound(self, signal_type: str):
         """播放提示音"""
@@ -285,24 +312,24 @@ class T0MonitorThread(threading.Thread):
                 winsound.Beep(400, 500)
         except Exception as e:
             log.debug(f"播放提示音失败: {e}")
-    
+
     def _push_signal(self, signal: T0Signal):
         """推送做T信号到微信（Server酱）"""
         sendkey = os.environ.get("SCT_SENDKEY")
         if not sendkey:
             log.debug("未配置 SCT_SENDKEY，跳过推送")
             return
-        
+
         try:
             # 构建标题
             signal_icon = "🟢" if signal.signal_type == T0Signal.SIGNAL_BUY else "🔴"
             signal_text = "买入信号" if signal.signal_type == T0Signal.SIGNAL_BUY else "卖出信号"
             now_str = datetime.now().strftime("%m-%d %H:%M")
             title = f"{signal_icon} 做T信号 | {signal.name}({signal.code})"
-            
+
             # 构建内容
             content = f"""## {signal_icon} {signal_text}
-            
+
 **标的**: {signal.name}({signal.code})
 
 **触发条件**: {signal.reason}
@@ -315,14 +342,14 @@ class T0MonitorThread(threading.Thread):
 
 ---
 *{now_str}*"""
-            
-            url = f"{API_BASE}/{sendkey}.send"
+
+            url = f"/{sendkey}.send"
             resp = serverchan_client.post(url, data={"title": title, "desp": content})
-            
+
             if resp and resp.status_code == 200 and resp.json().get("code") == 0:
                 log.info(f"做T信号推送成功: {signal.name}")
             else:
                 log.warning(f"做T信号推送失败")
-                
+
         except Exception as e:
             log.error(f"做T信号推送异常: {e}")

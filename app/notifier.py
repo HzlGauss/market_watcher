@@ -14,8 +14,6 @@ from app.config import Config
 from app.utils import log
 from app.http_client import serverchan_client
 
-API_BASE = "https://sctapi.ftqq.com"
-
 
 def _send_macos_notification(
     title: str,
@@ -162,7 +160,7 @@ def push_alert(
 
     content = "\n".join(lines)
 
-    url = f"{API_BASE}/{sendkey}.send"
+    url = f"/{sendkey}.send"
     resp = serverchan_client.post(url, data={"title": title, "desp": content})
 
     if resp is None:
