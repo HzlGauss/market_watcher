@@ -21,10 +21,18 @@ class LLMModel(Enum):
 class LLMClient:
     """统一LLM客户端"""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "deepseek-chat"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "deepseek-chat",
+        base_url: Optional[str] = None,
+        verify_ssl: bool = True,
+    ):
         self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self._model = model
-        self._enabled = bool(self._api_key)
+        self._base_url = base_url or os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+        self._verify_ssl = verify_ssl
+        self._enabled = bool(self._api_key) and bool(self._base_url)
 
     @property
     def enabled(self) -> bool:
@@ -81,7 +89,13 @@ class LLMClient:
             payload["stop"] = stop
 
         try:
-            resp = http_client.post("/chat/completions", json=payload, headers=headers, timeout=timeout)
+            resp = http_client.post(
+                "/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                verify=self._verify_ssl,
+            )
             if resp and resp.status_code == 200:
                 result = resp.json()
                 content = result["choices"][0]["message"]["content"]
@@ -104,7 +118,7 @@ def get_llm_client(config: Optional[Config] = None) -> LLMClient:
     获取全局LLM客户端实例
 
     Args:
-        config: 配置对象，可选，用于获取模型名称
+        config: 配置对象，可选，用于获取模型名称和自定义配置
 
     Returns:
         LLMClient实例
@@ -113,7 +127,13 @@ def get_llm_client(config: Optional[Config] = None) -> LLMClient:
 
     if _default_llm_client is None:
         model = config.llm_model if config else "deepseek-chat"
-        _default_llm_client = LLMClient(model=model)
+        base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+        verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
+        _default_llm_client = LLMClient(
+            model=model,
+            base_url=base_url,
+            verify_ssl=verify_ssl,
+        )
 
     return _default_llm_client
 

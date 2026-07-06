@@ -178,6 +178,7 @@ class AnalysisStats:
     base_thresholds: dict = field(default_factory=dict)
     dynamic_enabled: bool = False
     north_flow: Optional["NorthFlowData"] = None
+    market_breadth: Optional["MarketBreadth"] = None
     llm_result: Optional[str] = None
 
 
@@ -215,6 +216,102 @@ class NorthFlowData:
     def is_significant(self) -> bool:
         """判断北向资金是否显著 (净流入/流出超过 50 亿)"""
         return abs(self.total_net) > 50.0
+
+
+@dataclass
+class MarketBreadth:
+    """全市场广度数据
+
+    从东方财富 API 获取，反映整个 A 股的涨跌分布、
+    量能水平和极端情绪（涨跌停家数）。
+
+    Attributes:
+        up_count: 上涨家数
+        down_count: 下跌家数
+        flat_count: 平盘家数
+        total_count: 总家数
+        limit_up: 涨停家数
+        limit_down: 跌停家数
+        total_amount: 全市场成交额（亿元）
+        total_volume: 全市场成交量（万手）
+        index_name: 参考指数名称
+        index_price: 参考指数点位
+        index_change_pct: 参考指数涨跌幅
+        main_net_inflow: 主力净流入（亿元）
+        update_time: 数据更新时间
+    """
+    up_count: int = 0
+    down_count: int = 0
+    flat_count: int = 0
+    total_count: int = 0
+    limit_up: int = 0
+    limit_down: int = 0
+    total_amount: float = 0.0
+    total_volume: float = 0.0
+    index_name: str = ""
+    index_price: float = 0.0
+    index_change_pct: float = 0.0
+    main_net_inflow: float = 0.0
+    update_time: str = ""
+
+    @property
+    def up_ratio(self) -> float:
+        """上涨比例 (0-1)"""
+        if self.total_count <= 0:
+            return 0.5
+        return self.up_count / self.total_count
+
+    @property
+    def down_ratio(self) -> float:
+        """下跌比例 (0-1)"""
+        if self.total_count <= 0:
+            return 0.5
+        return self.down_count / self.total_count
+
+    @property
+    def breadth_label(self) -> str:
+        """市场宽度标签
+
+        根据涨跌比给出市场状态定性：
+        - > 70% 上涨 → 普涨
+        - 50-70% 上涨 → 偏多
+        - 30-50% 上涨 → 偏空
+        - < 30% 上涨 → 普跌
+        """
+        r = self.up_ratio
+        if r >= 0.7:
+            return "普涨"
+        elif r >= 0.5:
+            return "偏多"
+        elif r >= 0.3:
+            return "偏空"
+        else:
+            return "普跌"
+
+    @property
+    def limit_emotion(self) -> str:
+        """涨跌停情绪标签
+
+        涨停多、跌停少 → 亢奋
+        涨停少、跌停多 → 恐慌
+        两者都少 → 平淡
+        两者都多 → 极端分化
+        """
+        if self.limit_up >= 80 and self.limit_down < 10:
+            return "亢奋"
+        elif self.limit_down >= 50 and self.limit_up < 20:
+            return "恐慌"
+        elif self.limit_up >= 50 and self.limit_down >= 30:
+            return "分化加剧"
+        elif self.limit_up < 30 and self.limit_down < 10:
+            return "平淡"
+        else:
+            return "正常"
+
+    @property
+    def is_valid(self) -> bool:
+        """数据是否有效（至少要有基本的涨跌统计）"""
+        return self.total_count > 0
 
 
 # ============================================================
@@ -259,6 +356,12 @@ class TechnicalSummary:
     bb_width: Optional[float] = None
     bb_signal: str = ""
     obv: Optional[float] = None
+    ma5: Optional[float] = None
+    ma10: Optional[float] = None
+    ma20: Optional[float] = None
+    ma60: Optional[float] = None
+    ma_alignment: str = ""  # 多头排列 / 空头排列 / 缠绕 / 多头回调 / 空头反弹 / 数据不足
+    ma_alignment_detail: str = ""
     signals: list[str] = field(default_factory=list)
 
 

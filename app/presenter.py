@@ -134,8 +134,32 @@ def print_sentiment(stats: AnalysisStats) -> None:
         down_str = f"{t['跌幅预警']:+.1f}%({down_adj:+.1f})" if abs(down_adj) > 0.01 else f"{bt['跌幅预警']:+.1f}%"
         print(f"{Color.DIM}⚙️ 动态阈值: 涨幅预警 {up_str} | 跌幅预警 {down_str}{Color.RESET}")
 
-    # 涨跌分布
-    print(f"{Color.CYAN}📊 涨跌分布:{Color.RESET}   "
+    # 全市场广度
+    if stats.market_breadth and stats.market_breadth.is_valid:
+        b = stats.market_breadth
+        breadth_label = b.breadth_label
+        b_color = Color.RED if breadth_label in ("普涨", "偏多") else (
+            Color.GREEN if breadth_label == "普跌" else Color.YELLOW)
+        emotion = b.limit_emotion
+        # 成交额显示
+        amount_str = f"{b.total_amount:.0f}亿" if b.total_amount >= 10000 else f"{b.total_amount:.0f}亿"
+        if b.total_amount >= 12000:
+            amount_str = f"{Color.RED}{amount_str}{Color.RESET}"  # 放量
+        elif b.total_amount < 6000:
+            amount_str = f"{Color.GREEN}{amount_str}{Color.RESET}"  # 缩量
+        print(f"{Color.CYAN}🏛️ 全市场:{Color.RESET}   "
+              f"{b_color}{breadth_label}{Color.RESET} | "
+              f"{Color.RED}涨{b.up_count}{Color.RESET}/"
+              f"{Color.GREEN}跌{b.down_count}{Color.RESET}/"
+              f"平{b.flat_count} | "
+              f"涨停 {Color.RED}{b.limit_up}{Color.RESET} | "
+              f"跌停 {Color.GREEN}{b.limit_down}{Color.RESET} | "
+              f"成交 {amount_str} | "
+              f"{b.index_name} {Color.CYAN}{b.index_change_pct:+.2f}%{Color.RESET} | "
+              f"情绪: {emotion}")
+
+    # 涨跌分布（自选标的）
+    print(f"{Color.CYAN}📊 自选分布:{Color.RESET}   "
           f"{Color.RED}涨{stats.up}{Color.RESET} | "
           f"{Color.GREEN}跌{stats.down}{Color.RESET} | "
           f"平{stats.flat} | 共{stats.total}只")
@@ -201,6 +225,12 @@ def print_key_levels(tech_summaries: dict, quotes: list[Quote]) -> None:
                 parts.append(f"{Color.GREEN}←跌破支撑{Color.RESET}")
             elif current >= tech.resistance * 0.99:
                 parts.append(f"{Color.RED}←突破压力{Color.RESET}")
+
+        # 均线排列状态
+        if tech.ma_alignment and tech.ma_alignment != "数据不足":
+            ma_color = Color.GREEN if tech.ma_alignment in ("多头排列", "多头回调") else (
+                Color.RED if tech.ma_alignment in ("空头排列", "空头反弹") else Color.YELLOW)
+            parts.append(f"均线:{ma_color}{tech.ma_alignment}{Color.RESET}")
 
         if len(parts) > 1:
             print(f"  {' | '.join(parts)}")
@@ -269,8 +299,20 @@ def save_brief(
             f.write("\n")
         f.write("\n")
 
-        # 市场概览
-        f.write("## 📊 市场概览\n\n")
+        # 全市场广度
+        if stats.market_breadth and stats.market_breadth.is_valid:
+            b = stats.market_breadth
+            f.write("## 🏛️ 全市场广度\n\n")
+            f.write(f"- 上涨: {b.up_count} | 下跌: {b.down_count} | 平盘: {b.flat_count} | 共: {b.total_count} 只\n")
+            f.write(f"- 涨跌比: {b.up_count}:{b.down_count} — {b.breadth_label}\n")
+            f.write(f"- 涨停: {b.limit_up} | 跌停: {b.limit_down} — {b.limit_emotion}\n")
+            f.write(f"- 成交额: {b.total_amount:.0f}亿 | 主力净流入: {b.main_net_inflow:+.1f}亿\n")
+            f.write(f"- {b.index_name}: {b.index_price:.2f} ({b.index_change_pct:+.2f}%)\n")
+            f.write(f"- 更新时间: {b.update_time}\n")
+            f.write(f"\n")
+            f.write("## 📊 市场概览\n\n")
+        else:
+            f.write("## 📊 市场概览\n\n")
         f.write(f"- 上涨: {stats.up} | 下跌: {stats.down} | 平盘: {stats.flat} | 共监控: {stats.total} 只\n")
         f.write(f"- 涨跌比: {stats.up}:{stats.down}\n")
         if stats.alert_count > 0:

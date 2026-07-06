@@ -372,7 +372,8 @@ def generate_morning_brief(config: Config) -> Path | None:
     if quotes:
         # 使用全部标的（持仓+自选）计算情绪评分
         all_quotes = [q for q in quotes if q.change_pct is not None]
-        sentiment = calc_market_sentiment(all_quotes)
+        from app.data_fetcher import fetch_market_breadth
+        sentiment = calc_market_sentiment(all_quotes, breadth=fetch_market_breadth())
         data_lines.append(f"\n## 三、昨日A股收盘数据")
         data_lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
 
@@ -426,7 +427,8 @@ def generate_morning_brief(config: Config) -> Path | None:
     if quotes:
         # 使用全部标的（持仓+自选）计算情绪评分
         all_quotes_llm = [q for q in quotes if q.change_pct is not None]
-        sentiment = calc_market_sentiment(all_quotes_llm)
+        from app.data_fetcher import fetch_market_breadth
+        sentiment = calc_market_sentiment(all_quotes_llm, breadth=fetch_market_breadth())
         llm_lines.append(f"\n[昨日A股] 情绪: {sentiment.score}/100 ({sentiment.label})")
 
         index_quotes = [q for q in quotes if q.type == "指数"]
@@ -549,7 +551,8 @@ def generate_midday_review(config: Config) -> Path | None:
 
     # 使用全部标的（持仓+自选）进行统计和排行
     all_quotes = [q for q in quotes if q.change_pct is not None]
-    _, stats = analyze(all_quotes, {}, config)
+    from app.data_fetcher import fetch_market_breadth
+    _, stats = analyze(all_quotes, {}, config, market_breadth=fetch_market_breadth())
     from app.data_fetcher import fetch_market_news
     morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
 

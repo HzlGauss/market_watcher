@@ -20,9 +20,11 @@ class HttpClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: int = 10,
         max_retries: int = 2,
+        verify_ssl: Union[bool, str] = True,
     ):
         self._base_url = base_url
         self._timeout = timeout
+        self._verify_ssl = verify_ssl
         self._session = self._create_session(max_retries)
         if headers:
             self._session.headers.update(headers)
@@ -34,7 +36,7 @@ class HttpClient:
         retry_strategy = Retry(
             total=max_retries,
             backoff_factor=1,
-            status_forcelist=[429, 456, 500, 502, 503, 504],
+            status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"],
         )
 
@@ -49,21 +51,28 @@ class HttpClient:
 
         return session
 
+    def _get_verify(self) -> Union[bool, str]:
+        """Get SSL verification setting"""
+        return self._verify_ssl
+
     def get(
         self,
         url: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
+        verify: Optional[Union[bool, str]] = None,
     ) -> Optional[requests.Response]:
         """GET request"""
         full_url = f"{self._base_url}{url}" if self._base_url else url
+        verify_ssl = verify if verify is not None else self._verify_ssl
         try:
             resp = self._session.get(
                 full_url,
                 params=params,
                 headers=headers,
                 timeout=timeout or self._timeout,
+                verify=verify_ssl,
             )
             resp.raise_for_status()
             return resp
@@ -78,9 +87,11 @@ class HttpClient:
         json: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
+        verify: Optional[Union[bool, str]] = None,
     ) -> Optional[requests.Response]:
         """POST request"""
         full_url = f"{self._base_url}{url}" if self._base_url else url
+        verify_ssl = verify if verify is not None else self._verify_ssl
         try:
             resp = self._session.post(
                 full_url,
@@ -88,6 +99,7 @@ class HttpClient:
                 json=json,
                 headers=headers,
                 timeout=timeout or self._timeout,
+                verify=verify_ssl,
             )
             resp.raise_for_status()
             return resp
