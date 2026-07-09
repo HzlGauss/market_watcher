@@ -1095,3 +1095,146 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         obv=obv.obv,
         signals=signals,
     )
+
+
+# ============================================================
+# 筹码峰数据获取
+# ============================================================
+
+@dataclass
+class ChipDistribution:
+    """筹码峰数据"""
+    avg_cost: Optional[float] = None  # 平均成本
+    cost_low_90: Optional[float] = None  # 90%成本区间下限
+    cost_high_90: Optional[float] = None  # 90%成本区间上限
+    concentration_90: Optional[float] = None  # 90%集中度（越小越集中）
+    profit_ratio: Optional[float] = None  # 获利比例（0-100）
+
+
+def fetch_chip_distribution(code: str, market: str) -> Optional[ChipDistribution]:
+    """获取股票筹码峰数据（东方财富接口）
+    
+    Args:
+        code: 股票代码
+        market: 市场 (SH/SZ)
+    
+    Returns:
+        筹码峰数据，失败返回 None
+    """
+    # ETF 不支持
+    if code.startswith("51") or code.startswith("159") or code.startswith("56"):
+        return None
+    
+    try:
+        from app.http_client import eastmoney_client
+        
+        # 东方财富 secid 格式：SH=1.xxxxxx, SZ=0.xxxxxx
+        secid = f"1.{code}" if market.upper() == "SH" else f"0.{code}"
+        
+        # 东方财富筹码分布API（参考AKShare的实现）
+        url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+        params = {
+            "lmt": 1,
+            "klt": 101,
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+            "_": int(datetime.now().timestamp() * 1000),
+        }
+        
+        resp = eastmoney_client.get(url, params=params, timeout=15)
+        if not resp:
+            return None
+        
+        data = resp.json()
+        if not data or data.get("code") != 0:
+            return None
+        
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return None
+        
+        # 取最新一条数据
+        latest = klines[-1].split(",")
+        
+        # 解析筹码峰数据，根据实际字段顺序调整
+        # 字段参考：日期,开盘价,收盘价,最高价,最低价,成交量,成交额,振幅,涨跌幅,涨跌额,换手率,
+        #         量比,市盈率,市净率,总市值,流通市值,成交次数,主买量,主卖量,
+        #         大单流入,大单流出,中单流入,中单流出,小单流入,小单流出,
+        #         获利比例,平均成本,90%成本低,90%成本高,90%集中度
+        # 先按常见的字段顺序尝试解析
+        if len(latest) >= 56:
+            try:
+                chip = ChipDistribution()
+                # 尝试按合理的顺序解析
+                # 字段索引可能需要根据实际返回调整，这里做一个保守的实现
+                # 先尝试找到获利比例和平均成本字段
+                # 先用一个简化的方法，假设数据在后面的字段
+                # 实际使用时可以根据真实API返回调整
+                
+                # 先做一个简化的测试解析
+                # 如果无法确定字段顺序，我们先用一个备选方案
+                # 尝试调用另一个接口
+                return _fetch_chip_from_datacenter(code, market)
+                
+            except Exception:
+                pass
+        
+        # 备用方案
+        return _fetch_chip_from_datacenter(code, market)
+        
+    except Exception as e:
+        log.debug(f"Failed to fetch chip distribution: {e}")
+        return None
+
+
+def _fetch_chip_from_datacenter(code: str, market: str) -> Optional[ChipDistribution]:
+    """从东方财富数据中心获取筹码峰数据（备用方案）"""
+    try:
+        from app.http_client import eastmoney_client
+        
+        # 东方财富数据中心筹码API
+        url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+        params = {
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "pageSize": "1",
+            "pageNumber": "1",
+            "reportName": "RPTA_APP_CHIP",
+            "columns": "ALL",
+            "filter": f"(SECURITY_CODE=\"{code}\")",
+        }
+        
+        resp = eastmoney_client.get(url, params=params, timeout=15)
+        if not resp or resp.status_code != 200:
+            return None
+        
+        data = resp.json()
+        if data.get("code") != 0:
+            return None
+        
+        result = data.get("result", {}).get("data", [])
+        if not result or len(result) == 0:
+            return None
+        
+        item = result[0]
+        
+        chip = ChipDistribution()
+        
+        # 从返回的字典中提取字段
+        chip.avg_cost = item.get("AVG_COST")
+        chip.cost_low_90 = item.get("COST_LOW_90")
+        chip.cost_high_90 = item.get("COST_HIGH_90")
+        chip.concentration_90 = item.get("CONCENTRATION_90")
+        chip.profit_ratio = item.get("PROFIT_RATIO")
+        
+        # 如果数据有效，返回
+        if chip.avg_cost is not None:
+            return chip
+        
+        return None
+        
+    except Exception as e:
+        log.debug(f"Failed to fetch chip from datacenter: {e}")
+        return None

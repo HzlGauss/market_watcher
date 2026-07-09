@@ -161,8 +161,8 @@ def _get_holdings_tech_analysis(
     holdings: list[Holding],
     quotes: list[Quote],
 ) -> list[dict]:
-    """获取持仓的技术分析数据（支撑/压力位、量价关系、技术指标）
-
+    """获取持仓的技术分析数据（支撑/压力位、量价关系、技术指标、筹码峰）
+    
     返回每个持仓的技术分析字典列表。
     网络异常时返回空列表。
     """
@@ -175,6 +175,7 @@ def _get_holdings_tech_analysis(
         calc_kdj,
         calc_obv,
         rsi_signal,
+        fetch_chip_distribution,
     )
     from concurrent.futures import ThreadPoolExecutor
 
@@ -205,7 +206,10 @@ def _get_holdings_tech_analysis(
         macd = calc_macd(closes)
         kdj = calc_kdj(highs, lows, closes)
         obv = calc_obv(klines)
-
+        
+        # 获取筹码峰数据
+        chip = fetch_chip_distribution(h.code, h.market)
+        
         # 综合支撑/压力位描述
         support_parts = []
         if sr.support:
@@ -214,7 +218,7 @@ def _get_holdings_tech_analysis(
             support_parts.append(f"摆动支撑:{','.join(f'{s:.3f}' for s in sr.swing_supports[:2])}")
         if sr.pivot_supports:
             support_parts.append(f"枢轴支撑:{sr.pivot_supports[0]:.3f}")
-
+        
         resistance_parts = []
         if sr.resistance:
             resistance_parts.append(f"主压力:{sr.resistance:.3f}")
@@ -222,8 +226,8 @@ def _get_holdings_tech_analysis(
             resistance_parts.append(f"摆动压力:{','.join(f'{r:.3f}' for r in sr.swing_resistances[:2])}")
         if sr.pivot_resistances:
             resistance_parts.append(f"枢轴压力:{sr.pivot_resistances[0]:.3f}")
-
-        return {
+        
+        result = {
             "name": h.name,
             "code": h.code,
             "price": quote.price,
@@ -245,7 +249,16 @@ def _get_holdings_tech_analysis(
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
             "volume_clusters": sr.volume_clusters,
+            # 筹码峰数据
+            "chip": chip,
+            "chip_avg_cost": chip.avg_cost if chip else None,
+            "chip_cost_low_90": chip.cost_low_90 if chip else None,
+            "chip_cost_high_90": chip.cost_high_90 if chip else None,
+            "chip_concentration_90": chip.concentration_90 if chip else None,
+            "chip_profit_ratio": chip.profit_ratio if chip else None,
         }
+        
+        return result
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(_fetch_one, h): h.code for h in holdings}
@@ -1086,12 +1099,45 @@ def generate_evening_review(config: Config) -> Path | None:
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
             data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
-
-    if strategy_signals_evening:
-        data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，明日操作参考）")
-        for s in strategy_signals_evening:
-            for sig_text in s['signals']:
-                data_lines.append(f"  - {s['name']}: {sig_text}")
+        
+        # 筹码峰分析表格
+        chip_data = [t for t in tech_data_evening if t.get('chip_avg_cost') is not None]
+        has_chip = bool(chip_data)
+        if has_chip:
+            data_lines.append("\n## 六、筹码峰分析（筹码结构与主力动向）")
+            data_lines.append("")
+            data_lines.append("| 标的 | 平均成本 | 90%成本区间 | 90%集中度 | 获利比例 | 筹码解读 |")
+            data_lines.append("|------|----------|------------|----------|----------|----------|")
+            for t in chip_data:
+                avg_cost = f"{t['chip_avg_cost']:.3f}"
+                cost_low = f"{t['chip_cost_low_90']:.3f}" if t.get('chip_cost_low_90') else "--"
+                cost_high = f"{t['chip_cost_high_90']:.3f}" if t.get('chip_cost_high_90') else "--"
+                concentration = f"{t['chip_concentration_90']:.2f}%" if t.get('chip_concentration_90') else "--"
+                profit_ratio = f"{t['chip_profit_ratio']:.1f}%" if t.get('chip_profit_ratio') else "--"
+                
+                # 筹码解读
+                interpretation = ""
+                if t.get('chip_concentration_90') is not None and t['chip_concentration_90'] < 10:
+                    interpretation = "筹码高度集中，主力控盘"
+                elif t.get('chip_concentration_90') is not None and t['chip_concentration_90'] < 20:
+                    interpretation = "筹码较为集中"
+                else:
+                    interpretation = "筹码分散"
+                
+                if t.get('chip_profit_ratio') is not None and t['chip_profit_ratio'] > 70:
+                    interpretation += "，盈利盘占比高"
+                elif t.get('chip_profit_ratio') is not None and t['chip_profit_ratio'] < 30:
+                    interpretation += "，套牢盘多"
+                
+                data_lines.append(f"| {t['name']} | {avg_cost} | {cost_low}-{cost_high} | {concentration} | {profit_ratio} | {interpretation} |")
+        
+        # 组合策略信号
+        if strategy_signals_evening:
+            strategy_section_num = "七" if has_chip else "六"
+            data_lines.append(f"\n## {strategy_section_num}、⭐ 组合策略信号（多指标共振，明日操作参考）")
+            for s in strategy_signals_evening:
+                for sig_text in s['signals']:
+                    data_lines.append(f"  - {s['name']}: {sig_text}")
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
