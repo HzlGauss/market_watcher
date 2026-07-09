@@ -420,7 +420,7 @@ def check_low_volume_breakout(
     条件：
     1. 成交量放大（量比 ≥ 1.5）
     2. 股价上涨（涨幅 > 0）
-    3. OBV 趋势为资金入场或放量上涨
+    3. OBV 资金流入信号（加速/持续/转向流入，或底背离）
     4. 站稳均线支撑（MA20）
     """
     sig = CombinationSignal(
@@ -440,9 +440,9 @@ def check_low_volume_breakout(
         sig.matched_conditions += 1
         conditions.append(f"股价上涨({quote.change_pct:.2f}%)")
 
-    # 条件3: OBV 资金入场
+    # 条件3: OBV 资金入场信号
     obv_result = calc_obv(klines)
-    if obv_result.signal in ("资金入场", "放量上涨"):
+    if obv_result.signal in ("资金加速流入", "资金持续流入", "资金转向流入", "底背离"):
         sig.matched_conditions += 1
         conditions.append(f"OBV{obv_result.signal}")
 
@@ -478,7 +478,7 @@ def check_high_volume_stagflation(
     1. 滞涨现象（涨幅小但放量）
     2. RSI > 70（超买区域）
     3. 股价处于布林带上轨附近或之上
-    4. OBV 趋势为资金离场或放量下跌
+    4. OBV 资金流出信号（加速/持续/转向流出，或顶背离）
     """
     sig = CombinationSignal(
         strategy_name="高位放量滞警",
@@ -502,9 +502,9 @@ def check_high_volume_stagflation(
         sig.matched_conditions += 1
         conditions.append("触及布林上轨")
 
-    # 条件4: OBV 资金离场
+    # 条件4: OBV 资金离场信号
     obv_result = calc_obv(klines)
-    if obv_result.signal in ("资金离场", "放量下跌"):
+    if obv_result.signal in ("资金加速流出", "资金持续流出", "资金转向流出", "顶背离⚠️"):
         sig.matched_conditions += 1
         conditions.append(f"OBV{obv_result.signal}")
 
@@ -621,9 +621,9 @@ def check_volume_breakout(
         sig.matched_conditions += 1
         conditions.append("突破布林中轨")
 
-    # 条件4: OBV 资金入场
+    # 条件4: OBV 资金入场信号
     obv_result = calc_obv(klines)
-    if obv_result.signal in ("资金入场", "放量上涨"):
+    if obv_result.signal in ("资金加速流入", "资金持续流入", "资金转向流入", "底背离"):
         sig.matched_conditions += 1
         conditions.append(f"OBV{obv_result.signal}")
 
@@ -691,6 +691,206 @@ def check_low_volume_reversal(
 
     sig.description = " + ".join(conditions) if conditions else "条件不足"
     return sig
+
+
+# ============================================================
+# 策略 10: 均线多头回踩买入
+# ============================================================
+
+def check_ma_bullish_pullback(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """均线多头排列中的回踩买入信号
+
+    在上升趋势中，价格回踩 MA20 附近是经典的低吸买点。
+    均线排列的"多头"状态提供了趋势滤网，避免在下跌趋势中接飞刀。
+
+    条件（4选3触发）：
+    1. 均线处于多头状态（多头排列 或 多头回调）
+    2. 当前价格距 MA20 在 3% 以内（回踩到支撑附近）
+    3. RSI 不处于超买区（< 65，有上行空间）
+    4. 近期缩量（量比 < 0.9，回调动能衰减）
+    """
+    sig = CombinationSignal(
+        strategy_name="均线多头回踩",
+        direction="buy",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 均线多头状态
+    if tech.ma_alignment in ("多头排列", "多头回调"):
+        sig.matched_conditions += 1
+        conditions.append(f"均线{tech.ma_alignment}")
+
+    # 条件2: 价格接近 MA20
+    if tech.ma20 and quote.price and tech.ma20 > 0:
+        distance_pct = abs(quote.price - tech.ma20) / tech.ma20 * 100
+        if distance_pct <= 3.0 and quote.price > tech.ma20 * 0.97:
+            sig.matched_conditions += 1
+            direction = "上方" if quote.price >= tech.ma20 else "下方"
+            conditions.append(f"距MA20({tech.ma20:.2f}){distance_pct:.1f}%({direction})")
+
+    # 条件3: RSI 不超买
+    if tech.rsi is not None and tech.rsi < 65:
+        sig.matched_conditions += 1
+        conditions.append(f"RSI={tech.rsi:.0f}(非超买)")
+
+    # 条件4: 缩量回调
+    if quote.volume_ratio is not None and quote.volume_ratio < 0.9:
+        sig.matched_conditions += 1
+        conditions.append(f"缩量(量比{quote.volume_ratio:.2f})")
+
+    # 置信度
+    sig.confidence = _confidence_from_ratio(sig.matched_conditions, sig.total_conditions)
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 11: 均线空头反弹卖出
+# ============================================================
+
+def check_ma_bearish_bounce(
+    tech: TechnicalSummary,
+    quote: Quote,
+    klines: list[KlineData],
+) -> CombinationSignal:
+    """均线空头排列中的反弹卖出信号
+
+    在下跌趋势中，价格反弹至 MA20 附近是减仓/做空时机。
+    均线排列的"空头"状态提供了趋势滤网，避免在上涨趋势中过早卖出。
+
+    条件（4选3触发）：
+    1. 均线处于空头状态（空头排列 或 空头反弹）
+    2. 当前价格距 MA20 在 3% 以内（反弹到压力附近）
+    3. RSI 不处于超卖区（> 35，仍有下行风险）
+    4. 反弹量能不足（量比 < 1.0，无量反弹持续性差）
+    """
+    sig = CombinationSignal(
+        strategy_name="均线空头反弹",
+        direction="sell",
+        total_conditions=4,
+    )
+    conditions = []
+
+    # 条件1: 均线空头状态
+    if tech.ma_alignment in ("空头排列", "空头反弹"):
+        sig.matched_conditions += 1
+        conditions.append(f"均线{tech.ma_alignment}")
+
+    # 条件2: 价格接近 MA20
+    if tech.ma20 and quote.price and tech.ma20 > 0:
+        distance_pct = abs(quote.price - tech.ma20) / tech.ma20 * 100
+        if distance_pct <= 3.0 and quote.price < tech.ma20 * 1.03:
+            sig.matched_conditions += 1
+            direction = "上方" if quote.price >= tech.ma20 else "下方"
+            conditions.append(f"距MA20({tech.ma20:.2f}){distance_pct:.1f}%({direction})")
+
+    # 条件3: RSI 不超卖
+    if tech.rsi is not None and tech.rsi > 35:
+        sig.matched_conditions += 1
+        conditions.append(f"RSI={tech.rsi:.0f}(非超卖)")
+
+    # 条件4: 反弹无量
+    if quote.volume_ratio is not None and quote.volume_ratio < 1.0:
+        sig.matched_conditions += 1
+        conditions.append(f"无量反弹(量比{quote.volume_ratio:.2f})")
+
+    # 置信度
+    sig.confidence = _confidence_from_ratio(sig.matched_conditions, sig.total_conditions)
+    sig.description = " + ".join(conditions) if conditions else "条件不足"
+    return sig
+
+
+# ============================================================
+# 策略 12: 均线交叉信号（金叉/死叉）
+# ============================================================
+
+def check_ma_cross(
+    tech: TechnicalSummary,
+    prev_tech: Optional[TechnicalSummary],
+) -> Optional[CombinationSignal]:
+    """均线 MA5/MA10 交叉信号
+
+    检测短期均线与中期均线的交叉，作为趋势转变的早期信号。
+    - 金叉（MA5上穿MA10）且 MA20 上行 → 趋势转多信号
+    - 死叉（MA5下穿MA10）且 MA20 下行 → 趋势转空信号
+    - 如果 MA20 方向与交叉方向相反 → 仅缠绕信号，不触发
+
+    条件：
+    1. 检测到 MA5/MA10 交叉（需要 prev_tech 对比）
+    2. MA20 方向与交叉方向一致（金叉时 MA20 上行，死叉时 MA20 下行）
+    """
+    if prev_tech is None:
+        return None
+
+    ma5, ma10 = tech.ma5, tech.ma10
+    prev_ma5, prev_ma10 = prev_tech.ma5, prev_tech.ma10
+
+    if any(v is None for v in [ma5, ma10, prev_ma5, prev_ma10]):
+        return None
+
+    # 检测金叉
+    golden_cross = prev_ma5 <= prev_ma10 and ma5 > ma10
+    # 检测死叉
+    death_cross = prev_ma5 >= prev_ma10 and ma5 < ma10
+
+    if golden_cross and tech.ma_alignment not in ("空头排列",):
+        # MA20 趋势确认
+        if tech.ma_alignment_detail and "上行" in tech.ma_alignment_detail:
+            confidence = "high"
+            desc = f"MA5({ma5:.2f})上穿MA10({ma10:.2f})，MA20上行确认，趋势转多信号可信"
+        else:
+            confidence = "medium"
+            desc = f"MA5({ma5:.2f})上穿MA10({ma10:.2f})，关注MA20能否跟随上行确认"
+
+        return CombinationSignal(
+            strategy_name="均线金叉",
+            direction="buy",
+            confidence=confidence,
+            matched_conditions=2,
+            total_conditions=2,
+            description=desc,
+        )
+
+    if death_cross and tech.ma_alignment not in ("多头排列",):
+        if tech.ma_alignment_detail and "下行" in tech.ma_alignment_detail:
+            confidence = "high"
+            desc = f"MA5({ma5:.2f})下穿MA10({ma10:.2f})，MA20下行确认，趋势转空信号可信"
+        else:
+            confidence = "medium"
+            desc = f"MA5({ma5:.2f})下穿MA10({ma10:.2f})，关注MA20能否跟随下行确认"
+
+        return CombinationSignal(
+            strategy_name="均线死叉",
+            direction="sell",
+            confidence=confidence,
+            matched_conditions=2,
+            total_conditions=2,
+            description=desc,
+        )
+
+    return None
+
+
+# ============================================================
+# 辅助：根据匹配比例计算置信度
+# ============================================================
+
+def _confidence_from_ratio(matched: int, total: int) -> str:
+    """辅助函数：根据条件满足比例返回置信度字符串"""
+    if total == 0:
+        return "low"
+    ratio = matched / total
+    if ratio >= 1.0:
+        return "high"
+    elif ratio >= 0.75:
+        return "medium"
+    else:
+        return "low"
 
 
 # ============================================================
@@ -767,6 +967,21 @@ def evaluate_all_strategies(
     reversal_sig = check_low_volume_reversal(tech, quote, klines)
     if reversal_sig.is_triggering:
         signals.append(reversal_sig)
+
+    # 策略10: 均线多头回踩买入
+    pullback_sig = check_ma_bullish_pullback(tech, quote, klines)
+    if pullback_sig.is_triggering:
+        signals.append(pullback_sig)
+
+    # 策略11: 均线空头反弹卖出
+    bounce_sig = check_ma_bearish_bounce(tech, quote, klines)
+    if bounce_sig.is_triggering:
+        signals.append(bounce_sig)
+
+    # 策略12: 均线金叉/死叉
+    cross_sig = check_ma_cross(tech, prev_tech)
+    if cross_sig is not None and cross_sig.is_triggering:
+        signals.append(cross_sig)
 
     return signals
 

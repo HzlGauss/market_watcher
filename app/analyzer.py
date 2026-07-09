@@ -6,7 +6,7 @@ from __future__ import annotations
 import statistics
 from typing import Optional
 
-from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData
+from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData, MarketBreadth
 from app.config import Config
 
 
@@ -22,21 +22,34 @@ WEAK = 25         # 弱势门槛
 # 市场情绪评估
 # ============================================================
 
-def calc_market_sentiment(quotes: list[Quote]) -> SentimentResult:
-    """基于所有监控标的（含指数）评估市场情绪
+def calc_market_sentiment(
+    quotes: list[Quote],
+    breadth: Optional["MarketBreadth"] = None,
+) -> SentimentResult:
+    """基于全市场广度 + 自选标的，综合评估市场情绪
 
-    评分维度:
-    - 涨跌比: 0-40分
-    - 涨跌幅中位数: 0-40分
-    - 分化度: 0-20分（标准差越小越一致，越有方向性）
+    两层评分机制：
+    1. 如果有全市场广度数据 → 全市场权重 55%，自选权重 45%
+    2. 如果无广度数据 → 回退到仅自选标的评分（兼容旧版）
+
+    全市场维度:
+    - 涨跌比: 0-35分
+    - 涨跌停情绪: 0-10分
+    - 全市场成交额判断（相对于万亿基准）: 0-10分
+
+    自选标的维度:
+    - 涨跌幅中位数: 0-25分
+    - 涨跌比: 0-10分
+    - 分化度(标准差): 0-10分
     """
+    # ---- 自选标的分析 ----
     valid = [q for q in quotes if q.change_pct is not None]
     if not valid:
         return SentimentResult()
 
     pcts = [q.change_pct for q in valid]  # type: ignore
     n = len(pcts)
-    up_ratio = sum(1 for p in pcts if p > 0) / n
+    watch_up_ratio = sum(1 for p in pcts if p > 0) / n
     median_pct = statistics.median(pcts)
     mean_pct = sum(pcts) / n
 
@@ -46,31 +59,112 @@ def calc_market_sentiment(quotes: list[Quote]) -> SentimentResult:
     else:
         std_pct = 0.0
 
-    ratio_score = up_ratio * 40
-    median_score = max(0.0, min(40.0, (median_pct + 3) / 6 * 40))
-    # 标准差越小 → 市场越一致 → 方向性越强，分数更高
-    # std=0 → 20分，std=3 → 0分
-    std_score = max(0.0, min(20.0, 20.0 - std_pct / 3 * 20))
+    if breadth is not None and breadth.is_valid:
+        # ============ 双层评分：全市场(55%) + 自选(45%) ============
 
-    score = round(ratio_score + median_score + std_score)
-    score = max(0, min(100, score))
+        # --- 全市场涨跌比 (0-35) ---
+        # up_ratio=0.5(涨跌各半) → 17.5分，up_ratio=0.8 → 28分，up_ratio=0.2 → 7分
+        ratio_score = breadth.up_ratio * 35
 
-    if score >= 75:
-        label, detail = "强势 🔥", f"普涨格局，中位数{median_pct:+.2f}%"
-    elif score >= 60:
-        label, detail = "偏强 📈", f"涨多跌少，中位数{median_pct:+.2f}%"
-    elif score >= 40:
-        label, detail = "震荡 ⚖️", f"涨跌互现，中位数{median_pct:+.2f}%"
-    elif score >= 25:
-        label, detail = "偏弱 📉", f"跌多涨少，中位数{median_pct:+.2f}%"
+        # --- 涨跌停情绪 (0-10) ---
+        # 涨停多+跌停少 → 高，涨停少+跌停多 → 低，正常 → 5
+        if breadth.limit_up >= 80 and breadth.limit_down < 10:
+            limit_score = 10.0  # 亢奋
+        elif breadth.limit_down >= 50 and breadth.limit_up < 20:
+            limit_score = 0.0   # 恐慌
+        elif breadth.limit_up >= 50 and breadth.limit_down >= 30:
+            limit_score = 4.0   # 分化加剧
+        elif breadth.limit_up < 30 and breadth.limit_down < 10:
+            limit_score = 5.0   # 平淡
+        else:
+            # 正常：根据涨跌停比线性插值
+            if breadth.limit_down > 0:
+                limit_ratio = breadth.limit_up / breadth.limit_down
+                limit_score = max(0.0, min(10.0, 5.0 + (limit_ratio - 1) * 2))
+            else:
+                limit_score = 7.0 if breadth.limit_up > 0 else 5.0
+
+        # --- 全市场成交额 (0-10) ---
+        # 万亿以上在牛市中才有支撑力，8000-10000亿中性，<6000亿弱势
+        if breadth.total_amount >= 12000:
+            vol_score = 10.0
+        elif breadth.total_amount >= 8000:
+            vol_score = 5.0 + (breadth.total_amount - 8000) / 4000 * 5.0
+        elif breadth.total_amount >= 5000:
+            vol_score = (breadth.total_amount - 5000) / 3000 * 5.0
+        else:
+            vol_score = 0.0
+
+        macro_score = ratio_score + limit_score + vol_score  # 0-55
+
+        # --- 自选标的：中位数 (0-25) ---
+        # median_pct=-3% → 0分，median_pct=0% → 12.5分，median_pct=+3% → 25分
+        watch_median_score = max(0.0, min(25.0, (median_pct + 3) / 6 * 25))
+
+        # --- 自选标的：涨跌比 (0-10) ---
+        watch_ratio_score = watch_up_ratio * 10
+
+        # --- 自选标的：分化度 (0-10) ---
+        # std=0 → 10分，std=3 → 0分
+        watch_std_score = max(0.0, min(10.0, 10.0 - std_pct / 3 * 10))
+
+        watch_score = watch_median_score + watch_ratio_score + watch_std_score  # 0-45
+
+        score = round(macro_score + watch_score)
+        score = max(0, min(100, score))
+
+        # 定性标签（引入全市场数据后更准确）
+        if score >= 75:
+            label, detail = "强势 🔥", (
+                f"{breadth.breadth_label}，{breadth.up_count}涨{breadth.down_count}跌"
+                f"，成交{breadth.total_amount:.0f}亿"
+            )
+        elif score >= 60:
+            label, detail = "偏强 📈", (
+                f"{breadth.breadth_label}，{breadth.up_count}涨{breadth.down_count}跌"
+                f"，成交{breadth.total_amount:.0f}亿"
+            )
+        elif score >= 40:
+            label, detail = "震荡 ⚖️", (
+                f"{breadth.breadth_label}，涨跌各半"
+                f"，成交{breadth.total_amount:.0f}亿"
+            )
+        elif score >= 25:
+            label, detail = "偏弱 📉", (
+                f"{breadth.breadth_label}，{breadth.up_count}涨{breadth.down_count}跌"
+                f"，成交{breadth.total_amount:.0f}亿"
+            )
+        else:
+            label, detail = "弱势 ❄️", (
+                f"{breadth.breadth_label}，{breadth.up_count}涨{breadth.down_count}跌"
+                f"，成交{breadth.total_amount:.0f}亿"
+            )
+
     else:
-        label, detail = "弱势 ❄️", f"普跌格局，中位数{median_pct:+.2f}%"
+        # ============ 仅自选标的评分（兼容旧版）============
+        ratio_score = watch_up_ratio * 40
+        median_score = max(0.0, min(40.0, (median_pct + 3) / 6 * 40))
+        std_score = max(0.0, min(20.0, 20.0 - std_pct / 3 * 20))
+
+        score = round(ratio_score + median_score + std_score)
+        score = max(0, min(100, score))
+
+        if score >= 75:
+            label, detail = "强势 🔥", f"普涨格局，中位数{median_pct:+.2f}%"
+        elif score >= 60:
+            label, detail = "偏强 📈", f"涨多跌少，中位数{median_pct:+.2f}%"
+        elif score >= 40:
+            label, detail = "震荡 ⚖️", f"涨跌互现，中位数{median_pct:+.2f}%"
+        elif score >= 25:
+            label, detail = "偏弱 📉", f"跌多涨少，中位数{median_pct:+.2f}%"
+        else:
+            label, detail = "弱势 ❄️", f"普跌格局，中位数{median_pct:+.2f}%"
 
     return SentimentResult(
         score=score,
         label=label,
         detail=detail,
-        up_ratio=round(up_ratio, 2),
+        up_ratio=round(watch_up_ratio, 2),
         median_pct=median_pct,
     )
 
@@ -84,7 +178,20 @@ def adjust_thresholds(
     sentiment: SentimentResult,
     config: Config,
 ) -> dict[str, float]:
-    """根据市场情绪动态调整阈值"""
+    """根据市场情绪不对称调整阈值
+
+    核心原则：不做对称漂移，而是基于交易逻辑不对称调整。
+
+    强势市场（普涨）:
+    - 涨幅阈值 ↑ 放宽：普涨中大涨不稀有，减少噪音
+    - 跌幅阈值 ↓ 收紧：普涨中还跌的标的更值得警惕（跑输市场）
+
+    弱势市场（普跌）:
+    - 涨幅阈值 ↓ 收紧：普跌中逆势上涨才是真强势，值得关注
+    - 跌幅阈值 ↑ 放宽：普跌中跌是正常的，减少噪音
+
+    震荡市场：双向中性调整
+    """
     if not config.dynamic_threshold_enabled:
         return dict(base)
 
@@ -92,30 +199,37 @@ def adjust_thresholds(
     score = sentiment.score
     t = dict(base)
 
-    if score >= STRONG:  # 强势：放宽涨跌幅阈值（更不敏感）
+    if score >= STRONG:  # 强势：放宽涨幅、收紧跌幅
         t["涨幅预警"] = base["涨幅预警"] + 1.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 1.0 * intensity
-        t["跌幅预警"] = base["跌幅预警"] + 0.5 * intensity
-        t["跌幅关注"] = base["跌幅关注"] + 0.3 * intensity
+        # 强势中跌是异类 → 收紧跌幅阈值（更容易触发）
+        t["跌幅预警"] = base["跌幅预警"] + 1.0 * intensity   # 例如 -2.5→-1.0，更容易触发
+        t["跌幅关注"] = base["跌幅关注"] + 0.8 * intensity
     elif score >= SLIGHTLY_UP:  # 偏强
         t["涨幅预警"] = base["涨幅预警"] + 0.5 * intensity
         t["涨幅关注"] = base["涨幅关注"] + 0.3 * intensity
-    elif score <= WEAK:  # 弱势：收紧涨幅阈值、放宽跌幅阈值（更敏感）
-        t["涨幅预警"] = base["涨幅预警"] - 1.5 * intensity
-        t["涨幅关注"] = base["涨幅关注"] - 1.0 * intensity
         t["跌幅预警"] = base["跌幅预警"] + 0.5 * intensity
         t["跌幅关注"] = base["跌幅关注"] + 0.3 * intensity
-        t["大跌预警"] = base["大跌预警"] + 1.0 * intensity
+    elif score <= WEAK:  # 弱势：收紧涨幅、放宽跌幅
+        # 弱势中涨是异类 → 收紧涨幅阈值（更容易触发）
+        t["涨幅预警"] = base["涨幅预警"] - 1.0 * intensity   # 例如 3.0→1.5，更容易触发
+        t["涨幅关注"] = base["涨幅关注"] - 0.8 * intensity
+        t["跌幅预警"] = base["跌幅预警"] - 1.5 * intensity   # 放宽
+        t["跌幅关注"] = base["跌幅关注"] - 1.0 * intensity
+        t["大跌预警"] = base.get("大跌预警", -5.0) - 1.0 * intensity
     elif score <= SLIGHTLY_DOWN:  # 偏弱
         t["涨幅预警"] = base["涨幅预警"] - 0.5 * intensity
-        t["跌幅预警"] = base["跌幅预警"] + 0.3 * intensity
+        t["涨幅关注"] = base["涨幅关注"] - 0.3 * intensity
+        t["跌幅预警"] = base["跌幅预警"] - 0.5 * intensity
+        t["跌幅关注"] = base["跌幅关注"] - 0.3 * intensity
 
     # 安全限幅
-    t["涨幅预警"] = max(t["涨幅预警"], 1.0)
-    t["涨幅关注"] = max(t["涨幅关注"], 0.5)
-    t["跌幅预警"] = min(t["跌幅预警"], -0.5)
-    t["跌幅关注"] = min(t["跌幅关注"], -0.3)
-    t["大跌预警"] = min(t["大跌预警"], -2.0)
+    t["涨幅预警"] = max(t["涨幅预警"], 0.5)
+    t["涨幅关注"] = max(t["涨幅关注"], 0.3)
+    t["跌幅预警"] = min(t["跌幅预警"], -0.3)
+    t["跌幅关注"] = min(t["跌幅关注"], -0.2)
+    if "大跌预警" in t:
+        t["大跌预警"] = min(t["大跌预警"], -1.5)
 
     return {k: round(v, 1) for k, v in t.items()}
 
@@ -157,10 +271,11 @@ def analyze(
     config: Config,
     tech_summaries: dict[str, TechnicalSummary] | None = None,
     north_data: Optional["NorthFlowData"] = None,
+    market_breadth: Optional["MarketBreadth"] = None,
 ) -> tuple[list[Alert], AnalysisStats]:
     """执行全部分析，返回异动列表和统计结果"""
     base = config.thresholds
-    sentiment = calc_market_sentiment(quotes)
+    sentiment = calc_market_sentiment(quotes, breadth=market_breadth)
     thresholds = adjust_thresholds(base, sentiment, config)
 
     up_warn = thresholds["涨幅预警"]
@@ -264,6 +379,7 @@ def analyze(
         base_thresholds=base,
         dynamic_enabled=config.dynamic_threshold_enabled,
         north_flow=north_data,
+        market_breadth=market_breadth,
     )
     return alerts, stats
 
@@ -271,6 +387,10 @@ def analyze(
 # ============================================================
 # 扫描历史持久化
 # ============================================================
+
+# 扫描历史最大保留条目数（约覆盖最近 3-5 个交易日）
+MAX_SCAN_HISTORY = 200
+
 
 def _load_scan_history() -> list["ScanRecord"]:
     """加载扫描历史（从 JSON 文件）
@@ -325,6 +445,12 @@ def _load_scan_history() -> list["ScanRecord"]:
                         bb_width=tech_data.get("bb_width"),
                         bb_signal=tech_data.get("bb_signal", ""),
                         signals=tech_data.get("signals", []),
+                        ma5=tech_data.get("ma5"),
+                        ma10=tech_data.get("ma10"),
+                        ma20=tech_data.get("ma20"),
+                        ma60=tech_data.get("ma60"),
+                        ma_alignment=tech_data.get("ma_alignment", ""),
+                        ma_alignment_detail=tech_data.get("ma_alignment_detail", ""),
                     )
 
                 funds_status[code] = FundScanStatus(
@@ -368,8 +494,11 @@ def _save_scan_history(scan_history: list["ScanRecord"]) -> None:
     history_file = state_dir / "scan_history.json"
 
     try:
+        # 只保留最近 N 条记录，防止文件无限增长
+        recent = scan_history[-MAX_SCAN_HISTORY:] if len(scan_history) > MAX_SCAN_HISTORY else scan_history
+
         data = []
-        for record in scan_history:
+        for record in recent:
             funds_status = {}
             for code, status in record.funds_status.items():
                 tech_snapshot_data = None
@@ -400,6 +529,12 @@ def _save_scan_history(scan_history: list["ScanRecord"]) -> None:
                         "bb_width": ts.bb_width,
                         "bb_signal": ts.bb_signal,
                         "signals": ts.signals,
+                        "ma5": ts.ma5,
+                        "ma10": ts.ma10,
+                        "ma20": ts.ma20,
+                        "ma60": ts.ma60,
+                        "ma_alignment": ts.ma_alignment,
+                        "ma_alignment_detail": ts.ma_alignment_detail,
                     }
 
                 funds_status[code] = {

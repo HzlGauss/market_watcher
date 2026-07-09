@@ -204,6 +204,157 @@ def _ema(values: list[float], period: int) -> list[float]:
     return ema_vals
 
 
+def calc_sma(values: list[float], period: int) -> list[float]:
+    """计算 SMA（简单移动平均）
+
+    Args:
+        values: 价格序列（按时间升序）
+        period: 均线周期
+
+    Returns:
+        SMA 值序列（长度与输入相同，前 period-1 个值为 None）
+    """
+    if not values or len(values) < period:
+        return []
+    sma_vals: list[Optional[float]] = [None] * (period - 1)
+    for i in range(period - 1, len(values)):
+        sma_vals.append(sum(values[i - period + 1:i + 1]) / period)
+    return sma_vals  # type: ignore[return-value]
+
+
+# ============================================================
+# MA Alignment —— 均线排列分析
+# ============================================================
+
+@dataclass
+class MAAlignment:
+    """均线排列分析结果"""
+    ma5: Optional[float] = None
+    ma10: Optional[float] = None
+    ma20: Optional[float] = None
+    ma60: Optional[float] = None
+    alignment: str = "数据不足"  # 多头排列 / 空头排列 / 缠绕 / 多头回调 / 空头反弹 / 数据不足
+    detail: str = ""
+
+    @property
+    def is_bullish(self) -> bool:
+        """是否多头排列"""
+        return self.alignment == "多头排列"
+
+    @property
+    def is_bearish(self) -> bool:
+        """是否空头排列"""
+        return self.alignment == "空头排列"
+
+    @property
+    def is_sideways(self) -> bool:
+        """是否缠绕（无明显方向）"""
+        return self.alignment == "缠绕"
+
+
+def calc_ma_alignment(klines: list["KlineData"], periods: tuple = (5, 10, 20, 60)) -> MAAlignment:
+    """计算均线排列状态
+
+    使用 SMA 计算多条均线，判断排列方向：
+    - 多头排列: MA5 > MA10 > MA20 > MA60 — 各级别均线依次向上
+    - 空头排列: MA5 < MA10 < MA20 < MA60 — 各级别均线依次向下
+    - 多头回调: MA20 向上（短均线跌破中均线但长均线仍向上）— 上升趋势中的回调
+    - 空头反弹: MA20 向下（短均线上穿中均线但长均线仍向下）— 下降趋势中的反弹
+    - 缠绕: 均线交错，无明显方向
+
+    Args:
+        klines: K线数据（按时间升序），需要足够的数据覆盖最大周期
+        periods: 均线周期元组，默认 (5, 10, 20, 60)
+
+    Returns:
+        MAAlignment 对象，包含各均线值和排列状态
+    """
+    if not klines:
+        return MAAlignment()
+
+    closes = [k.close for k in klines if k.close is not None]
+    if not closes:
+        return MAAlignment()
+
+    max_period = max(periods)
+    if len(closes) < max_period:
+        return MAAlignment(detail=f"数据不足（需要至少{max_period}根K线，当前{len(closes)}根）")
+
+    # 计算各周期 SMA
+    ma_values: dict[int, Optional[float]] = {}
+    for p in periods:
+        sma_series = calc_sma(closes, p)
+        if sma_series:
+            last_val = sma_series[-1]
+            ma_values[p] = round(last_val, 3) if last_val is not None else None
+        else:
+            ma_values[p] = None
+
+    ma5, ma10, ma20, ma60 = (ma_values.get(p) for p in periods)
+
+    # 判断排列状态
+    if any(v is None for v in [ma5, ma10, ma20]):
+        return MAAlignment(
+            ma5=ma5, ma10=ma10, ma20=ma20, ma60=ma60,
+            alignment="数据不足",
+            detail="均线数据不完整"
+        )
+
+    # 辅助：判断均线趋势方向（通过前一日对比）
+    has_ma60 = ma60 is not None
+    prev_closes = closes[:-1]
+
+    # MA20 趋势（前一日 MA20 vs 当日 MA20）
+    ma20_rising = False
+    ma20_falling = False
+    if len(prev_closes) >= 20:
+        prev_sma = calc_sma(prev_closes, 20)
+        if prev_sma and prev_sma[-1] is not None:
+            ma20_rising = ma20 > prev_sma[-1]
+            ma20_falling = ma20 < prev_sma[-1]
+
+    # 主判断：均线排列（必须使用 assert 告知 type checker ma5/ma10/ma20 非 None）
+    assert ma5 is not None and ma10 is not None and ma20 is not None
+
+    if ma5 > ma10 > ma20:
+        if has_ma60 and ma60 is not None and ma20 > ma60:
+            alignment = "多头排列"
+            detail = "MA5>MA10>MA20>MA60，各级均线顺向向上，趋势强劲"
+        else:
+            alignment = "多头排列"
+            detail = "MA5>MA10>MA20，短期均线多头排列"
+    elif ma5 < ma10 < ma20:
+        if has_ma60 and ma60 is not None and ma20 < ma60:
+            alignment = "空头排列"
+            detail = "MA5<MA10<MA20<MA60，各级均线顺向向下，趋势疲弱"
+        else:
+            alignment = "空头排列"
+            detail = "MA5<MA10<MA20，短期均线空头排列"
+    elif ma5 < ma10 and ma20_rising:
+        # 短均线在下方，但中长均线仍在上行 → 上升趋势中的回调
+        alignment = "多头回调"
+        detail = f"MA5({ma5})<MA10({ma10})，但MA20({ma20})仍在上行，上升趋势中的短期回调"
+    elif ma5 > ma10 and ma20_falling:
+        # 短均线上穿，但中长均线仍在下降 → 下降趋势中的反弹
+        alignment = "空头反弹"
+        detail = f"MA5({ma5})>MA10({ma10})，但MA20({ma20})仍在下行，下降趋势中的短期反弹"
+    else:
+        # 均线交错缠绕
+        alignment = "缠绕"
+        if ma20_rising:
+            detail = "均线缠绕，MA20缓慢上行，偏多震荡"
+        elif ma20_falling:
+            detail = "均线缠绕，MA20缓慢下行，偏空震荡"
+        else:
+            detail = "均线缠绕，无明显方向"
+
+    return MAAlignment(
+        ma5=ma5, ma10=ma10, ma20=ma20, ma60=ma60,
+        alignment=alignment,
+        detail=detail,
+    )
+
+
 # ============================================================
 # RSI —— 相对强弱指标
 # ============================================================
@@ -1050,6 +1201,7 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
     sr = calc_support_resistance(klines)
     bb = calc_bollinger(closes)
     obv = calc_obv(klines)
+    ma = calc_ma_alignment(klines)
 
     signals = []
     if rsi and rsi_signal(rsi) in ("超买", "严重超买"):
@@ -1067,6 +1219,16 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         signals.append(f"布林触及下轨(带宽{bb.width}%)")
     if obv.signal and obv.signal not in ("中性", "数据不足"):
         signals.append(f"OBV{obv.signal}")
+
+    # 均线排列信号
+    if ma.alignment == "多头排列":
+        signals.append("均线多头排列")
+    elif ma.alignment == "多头回调":
+        signals.append("均线多头回调(回踩中)")
+    elif ma.alignment == "空头排列":
+        signals.append("均线空头排列")
+    elif ma.alignment == "空头反弹":
+        signals.append("均线空头反弹(反压中)")
 
     return TechnicalSummary(
         rsi=rsi,
@@ -1093,6 +1255,12 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         bb_width=bb.width,
         bb_signal=bb.signal,
         obv=obv.obv,
+        ma5=ma.ma5,
+        ma10=ma.ma10,
+        ma20=ma.ma20,
+        ma60=ma.ma60,
+        ma_alignment=ma.alignment,
+        ma_alignment_detail=ma.detail,
         signals=signals,
     )
 

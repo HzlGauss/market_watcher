@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -478,6 +478,126 @@ class NorthFlowFetcher:
         except Exception as e:
             log.warning(f"北向资金解析失败: {e}")
             return self._cache
+
+
+# ============================================================
+# 全市场广度数据
+# ============================================================
+
+# 市场广度数据内存缓存
+_breadth_cache: Optional["MarketBreadth"] = None
+_breadth_fetch_time: float = 0.0
+BREADTH_CACHE_SECONDS = 300  # 5分钟缓存
+
+
+def fetch_market_breadth(force_refresh: bool = False) -> Optional["MarketBreadth"]:
+    """获取全市场广度数据（涨跌家数、成交额、涨跌停等）
+
+    通过东方财富 AKShare stock_zh_a_spot_em() 获取全 A 股快照，
+    聚合计算涨跌分布、量能和极端情绪指标。
+    带 5 分钟内存缓存，避免频繁全市场查询。
+
+    Args:
+        force_refresh: 是否强制刷新缓存
+
+    Returns:
+        MarketBreadth 对象，获取失败返回 None
+    """
+    global _breadth_cache, _breadth_fetch_time
+
+    import time
+    now = time.time()
+
+    # 检查缓存
+    if (not force_refresh
+            and _breadth_cache is not None
+            and (now - _breadth_fetch_time) < BREADTH_CACHE_SECONDS):
+        return _breadth_cache
+
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+
+        if df is None or df.empty:
+            log.warning("全市场数据为空")
+            return _breadth_cache  # 返回旧缓存
+
+        # 聚合计算广度数据
+        total = len(df)
+        up_count = int((df["涨跌幅"] > 0).sum())
+        down_count = int((df["涨跌幅"] < 0).sum())
+        flat_count = total - up_count - down_count
+
+        # 涨跌停（约 ±9.5% 以上）
+        limit_up = int((df["涨跌幅"] >= 9.5).sum())
+        limit_down = int((df["涨跌幅"] <= -9.5).sum())
+
+        # 全市场成交额（亿元）
+        total_amount = df["成交额"].sum() / 1e8 if "成交额" in df.columns else 0.0
+
+        # 全市场成交量（万手）—— 如缺则用0
+        total_volume = 0.0
+        if "成交量" in df.columns:
+            total_volume = df["成交量"].sum() / 1e4  # 转为万手
+
+        # 主力净流入（亿元）—— 如缺则用0
+        main_net = 0.0
+        if "主力净流入" in df.columns:
+            main_net = df["主力净流入"].sum() / 1e8
+
+        # 取上证指数作为参考
+        index_name = "上证指数"
+        index_price = 0.0
+        index_change_pct = 0.0
+
+        sh_row = df[df["代码"] == "000001"]
+        if not sh_row.empty:
+            row = sh_row.iloc[0]
+            index_price = float(row.get("最新价", 0) or 0)
+            index_change_pct = float(row.get("涨跌幅", 0) or 0)
+        else:
+            # 兜底：取沪深300
+            hs300 = df[df["代码"] == "000300"]
+            if not hs300.empty:
+                row = hs300.iloc[0]
+                index_name = "沪深300"
+                index_price = float(row.get("最新价", 0) or 0)
+                index_change_pct = float(row.get("涨跌幅", 0) or 0)
+
+        breadth = MarketBreadth(
+            up_count=up_count,
+            down_count=down_count,
+            flat_count=flat_count,
+            total_count=total,
+            limit_up=limit_up,
+            limit_down=limit_down,
+            total_amount=round(total_amount, 1),
+            total_volume=round(total_volume, 1),
+            index_name=index_name,
+            index_price=round(index_price, 2),
+            index_change_pct=round(index_change_pct, 2),
+            main_net_inflow=round(main_net, 1),
+            update_time=time.strftime("%H:%M:%S"),
+        )
+
+        _breadth_cache = breadth
+        _breadth_fetch_time = now
+        log.info(
+            f"市场广度: {breadth.breadth_label} | "
+            f"涨{up_count}/跌{down_count}/平{flat_count} | "
+            f"涨停{limit_up}/跌停{limit_down} | "
+            f"成交{total_amount:.0f}亿 | "
+            f"{index_name} {index_change_pct:+.2f}%"
+        )
+
+        return breadth
+
+    except ImportError:
+        log.debug("AKShare 未安装，跳过全市场广度数据")
+        return None
+    except Exception as e:
+        log.warning(f"获取全市场广度数据失败: {e}")
+        return _breadth_cache  # 返回旧缓存
 
 
 # ============================================================

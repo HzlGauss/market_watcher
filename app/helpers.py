@@ -70,6 +70,12 @@ def validate_holding(item: dict, source: str = "unknown") -> Optional[Holding]:
     """
     验证并创建 Holding
 
+    数据质量检查：
+    - code 为空 → 跳过
+    - amount = 0 → 跳过（观察标的，非真实持仓）
+    - cost <= 0 → 警告但仍然创建（可能只是未填成本）
+    - market 为空 → 自动检测
+
     Args:
         item: 包含持仓数据的字典
         source: 数据来源描述
@@ -85,9 +91,24 @@ def validate_holding(item: dict, source: str = "unknown") -> Optional[Holding]:
             return None
 
         name = str(item.get("name", "")).strip()
-        market = _detect_market(code, item.get("market", ""))
+        if not name:
+            log.warning(f"Skipping holding from {source}: name is empty (code={code})")
+            return None
+
+        # 市场自动检测（CSV 中 market 字段可能为空或 null）
+        raw_market = str(item.get("market", "")).strip()
+        market = _detect_market(code, raw_market)
+
         amount = _safe_positive_int(item.get("amount", 0))
         cost = _safe_positive_float(item.get("cost", 0.0))
+
+        # 标记异常成本
+        if cost <= 0:
+            log.debug(f"Holding {name}({code}): cost={cost} (P&L unavailable)")
+
+        # 标记市场为空的情况
+        if not raw_market:
+            log.debug(f"Holding {name}({code}) market auto-detected as {market}")
 
         return Holding(
             name=name,

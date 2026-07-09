@@ -21,6 +21,12 @@ if %ERRORLEVEL% NEQ 0 (
     pip install requests -q
 )
 
+python -c "import akshare" >nul 2>nul
+if %ERRORLEVEL% NEQ 0 (
+    echo Installing akshare...
+    pip install akshare>=1.14.0 -q
+)
+
 echo Environment ready, starting monitoring radar...
 echo.
 

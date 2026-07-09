@@ -134,7 +134,7 @@ class DataFetcherThread(threading.Thread):
                     for k in klines_data
                 ]
                 # 每次请求后等待，避免触发新浪频率限制
-                time.sleep(0.5)
+                time.sleep(0.3)
             except Exception as e:
                 log.warning(f"获取 {item.code} K线数据失败: {e}")
 

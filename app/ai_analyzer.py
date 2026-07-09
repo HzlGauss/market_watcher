@@ -24,13 +24,29 @@ def _build_prompt(
     lines = [
         "请基于以下实时盯盘数据，给出专业、简洁的盘面研判。",
         "",
-        f"## 市场状态",
+    ]
+
+    # 全市场广度（优先，LLM据此判断大盘环境）
+    if stats.market_breadth and stats.market_breadth.is_valid:
+        b = stats.market_breadth
+        lines.extend([
+            "## 🏛️ 全市场广度",
+            f"- 涨跌分布: {b.up_count}涨 / {b.down_count}跌 / {b.flat_count}平 (共{b.total_count}只)",
+            f"- 涨跌比: {b.up_ratio:.0%} → {b.breadth_label}",
+            f"- 涨停: {b.limit_up} | 跌停: {b.limit_down} → 情绪: {b.limit_emotion}",
+            f"- 全市场成交: {b.total_amount:.0f}亿 | 主力净流入: {b.main_net_inflow:+.1f}亿",
+            f"- 参考指数: {b.index_name} {b.index_change_pct:+.2f}% ({b.index_price:.2f})",
+            f"- 数据时间: {b.update_time}",
+            "",
+        ])
+
+    lines.extend([
+        f"## 持仓概况",
         f"- 时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"- 监控标的: {stats.total} 只",
         f"- 涨跌分布: 涨{stats.up} / 跌{stats.down} / 平{stats.flat}",
-        f"- 上涨家数占比: {stats.up/(stats.up+stats.down+stats.flat)*100:.0f}%",
         f"- 情绪评分: {s.score}/100 ({s.label})",
-    ]
+    ])
 
     # 成交量分析
     total_volume = sum(q.volume for q in quotes if q.volume is not None and q.volume > 0)
@@ -77,6 +93,7 @@ def _build_prompt(
                 "[趋势启动]", "[逃顶组合]", "[震荡套利]", "[双翼齐飞]",
                 "[低位放量启动]", "[高位放量滞警]", "[缩量洗盘]",
                 "[放量突破确认]", "[地量地价反转]",
+                "[均线多头回踩]", "[均线空头反弹]", "[均线金叉]", "[均线死叉]",
             ]):
                 strategy_signals.append(f"- {a.name}({a.code}): {msg}")
 
@@ -126,6 +143,11 @@ def _build_prompt(
                     parts.append(f"布林带:{tech.bb_signal}")
                 if tech.obv is not None:
                     parts.append(f"OBV:{tech.obv:.0f}")
+                if tech.ma_alignment and tech.ma_alignment != "数据不足":
+                    ma_info = f"均线:{tech.ma_alignment}"
+                    if tech.ma20 is not None:
+                        ma_info += f"(MA20={tech.ma20:.3f})"
+                    parts.append(ma_info)
                 lines.append(" ".join(parts))
 
     lines.extend([
@@ -133,9 +155,11 @@ def _build_prompt(
         "请按以下框架分析，输出控制在 300 字以内：",
         "",
         "### 第一步：盘面定性（1 句）",
-        "用一个词或短语定性当前盘面（如：缩量震荡、放量上攻、冲高回落等），然后一句话说明核心矛盾。",
+        "对照全市场广度数据（涨跌比/涨跌停/成交额），用一个词或短语定性当前盘面"
+        "（如：放量普涨、缩量震荡、二八分化、恐慌杀跌等），然后一句话说明核心矛盾。",
         "",
         "### 第二步：量价验证",
+        "- 全市场成交额是否充沛（万亿以上为活跃）？自选标的是否与全市场方向一致？",
         "- 当前上涨是否有量能支撑？上涨量比是否大于 50%？",
         "- 如果缩量上涨，需标注\"缩量上涨，持续性存疑\"",
         "- 如果放量下跌，需标注\"抛压较重，谨慎\"",
@@ -151,6 +175,10 @@ def _build_prompt(
         "- 缩量洗盘：上涨趋势中缩量回调+未破支撑，洗盘结束可加仓",
         "- 放量突破确认：放量突破布林中轨+OBV资金入场，突破有效确认",
         "- 地量地价反转：长期下跌后地量+RSI超卖+KDJ超卖，底部反转信号",
+        "- 均线多头回踩：多头排列+价格回踩MA20+缩量，均线支撑买入点，顺势低吸",
+        "- 均线空头反弹：空头排列+价格反弹至MA20+无量，均线压力卖出点，借反弹减仓",
+        "- 均线金叉：MA5上穿MA10，配合MA20方向判断趋势转多可信度",
+        "- 均线死叉：MA5下穿MA10，配合MA20方向判断趋势转空可信度",
         "",
         "### 第四步：异动解读",
         "对警报标的逐一说明：是技术性回调、资金驱动还是基本面因素？",

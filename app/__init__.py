@@ -24,6 +24,7 @@ from app.models import (
     SentimentResult,
     AnalysisStats,
     NorthFlowData,
+    MarketBreadth,
     INDEX_TYPE,
     MARKET_PREFIX,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "SentimentResult",
     "AnalysisStats",
     "NorthFlowData",
+    "MarketBreadth",
     "INDEX_TYPE",
     "MARKET_PREFIX",
     

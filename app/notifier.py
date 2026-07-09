@@ -14,6 +14,8 @@ from app.config import Config
 from app.utils import log
 from app.http_client import serverchan_client
 
+API_BASE = "https://sctapi.ftqq.com"
+
 
 def _send_macos_notification(
     title: str,
@@ -142,6 +144,17 @@ def push_alert(
         "",
     ]
 
+    # 全市场广度数据
+    if stats.market_breadth and stats.market_breadth.is_valid:
+        b = stats.market_breadth
+        lines.extend([
+            f"## 🏛️ 全市场",
+            f"- {b.breadth_label} | {b.up_count}涨{b.down_count}跌{b.flat_count}平",
+            f"- 涨停{b.limit_up}/跌停{b.limit_down} | 情绪:{b.limit_emotion}",
+            f"- 成交{b.total_amount:.0f}亿 | {b.index_name} {b.index_change_pct:+.2f}%",
+            "",
+        ])
+
     if alerts:
         lines.append("## 🔔 异动详情")
         for a in alerts[:5]:
@@ -160,7 +173,7 @@ def push_alert(
 
     content = "\n".join(lines)
 
-    url = f"/{sendkey}.send"
+    url = f"{API_BASE}/{sendkey}.send"
     resp = serverchan_client.post(url, data={"title": title, "desp": content})
 
     if resp is None:
