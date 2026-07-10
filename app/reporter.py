@@ -899,6 +899,266 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
     return "; ".join(signals) if signals else "资金面中性"
 
 
+# ============================================================
+# 交易辅助数据预计算（代码算价格，LLM 做推理）
+# ============================================================
+
+def _compute_trading_suggestions(
+    holdings: list[Holding],
+    quotes: list[Quote],
+    tech_data: list[dict],
+    dragon_tiger_summary: "DragonTigerSummary | None" = None,
+) -> list[dict]:
+    """为每只持仓预计算交易辅助数据：网格区间、逃顶/抄底信号
+
+    所有价格点由代码精确计算，LLM 只负责解释和给出操作建议。
+
+    Args:
+        holdings: 持仓列表
+        quotes: 实时行情列表
+        tech_data: _get_holdings_tech_analysis 的返回结果
+        dragon_tiger_summary: 龙虎榜综合分析结果（可选）
+
+    Returns:
+        每只持仓的交易辅助数据列表，按信号强度排序
+    """
+    results: list[dict] = []
+
+    # 建立辅助索引
+    quote_map = {q.code: q for q in quotes}
+    tech_map = {t["code"]: t for t in tech_data}
+
+    # 龙虎榜异常形态索引
+    dt_patterns: dict[str, list[str]] = {}
+    if dragon_tiger_summary and dragon_tiger_summary.abnormal_patterns:
+        for p in dragon_tiger_summary.abnormal_patterns:
+            code = p.get("code", "")
+            if code not in dt_patterns:
+                dt_patterns[code] = []
+            dt_patterns[code].append(p.get("pattern_type", ""))
+
+    for h in holdings:
+        code = h.code
+        quote = quote_map.get(code)
+        tech = tech_map.get(code)
+        if not quote or not tech or not quote.price:
+            continue
+
+        price = quote.price
+        support = tech.get("support")
+        resistance = tech.get("resistance")
+        atr = tech.get("atr")
+        clusters = tech.get("volume_clusters", []) or []
+        rsi = tech.get("rsi")
+        rsi_sig = tech.get("rsi_signal", "")
+        macd_sig = tech.get("macd_signal", "")
+        kdj_sig = tech.get("kdj_signal", "")
+        vol_price = tech.get("vol_price", "")
+
+        # ---- 1. 网格区间计算 ----
+        # 收集所有有效的支撑和压力点
+        all_supports: list[float] = []
+        all_resistances: list[float] = []
+
+        if support and price > 0:
+            all_supports.append(support)
+        if resistance and price > 0:
+            all_resistances.append(resistance)
+
+        # 成交密集区低于现价 = 支撑，高于现价 = 压力
+        for c in clusters:
+            if c < price * 0.99:
+                all_supports.append(c)
+            elif c > price * 1.01:
+                all_resistances.append(c)
+
+        all_supports.sort(reverse=True)   # 从高到低
+        all_resistances.sort()            # 从低到高
+
+        # 网格下沿 = 最近的主要支撑（不含太远的）
+        grid_lower = all_supports[0] if all_supports else round(price * 0.95, 2)
+        # 网格上沿 = 最近的主要压力
+        grid_upper = all_resistances[0] if all_resistances else round(price * 1.05, 2)
+
+        # 网格间距 = ATR * 0.5，最小 0.01（防止低股价精度不够）
+        grid_step = round(max(atr or price * 0.01, 0.01) * 0.5, 3)
+        if grid_step <= 0:
+            grid_step = round(price * 0.005, 3)
+
+        # 计算网格档位
+        grid_levels: list[dict] = []
+        if grid_upper > grid_lower and grid_step > 0:
+            level_count = int((grid_upper - grid_lower) / grid_step)
+            level_count = min(level_count, 30)  # 最多 30 档
+            for i in range(level_count + 1):
+                lvl_price = round(grid_lower + i * grid_step, 3)
+                tag = ""
+                if lvl_price <= price * 1.002 and lvl_price >= price * 0.998:
+                    tag = "◀ 当前价"
+                elif abs(lvl_price - support) < grid_step * 0.5 if support else False:
+                    tag = "(支撑)"
+                elif abs(lvl_price - resistance) < grid_step * 0.5 if resistance else False:
+                    tag = "(压力)"
+                grid_levels.append({"price": lvl_price, "tag": tag})
+
+        # 当前价在网格中的位置（0-100%）
+        if grid_upper > grid_lower:
+            grid_position = round((price - grid_lower) / (grid_upper - grid_lower) * 100)
+        else:
+            grid_position = 50
+
+        # ---- 2. 逃顶信号评分 ----
+        escape_score = 0
+        escape_reasons: list[str] = []
+
+        # RSI 超买：RSI >= 70 算超买
+        if rsi is not None and rsi >= 70:
+            escape_score += 2
+            escape_reasons.append(f"RSI超买({rsi:.0f})")
+        elif rsi is not None and rsi >= 60:
+            escape_score += 1
+            escape_reasons.append(f"RSI偏强({rsi:.0f})")
+
+        # 接近压力位
+        if resistance and price >= resistance * 0.98:
+            escape_score += 2
+            escape_reasons.append(f"接近压力{resistance:.3f}")
+
+        # MACD 死叉或即将死叉
+        if "死叉" in macd_sig or "顶背离" in macd_sig:
+            escape_score += 2
+            escape_reasons.append(f"MACD{macd_sig}")
+        elif "动能减弱" in macd_sig or "可能见顶" in macd_sig:
+            escape_score += 1
+            escape_reasons.append(f"MACD{macd_sig}")
+
+        # KDJ 超买
+        if "超买" in kdj_sig:
+            escape_score += 1
+            escape_reasons.append(f"KDJ超买")
+
+        # 量价背离：缩量上涨 / 放量滞涨
+        if "缩量上涨" in vol_price:
+            escape_score += 2
+            escape_reasons.append("缩量上涨(量价背离)")
+        elif "放量滞涨" in vol_price or "平盘放量" in vol_price:
+            escape_score += 1
+            escape_reasons.append(vol_price)
+
+        # 龙虎榜出货信号
+        dt_ptypes = dt_patterns.get(code, [])
+        if "limit_up_distribution" in dt_ptypes:
+            escape_score += 3
+            escape_reasons.append("龙虎榜涨停板出货")
+        if "wash_trade" in dt_ptypes:
+            escape_score += 1
+            escape_reasons.append("龙虎榜机构对倒")
+
+        # 网格位置高
+        if grid_position >= 80:
+            escape_score += 1
+            escape_reasons.append(f"网格高位({grid_position}%)")
+
+        # ---- 3. 抄底信号评分 ----
+        dip_score = 0
+        dip_reasons: list[str] = []
+
+        # RSI 超卖
+        if rsi is not None and rsi <= 30:
+            dip_score += 2
+            dip_reasons.append(f"RSI超卖({rsi:.0f})")
+        elif rsi is not None and rsi <= 40:
+            dip_score += 1
+            dip_reasons.append(f"RSI偏弱({rsi:.0f})")
+
+        # 接近支撑位
+        if support and price <= support * 1.02:
+            dip_score += 2
+            dip_reasons.append(f"接近支撑{support:.3f}")
+
+        # MACD 金叉或底背离
+        if "金叉" in macd_sig or "底背离" in macd_sig:
+            dip_score += 2
+            dip_reasons.append(f"MACD{macd_sig}")
+        elif "动能增强" in macd_sig:
+            dip_score += 1
+            dip_reasons.append(f"MACD{macd_sig}")
+
+        # KDJ 超卖
+        if "超卖" in kdj_sig:
+            dip_score += 1
+            dip_reasons.append(f"KDJ超卖")
+
+        # 量价关系
+        if "缩量下跌" in vol_price or "抛压减弱" in vol_price:
+            dip_score += 1
+            dip_reasons.append(vol_price)
+        if "放量上涨" in vol_price or "主力入场" in vol_price:
+            dip_score += 1
+            dip_reasons.append(vol_price)
+
+        # 龙虎榜接筹信号
+        if "limit_down_accumulation" in dt_ptypes:
+            dip_score += 3
+            dip_reasons.append("龙虎榜跌停接筹")
+
+        # 网格位置低
+        if grid_position <= 20:
+            dip_score += 1
+            dip_reasons.append(f"网格低位({grid_position}%)")
+
+        # ---- 4. 综合建议标签 ----
+        suggestion = "观望"
+        priority = 0
+        if dip_score >= 4 and escape_score <= 1:
+            suggestion = "🟢 逢低吸纳"
+            priority = dip_score
+        elif dip_score >= 3:
+            suggestion = "🟡 关注抄底"
+            priority = dip_score
+        elif escape_score >= 3 and dip_score <= 1:
+            suggestion = "🔴 考虑减仓"
+            priority = escape_score
+        elif escape_score >= 4:
+            suggestion = "🚨 逃顶预警"
+            priority = escape_score
+        elif escape_score >= 2 and dip_score >= 2:
+            suggestion = "⚪ 多空博弈"
+            priority = 0
+
+        results.append({
+            "name": h.name,
+            "code": code,
+            "price": price,
+            "change_pct": quote.change_pct,
+            "grid_lower": grid_lower,
+            "grid_upper": grid_upper,
+            "grid_step": grid_step,
+            "grid_levels": grid_levels,
+            "grid_position": grid_position,
+            "grid_level_count": len(grid_levels) - 1,
+            "escape_score": escape_score,
+            "escape_reasons": escape_reasons,
+            "dip_score": dip_score,
+            "dip_reasons": dip_reasons,
+            "suggestion": suggestion,
+            "priority": priority,
+            "support": support,
+            "resistance": resistance,
+            "atr": atr,
+            "rsi": rsi,
+            "rsi_signal": rsi_sig,
+            "macd_signal": macd_sig,
+            "kdj_signal": kdj_sig,
+            "vol_price": vol_price,
+            "volume_clusters": clusters[:3],
+        })
+
+    # 按优先级排序：需要行动的排前面
+    results.sort(key=lambda x: (x["priority"], x["escape_score"] + x["dip_score"]), reverse=True)
+    return results
+
+
 def generate_evening_review(config: Config) -> Path | None:
     """Evening Review - Full day summary + next day strategy"""
     report_cfg = config.report_cfg.get("Evening Review", {})
@@ -1096,6 +1356,67 @@ def generate_evening_review(config: Config) -> Path | None:
             for sig_text in s['signals']:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
 
+    # 7. Pre-compute trading suggestions (grid / escape / dip)
+    trade_suggestions = _compute_trading_suggestions(
+        holdings, quotes, tech_data_evening, dragon_tiger_summary
+    )
+    if trade_suggestions:
+        data_lines.append(f"\n## 七、🎯 交易辅助数据（网格挂单 / 逃顶 / 抄底）")
+        data_lines.append("")
+        data_lines.append(f"*价格点由代码计算，建议由 AI 解读*")
+        data_lines.append("")
+
+        for ts in trade_suggestions:
+            name = ts["name"]
+            code = ts["code"]
+            price = ts["price"]
+            chg = f"{ts['change_pct']:+.2f}%" if ts['change_pct'] is not None else "--"
+            grid_l = ts["grid_lower"]
+            grid_u = ts["grid_upper"]
+            step = ts["grid_step"]
+            pos = ts["grid_position"]
+            suggestion = ts["suggestion"]
+
+            data_lines.append(f"### {name}({code}) — {suggestion}")
+            data_lines.append(
+                f"现价 **{price:.3f}** ({chg}) | 网格区间 **{grid_l:.3f} ~ {grid_u:.3f}** | "
+                f"间距 **{step:.3f}** (半ATR) | 档位 **{pos}%**处"
+            )
+
+            # Escape / dip scores
+            e_reasons = " + ".join(ts["escape_reasons"]) if ts["escape_reasons"] else "无"
+            d_reasons = " + ".join(ts["dip_reasons"]) if ts["dip_reasons"] else "无"
+            data_lines.append(f"- 🔴 逃顶信号({ts['escape_score']}分): {e_reasons}")
+            data_lines.append(f"- 🟢 抄底信号({ts['dip_score']}分): {d_reasons}")
+
+            # Grid levels compact table
+            levels = ts["grid_levels"]
+            if levels and len(levels) <= 15:
+                data_lines.append(f"- 网格挂单位:")
+                mid = len(levels) // 2
+                half_levels = []
+                for i, lv in enumerate(levels):
+                    mark = f" **→ {lv['price']:.3f} {lv['tag']}**" if lv["tag"] else f" {lv['price']:.3f}"
+                    half_levels.append(mark)
+                    if i >= mid and len(half_levels) >= 8:
+                        break
+                data_lines.append("  " + " |".join(half_levels))
+            elif levels:
+                # Too many levels, show key ones only
+                key_indices = set()
+                for i in range(0, len(levels), max(1, len(levels) // 8)):
+                    key_indices.add(i)
+                # Add current price level
+                for i, lv in enumerate(levels):
+                    if lv["tag"]:
+                        key_indices.add(i)
+                key_levels = [levels[i] for i in sorted(key_indices)]
+                data_lines.append(f"- 网格挂单({len(levels)}档，仅显示关键位):")
+                data_lines.append("  " + " | ".join(
+                    f"{lv['price']:.3f}{' ← ' + lv['tag'] if lv['tag'] else ''}" for lv in key_levels
+                ))
+            data_lines.append("")
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 3. Build LLM prompt (compact)
@@ -1160,9 +1481,27 @@ def generate_evening_review(config: Config) -> Path | None:
     if dragon_tiger_llm:
         llm_lines.append(f"\n{dragon_tiger_llm}")
 
+    # 4.5 交易辅助数据（代码预计算，LLM 解读）
+    if trade_suggestions:
+        llm_lines.append("\n[🎯 交易辅助数据（代码预计算，请据此给出操作建议）]")
+        for ts in trade_suggestions:
+            llm_lines.append(
+                f"  {ts['name']}({ts['code']}): "
+                f"现价{ts['price']:.3f} | "
+                f"网格{ts['grid_lower']:.3f}~{ts['grid_upper']:.3f}(间距{ts['grid_step']:.3f}) | "
+                f"当前在{ts['grid_position']}%位置"
+            )
+            llm_lines.append(
+                f"    逃顶({ts['escape_score']}分): {', '.join(ts['escape_reasons']) if ts['escape_reasons'] else '无信号'}"
+            )
+            llm_lines.append(
+                f"    抄底({ts['dip_score']}分): {', '.join(ts['dip_reasons']) if ts['dip_reasons'] else '无信号'}"
+            )
+            llm_lines.append(f"    综合: {ts['suggestion']}")
+
     llm_lines.append(f"""
 
-请按以下结构生成晚报（约 700 字）：
+请按以下结构生成晚报（约 800 字）：
 
 ### 一、龙虎榜资金动向（简要）
 - 大资金整体取向：偏多/偏空/分歧
@@ -1180,7 +1519,18 @@ def generate_evening_review(config: Config) -> Path | None:
 - **估值水平**：结合 PE/PB 判断贵贱（标注置信度）
 - **核心判断**：一句话结论（如："短期超买，明日有回调需求"）
 
-### 四、明日多情景预案
+### 四、🔧 交易操作建议（每只持仓，核心板块）
+⚠️ 所有价格点已由代码预计算，你不需要自己算价格，直接基于提供的数据给出建议。
+
+对每只持仓，按以下格式输出：
+
+**{{持仓名}}** [当前建议: 参考上方预计算综合标签]
+- 逃顶：是否有逃顶信号？触发什么条件应该减仓？减到多少仓位？置信度[高/中/低]
+- 抄底：是否有抄底信号？什么价位可以试探性建仓/加仓？仓位多少？置信度[高/中/低]
+- 网格：按照预计算的网格区间和间距，给出买卖挂单建议（买单挂在支撑位下方，卖单挂在压力位上方）
+- 止损/止盈：硬止损位（跌破即走），硬止盈位（触及即减仓）
+
+### 五、明日多情景预案
 
 | 情景 | 触发条件 | 应对动作 | 置信度 |
 |------|---------|---------|--------|
@@ -1188,10 +1538,10 @@ def generate_evening_review(config: Config) -> Path | None:
 | 基准 | 平开震荡 | ... | 高 |
 | 悲观 | 低开+放量下跌 | ... | 中 |
 
-### 五、风控红线
-明日每只持仓的硬止损位和硬止盈位（具体价格）。
+### 六、风控红线
+明日每只持仓的硬止损位和硬止盈位（具体价格，可直接引用预计算数据中的支撑/压力位）。
 
-要求：必须使用条件格式（if-then），标注置信度。不输出与持仓无关的市场分析。
+要求：必须使用条件格式（if-then），标注置信度。交易建议必须给出具体的仓位比例和触发价格，不写"适当减仓"这种模糊表述。
 
 ---
 **置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
@@ -1201,7 +1551,7 @@ def generate_evening_review(config: Config) -> Path | None:
 **不确定性处理**：如果数据不足以支持判断，请直接输出"数据不足"而非强行给出结论。""")
 
     # 4. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=2000)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=2500)
     if not llm_content:
         log.warning("Evening review: LLM generation failed")
 

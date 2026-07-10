@@ -132,6 +132,7 @@ def _check_dragon_tiger_holdings(config, holding_codes: set) -> None:
         records = fetch_dragon_tiger_list(max_count=50)
         if not records:
             _dt_cache = {"date": today, "analyses": None}
+            log.debug("龙虎榜持仓检测: 今日数据尚未发布，跳过")
             return
 
         # Consecutive listing detection
@@ -516,7 +517,11 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
             message=alert_summary
         )
 
-        if call_llm and config.llm_enabled and config.deepseek_key:
+        # 有异动时强制调 LLM（即使奇数轮），无异动时维持隔轮调用
+        llm_effective = call_llm
+        if not llm_effective and alerts and config.llm_trigger == "仅异动时":
+            llm_effective = True
+        if llm_effective and config.llm_enabled and config.deepseek_key:
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
 
@@ -526,7 +531,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
             if config.push_enabled and config.sct_sendkey:
                 push_alert(alerts, stats, config, llm_result)
         else:
-            if not call_llm:
+            if not llm_effective:
                 log.info("LLM 跳过（本轮不请求）")
             if config.push_enabled and config.sct_sendkey:
                 push_alert(alerts, stats, config)
@@ -748,16 +753,25 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         )
 
     # LLM analysis (with full alerts + tech data)
+    # 有异动时强制调 LLM（即使奇数轮），无异动时维持隔轮调用
     llm_result = ""
-    if call_llm and config.llm_enabled:
+    should_call_llm = call_llm
+    if not should_call_llm and config.llm_enabled and alerts and config.llm_trigger == "仅异动时":
+        should_call_llm = True  # override: alerts present → analyze now
+    if should_call_llm and config.llm_enabled:
         try:
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
         except Exception as e:
             log.error(f"LLM analysis failed: {e}")
 
-    # Dragon Tiger holdings check (once per day, on first scan)
-    if scan_count == 1:
+    # Dragon Tiger holdings check (once per day, after market close ≥15:30)
+    # 龙虎榜数据通常在 16:30 后发布，盘中无法获取当日数据
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    after_close = now.hour >= 15 and now.minute >= 30
+    if after_close and _dt_cache["date"] != today_str:
+        log.info(f"收盘后触发龙虎榜持仓检测 ({today_str})")
         _check_dragon_tiger_holdings(config, holding_codes)
 
     # Push alerts if enabled (with LLM result for richer notification)
@@ -1007,7 +1021,7 @@ def main() -> None:
             print(f"\n{Color.BOLD}{Color.RED}🐉 龙虎榜深度分析{Color.RESET}")
             print(f"{Color.DIM}正在获取龙虎榜数据并进行席位级分析（约需 10-20 秒）...{Color.RESET}")
             try:
-                from app.dragon_tiger import fetch_dragon_tiger_list, format_dragon_tiger_report, analyze_dragon_tiger, build_llm_context
+                from app.dragon_tiger import fetch_dragon_tiger_list, format_dragon_tiger_report, analyze_dragon_tiger, build_llm_context, analyze_dragon_tiger_llm
                 from app.dragon_seat import analyze_dragon_tiger_seats, generate_seat_report, detect_consecutive_listings
                 import time as _time
 
@@ -1029,12 +1043,13 @@ def main() -> None:
                         relay = f" {Color.YELLOW}{item['relay_note']}{Color.RESET}" if item['relay_note'] else ""
                         print(f"    {item['name']}({item['code']}) 连续{item['consecutive_days']}天{relay}")
 
-                # 3. 生成传统汇总报告
-                summary = analyze_dragon_tiger(records)
+                # 3. 席位级深度分析（只拉取一次，结果复用给汇总+LLM）
+                analyses = analyze_dragon_tiger_seats(records, max_seat_fetch=40)
+
+                # 4. 生成汇总报告（传入席位数据，避免内部重复调用）
+                summary = analyze_dragon_tiger(records, seat_analyses=analyses if analyses else None)
                 report_lines = [format_dragon_tiger_report(summary)]
 
-                # 4. 席位级深度分析
-                analyses = analyze_dragon_tiger_seats(records, max_seat_fetch=40)
                 if analyses:
                     seat_report = generate_seat_report(analyses)
                     report_lines.append("\n---\n")
@@ -1060,6 +1075,29 @@ def main() -> None:
                             print(f"    [{a['quality']}] {a['name']}({a['code']}) "
                                   f"{a['change_pct']:+.1f}% | " +
                                   (f"机构{a['institution_net']/1e4:+.0f}万" if a['institution_net'] else ""))
+                else:
+                    h_alerts = None
+
+                # 4.5. LLM 龙虎榜深度解读
+                if config.dragon_tiger_llm_enabled and config.deepseek_key:
+                    print(f"\n  {Color.DIM}🤖 AI 正在解读龙虎榜数据...{Color.RESET}")
+                    try:
+                        llm_dt = analyze_dragon_tiger_llm(
+                            summary=summary,
+                            config=config,
+                            seat_analyses=analyses if analyses else None,
+                            holdings_alerts=h_alerts,
+                        )
+                        if llm_dt:
+                            report_lines.append("\n---\n")
+                            report_lines.append("## 🤖 AI 龙虎榜深度解读\n")
+                            report_lines.append(llm_dt)
+                            print(f"  {Color.GREEN}✅ AI 解读完成{Color.RESET}")
+                        else:
+                            print(f"  {Color.YELLOW}⚠️ AI 解读生成失败，跳过{Color.RESET}")
+                    except Exception as e:
+                        log.warning(f"LLM 龙虎榜分析异常: {e}")
+                        print(f"  {Color.YELLOW}⚠️ AI 解读异常: {e}{Color.RESET}")
 
                 # 5. 写入报告
                 full_report = "\n".join(report_lines)

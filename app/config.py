@@ -308,6 +308,11 @@ class Config:
         """大模型模型名称"""
         return self._raw.get("大模型分析", {}).get("模型", self.DEFAULT_LLM_MODEL)
 
+    @property
+    def dragon_tiger_llm_enabled(self) -> bool:
+        """龙虎榜 LLM 分析独立开关（不依赖全局 llm_enabled）"""
+        return self._raw.get("龙虎榜AI分析", {}).get("启用", False)
+
     # ---- 推送 ----
 
     @property

@@ -503,6 +503,13 @@ class DragonTigerSummary:
     hot_money_track: list[dict] = field(default_factory=list)
     sector_flow: list[dict] = field(default_factory=list)
     overall_assessment: str = ""
+    abnormal_patterns: list[dict] = field(default_factory=list)
+    sector_divergence: list[dict] = field(default_factory=list)
+    reason_summary: list[dict] = field(default_factory=list)
+    industry_flow: list[dict] = field(default_factory=list)
+    consecutive_listings: list[dict] = field(default_factory=list)
+    tomorrow_watch: list[dict] = field(default_factory=list)
+    total_net_buy: float = 0.0
 
 
 # ============================================================
