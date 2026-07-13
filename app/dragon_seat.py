@@ -299,6 +299,7 @@ def _save_history(records: list, max_days: int = 20):
             "change_pct": r.change_pct,
             "total_trade": r.total_trade,
             "reason": r.reason,
+            "date": today,
         }
         for r in records
     ]
@@ -342,6 +343,9 @@ def detect_consecutive_listings(
             day_records = history.get(date_str, [])
             matched = next((d for d in day_records if d.get("code") == code), None)
             if matched:
+                # 兼容旧历史数据：补上 date 字段
+                if not matched.get("date"):
+                    matched["date"] = date_str
                 past_entries.append(matched)
             else:
                 break  # 不连续了就停
