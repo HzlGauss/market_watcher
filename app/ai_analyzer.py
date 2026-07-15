@@ -34,7 +34,9 @@ def _build_prompt(
             f"- 涨跌分布: {b.up_count}涨 / {b.down_count}跌 / {b.flat_count}平 (共{b.total_count}只)",
             f"- 涨跌比: {b.up_ratio:.0%} → {b.breadth_label}",
             f"- 涨停: {b.limit_up} | 跌停: {b.limit_down} → 情绪: {b.limit_emotion}",
-            f"- 全市场成交: {b.total_amount:.0f}亿 | 主力净流入: {b.main_net_inflow:+.1f}亿",
+            f"- 全市场成交(累计): {b.total_amount:.0f}亿"
+            f" | 估算全天: ~{b.estimated_full_day_amount:.0f}亿"
+            f" | 主力净流入: {b.main_net_inflow:+.1f}亿",
             f"- 参考指数: {b.index_name} {b.index_change_pct:+.2f}% ({b.index_price:.2f})",
             f"- 数据时间: {b.update_time}",
             "",

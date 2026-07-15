@@ -313,6 +313,60 @@ class MarketBreadth:
         """数据是否有效（至少要有基本的涨跌统计）"""
         return self.total_count > 0
 
+    @property
+    def estimated_full_day_amount(self) -> float:
+        """估算全天成交额（亿元），基于当前时段线性外推"""
+        return _estimate_full_day_amount(self.total_amount)
+
+
+def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime | None" = None) -> float:
+    """估算全天成交额（亿元），基于当前时段线性外推
+
+    盘中累计值是当日的，直接给 LLM 会导致每轮都判断"量能不足"。
+    按已流逝交易时间比例外推到全天，收盘后直接返回实际值。
+
+    A股交易时段: 9:30-11:30 (120min) + 13:00-15:00 (120min) = 240min
+    """
+    if cumulative_amount <= 0:
+        return 0.0
+
+    if now is None:
+        from datetime import datetime
+        now = datetime.now()
+
+    # 收盘后 → 实际值
+    if now.hour >= 15:
+        return cumulative_amount
+
+    # 计算已流逝的交易分钟数
+    elapsed = _trading_minutes_elapsed(now)
+    if elapsed <= 0:
+        return cumulative_amount  # 开盘前不推算
+
+    # 线性外推
+    ratio = 240 / elapsed
+    estimated = round(cumulative_amount * ratio, 1)
+    return max(estimated, cumulative_amount)  # 不低于累计值
+
+
+def _trading_minutes_elapsed(t: "datetime.datetime") -> int:
+    """计算当日已流逝的A股交易分钟数"""
+    h, m = t.hour, t.minute
+    if h < 9 or (h == 9 and m < 30):
+        return 0
+    current = h * 60 + m
+    morning_end = 11 * 60 + 30
+    afternoon_start = 13 * 60
+    close = 15 * 60
+
+    if current >= close:
+        return 240
+    if current >= afternoon_start:
+        return 120 + min(current - afternoon_start, 120)
+    if current >= morning_end:
+        return 120
+    return max(current - (9 * 60 + 30), 1)
+
 
 # ============================================================
 # K线与技术分析模型
