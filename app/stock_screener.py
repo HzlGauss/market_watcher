@@ -25,6 +25,16 @@ from app.technical import (
 from app.models import KlineData
 
 
+def _is_near_limit_up(change_pct: float, code: str) -> bool:
+    """判断当日涨幅是否已接近涨停板（追不上了，排除）"""
+    code = str(code).strip()
+    if code.startswith(('300', '301', '688')):
+        return change_pct >= 19.0   # 创业板/科创板 20cm
+    if code.startswith(('8', '4')):
+        return change_pct >= 28.0   # 北交所/三板 30cm
+    return change_pct >= 9.5        # 主板 10cm
+
+
 def _safe_float(val) -> Optional[float]:
     if val is None:
         return None
@@ -60,7 +70,7 @@ class StockCandidate:
         'code', 'name', 'price', 'change_pct', 'volume', 'amount',
         'market_cap', 'pe_ratio', 'decline_20d', 'decline_5d',
         'rsi', 'macd_signal', 'kdj_signal', 'ma_alignment', 'obv_signal',
-        'volume_shrink', 'amplitude_narrow', 'score', 'signals', 'signal_level',
+        'volume_shrink', 'amplitude_narrow', 'path_label', 'score', 'signals', 'signal_level',
     )
 
     def __init__(
@@ -71,7 +81,7 @@ class StockCandidate:
         rsi: Optional[float] = None, macd_signal: str = "",
         kdj_signal: str = "", ma_alignment: str = "", obv_signal: str = "",
         volume_shrink: bool = False, amplitude_narrow: bool = False,
-        score: int = 0, signal_level: str = "",
+        path_label: str = "", score: int = 0, signal_level: str = "",
     ):
         self.code = code
         self.name = name
@@ -90,6 +100,7 @@ class StockCandidate:
         self.obv_signal = obv_signal
         self.volume_shrink = volume_shrink
         self.amplitude_narrow = amplitude_narrow
+        self.path_label = path_label
         self.score = score
         self.signals = []
         self.signal_level = signal_level
@@ -177,7 +188,7 @@ def _get_stock_list(max_stocks: int = 300) -> list[dict]:
             continue
 
         change_pct = _safe_float(row.get('涨跌幅')) or 0
-        if change_pct > 5:
+        if _is_near_limit_up(change_pct, code):
             continue
 
         candidates.append({
@@ -337,7 +348,7 @@ def _fetch_sina_batch_quotes(codes: list[str]) -> list[dict]:
         # 流动性和涨幅过滤
         if not amount or amount < 30_000_000:
             continue
-        if change_pct > 5:
+        if _is_near_limit_up(change_pct, code):
             continue
 
         results.append({
@@ -406,14 +417,17 @@ def _fetch_stock_klines(code: str, days: int = 60) -> list[KlineData]:
 # 第2步：量价筑底特征
 # ============================================================
 
-def _check_price_volume_pattern(klines: list[KlineData]) -> tuple[bool, float, float, bool, bool]:
-    """检查量价筑底特征
+def _check_price_volume_pattern(klines: list[KlineData]) -> tuple[bool, float, float, bool, bool, str]:
+    """检查量价筑底特征（双路径）
+
+    路径1 筑底中：还在下跌/盘整 + 缩量或振幅收敛（磨底阶段）
+    路径2 确认反转：中期明显下跌过 + 近5日止跌反弹 + 量能不萎缩（反转已启动）
 
     Returns:
-        (通过, 近20日跌幅%, 近5日跌幅%, 缩量筑底, 振幅收敛)
+        (通过, 近20日跌幅%, 近5日跌幅%, 缩量筑底, 振幅收敛, 路径标签)
     """
     if len(klines) < 25:
-        return False, 0, 0, False, False
+        return False, 0, 0, False, False, ""
 
     closes = [k.close for k in klines if k.close is not None]
     volumes = [k.volume for k in klines if k.volume is not None]
@@ -421,39 +435,49 @@ def _check_price_volume_pattern(klines: list[KlineData]) -> tuple[bool, float, f
     lows = [k.low for k in klines if k.low is not None]
 
     if len(closes) < 25:
-        return False, 0, 0, False, False
+        return False, 0, 0, False, False, ""
 
-    # 近20日跌幅
+    # 近20日收益率
     if closes[-21] and closes[-21] > 0:
         decline_20d = (closes[-1] - closes[-21]) / closes[-21] * 100
     else:
         decline_20d = 0
 
-    # 排除：20日涨幅 > 8%（不在底部区域）
-    if decline_20d > 8:
-        return False, decline_20d, 0, False, False
+    # 排除：持续上涨中（不是底部）
+    if decline_20d > 12:
+        return False, decline_20d, 0, False, False, ""
 
-    # 近5日跌幅
+    # 近5日收益率
     if closes[-6] and closes[-6] > 0:
         decline_5d = (closes[-1] - closes[-6]) / closes[-6] * 100
     else:
         decline_5d = 0
 
-    # 缩量筑底
+    # 成交量统计
     vol_5d_avg = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
     vol_20d_avg = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
     volume_shrink = vol_5d_avg < vol_20d_avg * 0.7 if vol_20d_avg > 0 else False
+    vol_rising = vol_5d_avg >= vol_20d_avg * 0.5 if vol_20d_avg > 0 else False
 
-    # 振幅收敛
+    # 振幅
     amps_5d = [(h - l) / c for h, l, c in zip(highs[-5:], lows[-5:], closes[-5:]) if c and c > 0]
     amps_20d = [(h - l) / c for h, l, c in zip(highs[-20:], lows[-20:], closes[-20:]) if c and c > 0]
     amp_5d = sum(amps_5d) / len(amps_5d) if amps_5d else 0
     amp_20d = sum(amps_20d) / len(amps_20d) if amps_20d else 1
     amplitude_narrow = amp_5d < amp_20d * 0.7 if amp_20d > 0 else False
 
-    # 通过条件：下跌/回调中 + (缩量 或 振幅收敛)
-    passed = (decline_20d < 2 or decline_5d < 0) and (volume_shrink or amplitude_narrow)
-    return passed, decline_20d, decline_5d, volume_shrink, amplitude_narrow
+    # ---- 路径1: 筑底中 ----
+    path1 = (decline_20d < 2 or decline_5d < 0) and (volume_shrink or amplitude_narrow)
+
+    # ---- 路径2: 确认反转（中期跌过 + 近5日回升 + 量能不萎缩） ----
+    # 个股反弹幅度放宽到 12%（主板一个板 = 10%）
+    path2 = (decline_20d <= -5 and 0 < decline_5d <= 12 and vol_rising)
+
+    if path1:
+        return True, decline_20d, decline_5d, volume_shrink, amplitude_narrow, "筑底中"
+    if path2:
+        return True, decline_20d, decline_5d, volume_shrink, amplitude_narrow, "确认反转"
+    return False, decline_20d, decline_5d, volume_shrink, amplitude_narrow, ""
 
 
 # ============================================================
@@ -608,7 +632,7 @@ def screen_stock_bottom_reversal(
             continue
 
         # 第2步：量价特征
-        passed, dec_20d, dec_5d, vol_shrink, amp_narrow = _check_price_volume_pattern(klines)
+        passed, dec_20d, dec_5d, vol_shrink, amp_narrow, path_label = _check_price_volume_pattern(klines)
         if not passed:
             continue
         passed_stage2 += 1
@@ -630,6 +654,7 @@ def screen_stock_bottom_reversal(
             obv_signal=indicators.get('obv_signal', ''),
             volume_shrink=vol_shrink,
             amplitude_narrow=amp_narrow,
+            path_label=path_label,
             score=score,
             signal_level=_determine_level(score, signals),
         )
@@ -693,10 +718,10 @@ def generate_stock_screen_report(
             continue
         lines.append(f"## {stars} {label} ({len(group)}只)")
         lines.append("")
-        lines.append("| # | 代码 | 名称 | 现价 | 涨跌 | 20日跌 | 市值 | "
-                     "成交额 | PE | RSI | MACD | KDJ | 均线 | OBV | 得分 |")
-        lines.append("| ---: | --- | --- | ---: | ---: | ---: | ---: | "
-                     "---: | ---: | ---: | --- | --- | --- | --- | ---: |")
+        lines.append("| # | 代码 | 名称 | 现价 | 涨跌 | 20日跌 | 5日跌 | 市值 | "
+                     "成交额 | PE | RSI | MACD | KDJ | 均线 | OBV | 路径 | 得分 |")
+        lines.append("| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | "
+                     "---: | ---: | ---: | --- | --- | --- | --- | --- | ---: |")
 
         for i, c in enumerate(group, 1):
             chg = f"{c.change_pct:+.2f}%" if c.change_pct else "--"
@@ -705,10 +730,10 @@ def generate_stock_screen_report(
             mcap_str = f"{c.market_cap_yi:.0f}亿" if c.market_cap > 0 else "--"
             lines.append(
                 f"| {i} | {c.code} | {c.name} | {c.price:.2f} | {chg} | "
-                f"{c.decline_20d:+.1f}% | {mcap_str} | "
+                f"{c.decline_20d:+.1f}% | {c.decline_5d:+.1f}% | {mcap_str} | "
                 f"{c.amount_yi:.1f}亿 | {pe_str} | {rsi_str} | {c.macd_signal} | "
                 f"{c.kdj_signal} | {c.ma_alignment} | {c.obv_signal} | "
-                f"{c.score} |"
+                f"{c.path_label or '--'} | {c.score} |"
             )
         lines.append("")
         lines.append("**触发信号**:")
