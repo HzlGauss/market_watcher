@@ -831,10 +831,9 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
     # Start T+0 monitor thread if enabled
     t0_thread = None
     if hasattr(config, 't0_enabled') and config.t0_enabled:
-        enable_push = getattr(config, 't0_push_enabled', False)
         t0_interval = getattr(config, 't0_interval', 30)
         t0_thread = T0MonitorThread(monitor_items, data_pool, interval=t0_interval,
-                                    enable_sound=True, enable_push=enable_push)
+                                    enable_sound=True, enable_push=False)
         t0_thread.start()
 
     # Wait for initial data to be ready (up to 10 seconds)
