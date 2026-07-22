@@ -31,7 +31,8 @@ class T0Signal:
 
     def __init__(self, code: str, name: str, signal_type: str, reason: str,
                  price: float, support: float, resistance: float,
-                 risk_reward: float = 0.0):
+                 risk_reward: float = 0.0,
+                 buy_price: float = 0.0, sell_price: float = 0.0):
         self.code = code
         self.name = name
         self.signal_type = signal_type
@@ -40,6 +41,8 @@ class T0Signal:
         self.support = support
         self.resistance = resistance
         self.risk_reward = risk_reward  # 盈亏比
+        self.buy_price = buy_price      # 建议买入挂单价
+        self.sell_price = sell_price    # 建议卖出挂单价
         self.timestamp = time.time()
 
     @property
@@ -66,6 +69,42 @@ class T0Signal:
     def __repr__(self):
         return (f"T0Signal(code={self.code}, type={self.signal_type}, "
                 f"reason={self.reason}, RR={self.risk_reward:.1f})")
+
+
+def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
+    """计算做T的买入/卖出挂单建议价格
+
+    买入挂单价: 取下面最近的支撑/筹码峰/日内低点，上方留ATR/4缓冲（避免挂太低不成交）
+    卖出挂单价: 取上面最近的压力/筹码峰/日内高点，下方留ATR/4缓冲（避免挂太高不成交）
+
+    Returns:
+        {"buy_price": float, "sell_price": float}
+    """
+    support = sr.support or price
+    resistance = sr.resistance or price
+    clusters = sr.volume_clusters or []
+    atr = sr.atr or price * 0.005
+
+    # ---- 买入挂单价 ----
+    buy_refs = [support] + [c for c in clusters if c < price]
+    if quote.low:
+        buy_refs.append(quote.low)
+    nearest_below = max(c for c in buy_refs if c < price) if any(c < price for c in buy_refs) else support
+    buy_p = nearest_below + atr / 4
+    buy_p = min(buy_p, price)  # 不高于现价
+
+    # ---- 卖出挂单价 ----
+    sell_refs = [resistance] + [c for c in clusters if c > price]
+    if quote.high:
+        sell_refs.append(quote.high)
+    nearest_above = min(c for c in sell_refs if c > price) if any(c > price for c in sell_refs) else resistance
+    sell_p = nearest_above - atr / 4
+    sell_p = max(sell_p, price)  # 不低于现价
+
+    return {
+        "buy_price": round(buy_p, 3),
+        "sell_price": round(sell_p, 3),
+    }
 
 
 class T0MonitorThread(threading.Thread):
@@ -221,11 +260,21 @@ class T0MonitorThread(threading.Thread):
         if range_width < min_width:
             return None
 
+        # 日内振幅检查：太小无利润空间，跳过
+        intrabar = self._calc_intraday_bias(quote)
+        if intrabar is None:
+            return None
+        if intrabar["amplitude_low"]:
+            return None
+
+        # 计算建议挂单价格
+        suggested = _compute_suggested_prices(sr, price, quote)
+
         # 判断买入信号
-        buy_reasons = self._check_buy_conditions(quote, tech, sr, price, risk_reward)
+        buy_reasons = self._check_buy_conditions(quote, tech, sr, price, risk_reward, intrabar)
 
         # 判断卖出信号
-        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, risk_reward)
+        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, risk_reward, intrabar)
 
         if buy_reasons:
             reason = "; ".join(buy_reasons)
@@ -235,6 +284,8 @@ class T0MonitorThread(threading.Thread):
                 reason=reason, price=price,
                 support=sr.support, resistance=sr.resistance,
                 risk_reward=risk_reward,
+                buy_price=suggested["buy_price"],
+                sell_price=suggested["sell_price"],
             )
 
         if sell_reasons:
@@ -245,6 +296,8 @@ class T0MonitorThread(threading.Thread):
                 reason=reason, price=price,
                 support=sr.support, resistance=sr.resistance,
                 risk_reward=risk_reward,
+                buy_price=suggested["buy_price"],
+                sell_price=suggested["sell_price"],
             )
 
         return None
@@ -256,9 +309,30 @@ class T0MonitorThread(threading.Thread):
             return round(bid_vol / ask_vol, 2)
         return None
 
+    @staticmethod
+    def _calc_intraday_bias(quote: Quote) -> Optional[dict]:
+        """计算日内位置与振幅"""
+        if not (quote.high and quote.low and quote.price and quote.pre_close):
+            return None
+        day_range = quote.high - quote.low
+        if day_range <= 0:
+            return None
+        position = (quote.price - quote.low) / day_range * 100
+        amplitude = day_range / quote.pre_close * 100
+        is_etf = quote.type and "ETF" in quote.type
+        min_amp = 0.8 if is_etf else 1.5
+        return {
+            "position": round(position, 1),
+            "amplitude": round(amplitude, 2),
+            "amplitude_low": amplitude < min_amp,
+            "below_open": quote.open is not None and quote.price < quote.open,
+            "above_open": quote.open is not None and quote.price > quote.open,
+        }
+
     def _check_buy_conditions(self, quote: Quote, tech: TechnicalSummary,
-                              sr, price: float, risk_reward: float) -> List[str]:
-        """检查买入条件（5分钟级别指标 + 内外盘/委比资金信号）"""
+                              sr, price: float, risk_reward: float,
+                              intrabar: dict) -> List[str]:
+        """检查买入条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
         # 条件1：股价接近支撑位（1%以内）
@@ -291,6 +365,34 @@ class T0MonitorThread(threading.Thread):
         if bs_ratio and bs_ratio > 1.4:
             reasons.append(f"外盘优势(x{bs_ratio})")
 
+        # 条件8：MA20乖离（现价低于MA20，均值回归做多）
+        if tech.ma20 and price < tech.ma20:
+            deviation = (price - tech.ma20) / tech.ma20 * 100
+            if deviation <= -1.5:
+                reasons.append(f"MA20乖离({deviation:.1f}%)")
+
+        # 条件9：MA20趋势向上（MA20 > MA60，中长线偏多）
+        if tech.ma20 and tech.ma60 and tech.ma20 > tech.ma60:
+            reasons.append("MA20>MA60(偏多)")
+
+        # 条件10：筹码峰支撑（现价接近下方密集成交区，资金成本线托底）
+        clusters = sr.volume_clusters or []
+        nearby_below = [c for c in clusters if c < price and price <= c * 1.02]
+        if nearby_below:
+            reasons.append(f"筹码支撑({max(nearby_below):.2f})")
+
+        # 条件11：日内低位（现价接近今日最低点）
+        if intrabar["position"] <= 30:
+            reasons.append(f"日内低位({intrabar['position']:.0f}%)")
+
+        # 条件12：低于开盘（日内偏弱接近支撑，可能反弹）
+        if intrabar.get("below_open") and intrabar["position"] <= 50:
+            reasons.append("低于开盘(弱转强)")
+
+        # 条件13：振幅充裕（波动空间大，做T利润高）
+        if intrabar["amplitude"] >= 2.5:
+            reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
+
         # ---- 背离加分：接近支撑 + 外盘>内盘 = 隐藏吸筹 ----
         has_divergence = near_support and bs_ratio and bs_ratio > 1.0
         if has_divergence and len(reasons) < 2:
@@ -303,8 +405,9 @@ class T0MonitorThread(threading.Thread):
         return reasons if len(reasons) >= min_conditions else []
 
     def _check_sell_conditions(self, quote: Quote, tech: TechnicalSummary,
-                               sr, price: float, risk_reward: float) -> List[str]:
-        """检查卖出条件（5分钟级别指标 + 内外盘/委比资金信号）"""
+                               sr, price: float, risk_reward: float,
+                               intrabar: dict) -> List[str]:
+        """检查卖出条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
         # 条件1：股价接近压力位（1%以内）
@@ -336,6 +439,34 @@ class T0MonitorThread(threading.Thread):
         bs_ratio = self._calc_buy_sell_ratio(quote.bid_volume, quote.ask_volume)
         if bs_ratio and bs_ratio < 1 / 1.4:  # 等价于 ask/bid > 1.4
             reasons.append(f"内盘优势(x{1/bs_ratio:.1f})")
+
+        # 条件8：MA20乖离（现价高于MA20，均值回归做空）
+        if tech.ma20 and price > tech.ma20:
+            deviation = (price - tech.ma20) / tech.ma20 * 100
+            if deviation >= 1.5:
+                reasons.append(f"MA20乖离(+{deviation:.1f}%)")
+
+        # 条件9：MA20趋势向下（MA20 < MA60，中长线偏空）
+        if tech.ma20 and tech.ma60 and tech.ma20 < tech.ma60:
+            reasons.append("MA20<MA60(偏空)")
+
+        # 条件10：筹码峰压力（现价接近上方密集成交区，套牢盘抛压）
+        clusters = sr.volume_clusters or []
+        nearby_above = [c for c in clusters if c > price and c * 0.98 <= price]
+        if nearby_above:
+            reasons.append(f"筹码压力({min(nearby_above):.2f})")
+
+        # 条件11：日内高位（现价接近今日最高点）
+        if intrabar["position"] >= 70:
+            reasons.append(f"日内高位({intrabar['position']:.0f}%)")
+
+        # 条件12：高于开盘（日内偏强接近压力，可能回落）
+        if intrabar.get("above_open") and intrabar["position"] >= 50:
+            reasons.append("高于开盘(强转弱)")
+
+        # 条件13：振幅充裕（波动空间大，做T利润高）
+        if intrabar["amplitude"] >= 2.0:
+            reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
 
         # ---- 背离加分：接近压力 + 内盘>外盘 = 隐藏出货 ----
         has_divergence = near_resistance and bs_ratio and bs_ratio < 1.0
@@ -393,31 +524,37 @@ class T0MonitorThread(threading.Thread):
             return ""
 
         name_w = max(len(f"{s.name}({s.code})") for s in filtered) + 2
-        price_w = 10
+        price_w = 8
+        suggest_w = 8
         ref_w = 10
         rr_w = 8
-        reason_w = 56
+        reason_w = 48
 
-        sep = f"  {'─' * (name_w + price_w + ref_w + rr_w + reason_w + 9)}"
+        sep = f"  {'─' * (name_w + price_w + suggest_w + ref_w + rr_w + reason_w + 11)}"
 
         rows = [sep, f"  {label}"]
-        header = (f"  │ {'标的':<{name_w-2}} │ {'当前价':>{price_w-2}} │ "
-                  f"{'支撑/压力':>{ref_w-4}} │ {'盈亏比':>{rr_w-2}} │ 触发条件")
+        header = (f"  │ {'标的':<{name_w-2}} │ {'现价':>{price_w-2}} │ "
+                  f"{'挂单':>{suggest_w-2}} │ {'支撑/压力':>{ref_w-4}} │ "
+                  f"{'RR':>{rr_w-2}} │ 触发条件")
         rows.append(header)
         rows.append(sep)
 
         for s in filtered:
             ref_label = "支撑" if signal_type == T0Signal.SIGNAL_BUY else "压力"
             ref_val = s.support if signal_type == T0Signal.SIGNAL_BUY else s.resistance
+            suggest_val = s.buy_price if signal_type == T0Signal.SIGNAL_BUY else s.sell_price
             name_col = f"{s.name}({s.code})"
             rr_str = f"{s.risk_reward:.1f}x" if s.risk_reward > 0 else "--"
             if s.risk_reward >= 2.0:
                 rr_str = f"⭐{rr_str}"
             elif s.risk_reward < 1.2 and s.risk_reward > 0:
                 rr_str = f"⚠️{rr_str}"
+            suggest_str = f"{suggest_val:.2f}" if suggest_val > 0 else "--"
             rows.append(
                 f"  │ {name_col:<{name_w-2}} │ {s.price:>{price_w-2}.2f} │ "
-                f"{ref_label}{ref_val:>{ref_w-4}.2f} │ {rr_str:>{rr_w-2}} │ {s.reason}"
+                f"{suggest_str:>{suggest_w-2}} │ "
+                f"{ref_label}{ref_val:>{ref_w-4}.2f} │ "
+                f"{rr_str:>{rr_w-2}} │ {s.reason}"
             )
         rows.append(sep)
         return "\n".join(rows)
@@ -471,24 +608,26 @@ class T0MonitorThread(threading.Thread):
 
         if buys:
             lines.append("## 🟢 买入信号\n")
-            lines.append("| 标的 | 当前价 | 支撑位 | 盈亏比 | 触发条件 |")
-            lines.append("| --- | ---: | ---: | ---: | --- |")
+            lines.append("| 标的 | 现价 | 挂单买入 | 支撑位 | 盈亏比 | 触发条件 |")
+            lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
             for s in buys:
                 rr_str = f"{s.risk_reward:.1f}x ({s.rr_quality})"
+                buy_str = f"{s.buy_price:.2f}" if s.buy_price > 0 else "--"
                 lines.append(
-                    f"| {s.name}({s.code}) | {s.price:.2f} | {s.support:.2f} "
-                    f"| {rr_str} | {s.reason} |")
+                    f"| {s.name}({s.code}) | {s.price:.2f} | {buy_str} | "
+                    f"{s.support:.2f} | {rr_str} | {s.reason} |")
             lines.append("")
 
         if sells:
             lines.append("## 🔴 卖出信号\n")
-            lines.append("| 标的 | 当前价 | 压力位 | 盈亏比 | 触发条件 |")
-            lines.append("| --- | ---: | ---: | ---: | --- |")
+            lines.append("| 标的 | 现价 | 挂单卖出 | 压力位 | 盈亏比 | 触发条件 |")
+            lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
             for s in sells:
                 rr_str = f"{s.risk_reward:.1f}x ({s.rr_quality})"
+                sell_str = f"{s.sell_price:.2f}" if s.sell_price > 0 else "--"
                 lines.append(
-                    f"| {s.name}({s.code}) | {s.price:.2f} | {s.resistance:.2f} "
-                    f"| {rr_str} | {s.reason} |")
+                    f"| {s.name}({s.code}) | {s.price:.2f} | {sell_str} | "
+                    f"{s.resistance:.2f} | {rr_str} | {s.reason} |")
             lines.append("")
 
         weak_signals = [s for s in signals if s.is_weak]
