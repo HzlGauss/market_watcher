@@ -1230,6 +1230,29 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
     elif ma.alignment == "空头反弹":
         signals.append("均线空头反弹(反压中)")
 
+    # ---- 跳空缺口检测 ----
+    gap = detect_gap(klines, quote.price or 0, quote.open or 0)
+    if gap.has_gap:
+        if gap.gap_type == "向上跳空":
+            if gap.is_filled:
+                signals.append(f"向上跳空{gap.gap_pct:+.1f}%(已回补)")
+            elif gap.filled_pct >= 30:
+                signals.append(f"向上跳空{gap.gap_pct:+.1f}%(回补{gap.filled_pct:.0f}%)")
+            else:
+                signals.append(f"向上跳空{gap.gap_pct:+.1f}%(未回补)")
+        else:
+            if gap.is_filled:
+                signals.append(f"向下跳空{gap.gap_pct:+.1f}%(已回补)")
+            elif gap.filled_pct >= 30:
+                signals.append(f"向下跳空{gap.gap_pct:+.1f}%(回补{gap.filled_pct:.0f}%)")
+            else:
+                signals.append(f"向下跳空{gap.gap_pct:+.1f}%(未回补)")
+
+    # ---- 关键位突破检测 ----
+    breakout = check_key_level_breakout(klines, quote.price or 0, period=20)
+    if breakout.has_breakout:
+        signals.append(breakout.detail)
+
     return TechnicalSummary(
         rsi=rsi,
         rsi_signal=rsi_signal(rsi),
@@ -1261,5 +1284,174 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         ma60=ma.ma60,
         ma_alignment=ma.alignment,
         ma_alignment_detail=ma.detail,
+        has_gap=gap.has_gap,
+        gap_type=gap.gap_type,
+        gap_pct=gap.gap_pct,
+        gap_detail=gap.detail,
+        gap_filled_pct=gap.filled_pct,
+        breakout_type=breakout.breakout_type,
+        breakout_detail=breakout.detail,
         signals=signals,
     )
+
+
+# ============================================================
+# 跳空缺口 & 关键位突破分析
+# ============================================================
+
+@dataclass
+class GapInfo:
+    """跳空缺口信息"""
+    has_gap: bool = False
+    gap_type: str = ""          # "向上跳空" / "向下跳空" / ""
+    gap_pct: float = 0.0        # 跳空幅度(%)
+    gap_upper: float = 0.0      # 缺口上沿 = max(今开, 昨收)
+    gap_lower: float = 0.0      # 缺口下沿 = min(今开, 昨收)
+    gap_size: float = 0.0       # 缺口宽度(绝对值)
+    filled_pct: float = 0.0     # 回补进度(0-100%)
+    is_filled: bool = False     # 是否已完全回补
+    detail: str = ""
+
+
+def detect_gap(klines: list[KlineData], current_price: float, current_open: float) -> GapInfo:
+    """检测今日是否存在跳空缺口并计算回补进度
+
+    判断逻辑：
+    - 今日开盘价 vs 昨日收盘价
+    - 向上跳空: 今开 > 昨收（缺口区间 = 昨收 ~ 今开）
+    - 向下跳空: 今开 < 昨收（缺口区间 = 今开 ~ 昨收）
+
+    Args:
+        klines: K线数据（至少2根，最后一根为今日）
+        current_price: 当前价格
+        current_open: 今日开盘价
+
+    Returns:
+        GapInfo 对象
+    """
+    if len(klines) < 2 or current_open <= 0:
+        return GapInfo()
+
+    yesterday = klines[-2]
+    if yesterday.close is None or yesterday.close <= 0:
+        return GapInfo()
+
+    prev_close = yesterday.close
+    gap_pct = (current_open - prev_close) / prev_close * 100
+
+    info = GapInfo()
+
+    if gap_pct >= 0.5:  # 向上跳空 ≥ 0.5%
+        info.gap_type = "向上跳空"
+        info.gap_lower = prev_close
+        info.gap_upper = current_open
+        info.gap_size = current_open - prev_close
+        info.gap_pct = round(gap_pct, 2)
+        info.has_gap = True
+    elif gap_pct <= -0.5:  # 向下跳空 ≥ 0.5%
+        info.gap_type = "向下跳空"
+        info.gap_lower = current_open
+        info.gap_upper = prev_close
+        info.gap_size = prev_close - current_open
+        info.gap_pct = round(gap_pct, 2)
+        info.has_gap = True
+    else:
+        return info
+
+    # 计算回补进度
+    if info.has_gap and current_price > 0:
+        if info.gap_type == "向上跳空":
+            # 现价越接近缺口下沿(昨收)，回补越多
+            if current_price <= info.gap_lower:
+                info.filled_pct = 100.0
+                info.is_filled = True
+            else:
+                filled = (info.gap_upper - current_price) / info.gap_size * 100
+                info.filled_pct = round(max(0, filled), 1)
+            info.detail = (
+                f"{info.gap_type} {info.gap_pct:+.1f}% "
+                f"(缺口{info.gap_lower:.2f}~{info.gap_upper:.2f}), "
+                f"回补{info.filled_pct:.0f}%"
+            )
+        else:  # 向下跳空
+            if current_price >= info.gap_upper:
+                info.filled_pct = 100.0
+                info.is_filled = True
+            else:
+                filled = (current_price - info.gap_lower) / info.gap_size * 100
+                info.filled_pct = round(max(0, filled), 1)
+            info.detail = (
+                f"{info.gap_type} {info.gap_pct:+.1f}% "
+                f"(缺口{info.gap_lower:.2f}~{info.gap_upper:.2f}), "
+                f"回补{info.filled_pct:.0f}%"
+            )
+
+    return info
+
+
+@dataclass
+class BreakoutInfo:
+    """关键位突破信息"""
+    has_breakout: bool = False
+    breakout_type: str = ""     # "突破近期高点" / "跌破近期低点" / ""
+    level: float = 0.0          # 被突破的关键价位
+    level_desc: str = ""        # 关键位描述（如"N日最高"）
+    detail: str = ""
+
+
+def check_key_level_breakout(
+    klines: list[KlineData],
+    current_price: float,
+    period: int = 20,
+) -> BreakoutInfo:
+    """检查当前价是否突破近期关键高低点
+
+    检测：
+    - 突破 N 日最高点（看多信号）
+    - 跌破 N 日最低点（看空信号）
+
+    Args:
+        klines: K线数据（不含今日，或今日为非最后一根）
+        current_price: 当前价格
+        period: 回看天数
+
+    Returns:
+        BreakoutInfo 对象
+    """
+    if len(klines) < period or current_price <= 0:
+        return BreakoutInfo()
+
+    # 取最近 N 日（不含今日）的 K 线
+    window = klines[-period-1:-1] if len(klines) > period else klines[:-1]
+    if len(window) < 5:
+        return BreakoutInfo()
+
+    highs = [k.high for k in window if k.high is not None]
+    lows = [k.low for k in window if k.low is not None]
+    if not highs or not lows:
+        return BreakoutInfo()
+
+    period_high = max(highs)
+    period_low = min(lows)
+    n_days = len(window)
+
+    info = BreakoutInfo()
+
+    if current_price > period_high:
+        info.has_breakout = True
+        info.breakout_type = "突破近期高点"
+        info.level = period_high
+        info.level_desc = f"{n_days}日最高"
+        info.detail = (
+            f"当前价{current_price:.2f}突破{n_days}日高点{period_high:.2f}"
+        )
+    elif current_price < period_low:
+        info.has_breakout = True
+        info.breakout_type = "跌破近期低点"
+        info.level = period_low
+        info.level_desc = f"{n_days}日最低"
+        info.detail = (
+            f"当前价{current_price:.2f}跌破{n_days}日低点{period_low:.2f}"
+        )
+
+    return info

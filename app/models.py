@@ -416,6 +416,13 @@ class TechnicalSummary:
     ma60: Optional[float] = None
     ma_alignment: str = ""  # 多头排列 / 空头排列 / 缠绕 / 多头回调 / 空头反弹 / 数据不足
     ma_alignment_detail: str = ""
+    has_gap: bool = False
+    gap_type: str = ""      # "向上跳空" / "向下跳空" / ""
+    gap_pct: float = 0.0
+    gap_detail: str = ""
+    gap_filled_pct: float = 0.0
+    breakout_type: str = ""  # "突破近期高点" / "跌破近期低点" / ""
+    breakout_detail: str = ""
     signals: list[str] = field(default_factory=list)
 
 

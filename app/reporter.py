@@ -19,6 +19,7 @@ from app.dragon_tiger import (
     analyze_dragon_tiger,
     format_dragon_tiger_report,
     build_llm_context,
+    _format_money,
 )
 
 
@@ -175,6 +176,8 @@ def _get_holdings_tech_analysis(
         calc_kdj,
         calc_obv,
         rsi_signal,
+        detect_gap,
+        check_key_level_breakout,
     )
     from concurrent.futures import ThreadPoolExecutor
 
@@ -195,6 +198,10 @@ def _get_holdings_tech_analysis(
 
         # 量价关系
         vol_price = analyze_volume_price(quote, klines)
+
+        # 跳空缺口 & 关键位突破
+        gap = detect_gap(klines, quote.price or 0, quote.open or 0)
+        breakout = check_key_level_breakout(klines, quote.price or 0, period=20)
 
         # 技术指标
         closes = [k.close for k in klines if k.close is not None]
@@ -245,6 +252,14 @@ def _get_holdings_tech_analysis(
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
             "volume_clusters": sr.volume_clusters,
+            # 跳空缺口 & 关键位突破
+            "has_gap": gap.has_gap,
+            "gap_type": gap.gap_type,
+            "gap_pct": gap.gap_pct,
+            "gap_detail": gap.detail,
+            "gap_filled_pct": gap.filled_pct,
+            "breakout_type": breakout.breakout_type,
+            "breakout_detail": breakout.detail,
         }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -399,6 +414,12 @@ def generate_morning_brief(config: Config) -> Path | None:
                     for sig_text in s['signals']:
                         data_lines.append(f"  - {s['name']}: {sig_text}")
 
+    # 主力资金动向（昨日参考）
+    fund_md, fund_llm = _format_fund_flow_section(quotes, label="自选")
+    if fund_md:
+        data_lines.append(f"\n## 六、💰 主力资金动向（昨收参考）")
+        data_lines.append(fund_md)
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 4. Fetch technical analysis for holdings (for LLM prompt)
@@ -478,6 +499,9 @@ def generate_morning_brief(config: Config) -> Path | None:
         for s in strategy_signals:
             for sig_text in s['signals']:
                 llm_lines.append(f"  {s['name']}: {sig_text}")
+
+    if fund_llm:
+        llm_lines.append(f"\n{fund_llm}")
 
     llm_lines.append(f"""
 
@@ -634,6 +658,12 @@ def generate_midday_review(config: Config) -> Path | None:
             for sig_text in s['signals']:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
 
+    # 主力资金流向
+    fund_md_mid, fund_llm_mid = _format_fund_flow_section(quotes, label="自选")
+    if fund_md_mid:
+        data_lines.append(f"\n## 七、💰 主力资金动向")
+        data_lines.append(fund_md_mid)
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 3. Build LLM prompt (compact)
@@ -706,6 +736,9 @@ def generate_midday_review(config: Config) -> Path | None:
             for sig_text in s['signals']:
                 llm_lines.append(f"  {s['name']}: {sig_text}")
 
+    if fund_llm_mid:
+        llm_lines.append(f"\n{fund_llm_mid}")
+
     llm_lines.append(f"""
 
 请作为资深策略分析师，基于以上午盘数据，生成一份结构清晰的午评报告（约500字）：
@@ -748,6 +781,111 @@ def generate_midday_review(config: Config) -> Path | None:
 # ============================================================
 # Evening Review 16:00
 # ============================================================
+
+def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") -> tuple[str, str]:
+    """生成主力资金流向摘要，返回 (数据区Markdown, LLM紧凑文本)
+
+    汇总主力净流入/流出情况，标注重点关注标的。
+    """
+    has_flow = [q for q in quotes if q.main_net_inflow is not None and q.amount and q.amount > 0]
+    if not has_flow:
+        return "", ""
+
+    # 按主力净流入占比排序
+    scored = []
+    total_inflow = 0.0
+    for q in has_flow:
+        pct = q.main_net_inflow / q.amount * 100  # type: ignore[operator]
+        total_inflow += q.main_net_inflow  # type: ignore[operator]
+        scored.append((q, pct))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    # ---- Markdown 数据区 ----
+    md_lines = [f"### 💰 {label}主力资金流向"]
+    md_lines.append("")
+    md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 信号 |")
+    md_lines.append("|------|--------|-----------|---------|------|")
+
+    top_in = scored[:3]
+    top_out = sorted(scored, key=lambda x: x[1])[:3]
+
+    for q, pct in scored[:8]:
+        chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
+        inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
+        if pct >= 15:
+            sig = "🔵 大幅流入"
+        elif pct >= 5:
+            sig = "🟢 流入"
+        elif pct <= -10:
+            sig = "🔴 大幅流出"
+        elif pct <= -5:
+            sig = "🟠 流出"
+        else:
+            sig = "⚪ 中性"
+        md_lines.append(f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% | {sig} |")
+
+    if total_inflow >= 1e8:
+        direction = "净流入" if total_inflow > 0 else "净流出"
+        md_lines.append(f"\n> 合计主力资金: **{direction} {abs(total_inflow)/1e8:.2f}亿**")
+    elif abs(total_inflow) >= 1e6:
+        direction = "净流入" if total_inflow > 0 else "净流出"
+        md_lines.append(f"\n> 合计主力资金: **{direction} {abs(total_inflow)/1e4:.0f}万**")
+
+    md = "\n".join(md_lines) + "\n"
+
+    # ---- LLM 紧凑文本 ----
+    llm_parts = [f"[{label}主力资金]"]
+    if total_inflow >= 1e8:
+        direction = "净流入" if total_inflow > 0 else "净流出"
+        llm_parts.append(f"合计{direction}{abs(total_inflow)/1e8:.2f}亿")
+    top_in_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_in)
+    top_out_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_out)
+    llm_parts.append(f"流入前3: {top_in_str}")
+    llm_parts.append(f"流出前3: {top_out_str}")
+
+    return md, "\n".join(llm_parts)
+
+
+def _format_gap_breakout_section(tech_data: list[dict]) -> tuple[str, str]:
+    """生成跳空缺口/关键位突破摘要，返回 (数据区Markdown, LLM紧凑文本)"""
+    gaps = [t for t in tech_data if t.get("has_gap")]
+    breakouts = [t for t in tech_data if t.get("breakout_type")]
+
+    if not gaps and not breakouts:
+        return "", ""
+
+    md_lines = []
+    llm_parts = []
+
+    if gaps:
+        md_lines.append("#### 🔲 跳空缺口")
+        md_lines.append("| 标的 | 类型 | 幅度 | 缺口区间 | 回补 |")
+        md_lines.append("|------|------|-----|---------|------|")
+        for t in gaps:
+            name = t["name"]
+            code = t["code"]
+            gp = t.get("gap_pct", 0)
+            gd = t.get("gap_detail", "")
+            filled = f"{t.get('gap_filled_pct', 0):.0f}%"
+            if t.get("gap_filled_pct", 0) >= 100:
+                filled = "✅ 已回补"
+            # Parse gap range from detail
+            md_lines.append(f"| {name}({code}) | {t.get('gap_type', '')} | {gp:+.1f}% | {gd[:40]} | {filled} |")
+        md_lines.append("")
+        gap_list = [f"{t['name']}({t.get('gap_pct',0):+.1f}%,回补{t.get('gap_filled_pct',0):.0f}%)" for t in gaps[:3]]
+        llm_parts.append(f"[跳空] {' '.join(gap_list)}")
+
+    if breakouts:
+        md_lines.append("#### 🎯 关键位突破")
+        md_lines.append("")
+        for t in breakouts:
+            md_lines.append(f"- **{t['name']}**({t['code']}): {t.get('breakout_detail', '')}")
+        md_lines.append("")
+        bo_list = [f"{t['name']}({t.get('breakout_type','')})" for t in breakouts[:3]]
+        llm_parts.append(f"[突破] {' '.join(bo_list)}")
+
+    return "\n".join(md_lines) + "\n", "\n".join(llm_parts)
+
 
 def _simple_attribution(h_results: list[dict], market_return: float | None) -> dict:
     """简单的持仓归因：将持仓收益拆解为 β（市场）和 α（选股）部分
@@ -1126,6 +1264,57 @@ def _compute_trading_suggestions(
             suggestion = "⚪ 多空博弈"
             priority = 0
 
+        # ---- 5. 止盈/止损价（代码计算 + 理由） ----
+        stop_loss = 0.0
+        stop_loss_reason = ""
+        take_profit = 0.0
+        take_profit_reason = ""
+
+        # 止损价：找下方最近的有效支撑
+        below_refs = [(s, "main_support") for s in [support] if s and s < price]
+        below_refs += [(c, "volume_cluster") for c in clusters if c < price]
+
+        if below_refs:
+            below_refs.sort(key=lambda x: x[0], reverse=True)
+            stop_loss = below_refs[0][0]
+            ref_type = below_refs[0][1]
+            if ref_type == "main_support":
+                stop_loss_reason = f"主支撑位{stop_loss:.2f}，跌破则趋势走坏"
+            else:
+                stop_loss_reason = f"成交密集区{stop_loss:.2f}，跌破大量筹码被套"
+        else:
+            # 无有效支撑参照 → ATR × 2 止损
+            atr_val = atr or price * 0.02
+            stop_loss = round(price - atr_val * 2, 3)
+            if stop_loss >= price:
+                stop_loss = round(price * 0.95, 3)
+            stop_loss_reason = f"无明确支撑位，基于2×ATR({atr_val:.3f})波动止损"
+
+        # 止盈价：找上方最近的有效压力
+        above_refs = [(r, "main_resistance") for r in [resistance] if r and r > price]
+        above_refs += [(c, "volume_cluster") for c in clusters if c > price]
+
+        if above_refs:
+            above_refs.sort(key=lambda x: x[0])
+            take_profit = above_refs[0][0]
+            ref_type = above_refs[0][1]
+            if ref_type == "main_resistance":
+                take_profit_reason = f"主压力位{take_profit:.2f}，触及大概率受阻回落"
+            else:
+                take_profit_reason = f"成交密集区{take_profit:.2f}，大量套牢盘解套抛压"
+        else:
+            atr_val = atr or price * 0.02
+            take_profit = round(price + atr_val * 2, 3)
+            take_profit_reason = f"无明确压力位，基于2×ATR({atr_val:.3f})波动止盈"
+
+        # 止损/止盈合理性检查
+        if stop_loss >= price:
+            stop_loss = round(price * 0.95, 3)
+            stop_loss_reason = "无有效支撑，按现价-5%硬止损"
+        if take_profit <= price:
+            take_profit = round(price * 1.05, 3)
+            take_profit_reason = "无有效压力，按现价+5%硬止盈"
+
         results.append({
             "name": h.name,
             "code": code,
@@ -1152,6 +1341,11 @@ def _compute_trading_suggestions(
             "kdj_signal": kdj_sig,
             "vol_price": vol_price,
             "volume_clusters": clusters[:3],
+            # 止盈/止损
+            "stop_loss": round(stop_loss, 3),
+            "stop_loss_reason": stop_loss_reason,
+            "take_profit": round(take_profit, 3),
+            "take_profit_reason": take_profit_reason,
         })
 
     # 按优先级排序：需要行动的排前面
@@ -1357,11 +1551,17 @@ def generate_evening_review(config: Config) -> Path | None:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
 
     # 7. Pre-compute trading suggestions (grid / escape / dip)
+    # 跳空缺口 & 关键位突破
+    gap_bo_md, gap_bo_llm = _format_gap_breakout_section(tech_data_evening)
+    if gap_bo_md:
+        data_lines.append(f"\n## 七、📊 缺口与突破")
+        data_lines.append(gap_bo_md)
+
     trade_suggestions = _compute_trading_suggestions(
         holdings, quotes, tech_data_evening, dragon_tiger_summary
     )
     if trade_suggestions:
-        data_lines.append(f"\n## 七、🎯 交易辅助数据（网格挂单 / 逃顶 / 抄底）")
+        data_lines.append(f"\n## 八、🎯 交易辅助数据（网格挂单 / 逃顶 / 抄底）")
         data_lines.append("")
         data_lines.append(f"*价格点由代码计算，建议由 AI 解读*")
         data_lines.append("")
@@ -1388,6 +1588,16 @@ def generate_evening_review(config: Config) -> Path | None:
             d_reasons = " + ".join(ts["dip_reasons"]) if ts["dip_reasons"] else "无"
             data_lines.append(f"- 🔴 逃顶信号({ts['escape_score']}分): {e_reasons}")
             data_lines.append(f"- 🟢 抄底信号({ts['dip_score']}分): {d_reasons}")
+
+            # 止盈/止损
+            sl = ts.get("stop_loss", 0)
+            tp = ts.get("take_profit", 0)
+            sl_reason = ts.get("stop_loss_reason", "")
+            tp_reason = ts.get("take_profit_reason", "")
+            if sl > 0:
+                data_lines.append(f"- 🛑 止损: **{sl:.3f}**（{sl_reason}）")
+            if tp > 0:
+                data_lines.append(f"- 🎯 止盈: **{tp:.3f}**（{tp_reason}）")
 
             # Grid levels compact table
             levels = ts["grid_levels"]
@@ -1416,6 +1626,12 @@ def generate_evening_review(config: Config) -> Path | None:
                     f"{lv['price']:.3f}{' ← ' + lv['tag'] if lv['tag'] else ''}" for lv in key_levels
                 ))
             data_lines.append("")
+
+    # 主力资金流向
+    fund_md_ev, fund_llm_ev = _format_fund_flow_section(quotes, label="自选")
+    if fund_md_ev:
+        data_lines.append(f"\n## 九、💰 主力资金动向（全天）")
+        data_lines.append(fund_md_ev)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -1481,6 +1697,12 @@ def generate_evening_review(config: Config) -> Path | None:
     if dragon_tiger_llm:
         llm_lines.append(f"\n{dragon_tiger_llm}")
 
+    if fund_llm_ev:
+        llm_lines.append(f"\n{fund_llm_ev}")
+
+    if gap_bo_llm:
+        llm_lines.append(f"\n{gap_bo_llm}")
+
     # 4.5 交易辅助数据（代码预计算，LLM 解读）
     if trade_suggestions:
         llm_lines.append("\n[🎯 交易辅助数据（代码预计算，请据此给出操作建议）]")
@@ -1498,6 +1720,12 @@ def generate_evening_review(config: Config) -> Path | None:
                 f"    抄底({ts['dip_score']}分): {', '.join(ts['dip_reasons']) if ts['dip_reasons'] else '无信号'}"
             )
             llm_lines.append(f"    综合: {ts['suggestion']}")
+            sl = ts.get("stop_loss", 0)
+            tp = ts.get("take_profit", 0)
+            if sl > 0:
+                llm_lines.append(f"    止损: {sl:.3f}（{ts.get('stop_loss_reason', '')}）")
+            if tp > 0:
+                llm_lines.append(f"    止盈: {tp:.3f}（{ts.get('take_profit_reason', '')}）")
 
     llm_lines.append(f"""
 

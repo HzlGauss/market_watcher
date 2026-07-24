@@ -276,6 +276,63 @@ class T0MonitorThread(threading.Thread):
         # 判断卖出信号
         sell_reasons = self._check_sell_conditions(quote, tech, sr, price, risk_reward, intrabar)
 
+        # 判断信号：买卖两侧都评估，选条件数更多的一方
+        # 若同等条件数，选盈亏比更有利的一方
+        buy_count = len(buy_reasons)
+        sell_count = len(sell_reasons)
+
+        if buy_count > sell_count and buy_reasons:
+            reason = "; ".join(buy_reasons)
+            return T0Signal(
+                code=item.code, name=item.name,
+                signal_type=T0Signal.SIGNAL_BUY,
+                reason=reason, price=price,
+                support=sr.support, resistance=sr.resistance,
+                risk_reward=risk_reward,
+                buy_price=suggested["buy_price"],
+                sell_price=suggested["sell_price"],
+            )
+
+        if sell_count > buy_count and sell_reasons:
+            reason = "; ".join(sell_reasons)
+            return T0Signal(
+                code=item.code, name=item.name,
+                signal_type=T0Signal.SIGNAL_SELL,
+                reason=reason, price=price,
+                support=sr.support, resistance=sr.resistance,
+                risk_reward=risk_reward,
+                buy_price=suggested["buy_price"],
+                sell_price=suggested["sell_price"],
+            )
+
+        # 条件数相等时，优先选有背离信号的
+        if buy_reasons and sell_reasons:
+            buy_has_divergence = any("背离" in r for r in buy_reasons)
+            sell_has_divergence = any("背离" in r for r in sell_reasons)
+            if buy_has_divergence and not sell_has_divergence:
+                reason = "; ".join(buy_reasons)
+                return T0Signal(
+                    code=item.code, name=item.name,
+                    signal_type=T0Signal.SIGNAL_BUY,
+                    reason=reason, price=price,
+                    support=sr.support, resistance=sr.resistance,
+                    risk_reward=risk_reward,
+                    buy_price=suggested["buy_price"],
+                    sell_price=suggested["sell_price"],
+                )
+            if sell_has_divergence and not buy_has_divergence:
+                reason = "; ".join(sell_reasons)
+                return T0Signal(
+                    code=item.code, name=item.name,
+                    signal_type=T0Signal.SIGNAL_SELL,
+                    reason=reason, price=price,
+                    support=sr.support, resistance=sr.resistance,
+                    risk_reward=risk_reward,
+                    buy_price=suggested["buy_price"],
+                    sell_price=suggested["sell_price"],
+                )
+
+        # 仅一侧有信号
         if buy_reasons:
             reason = "; ".join(buy_reasons)
             return T0Signal(
@@ -393,8 +450,17 @@ class T0MonitorThread(threading.Thread):
         if intrabar["amplitude"] >= 2.5:
             reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
 
+        # 条件14：主力净流入（资金方向与买入一致）
+        if quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
+            if quote.main_net_inflow > 0 and quote.main_net_inflow / quote.amount >= 0.05:
+                reasons.append(f"主力流入({quote.main_net_inflow/1e4:.0f}万)")
+
+        # 条件15：向下跳空回补（日内均值回归机会）
+        if tech.has_gap and tech.gap_type == "向下跳空" and not tech.gap_filled_pct >= 100:
+            reasons.append(f"跳空回补({tech.gap_detail})")
+
         # ---- 背离加分：接近支撑 + 外盘>内盘 = 隐藏吸筹 ----
-        has_divergence = near_support and bs_ratio and bs_ratio > 1.0
+        has_divergence = near_support and bs_ratio and bs_ratio > 1.2
         if has_divergence and len(reasons) < 2:
             # 只要有"接近支撑"+外盘占优(>1.0)，即使其他条件不满足也触发
             reasons.append("⭐内盘背离(主动买)")
@@ -410,8 +476,8 @@ class T0MonitorThread(threading.Thread):
         """检查卖出条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
-        # 条件1：股价接近压力位（1%以内）
-        near_resistance = price >= sr.resistance * 0.99
+        # 条件1：股价接近压力位（3%以内）
+        near_resistance = price >= sr.resistance * 0.97
         if near_resistance:
             reasons.append(f"接近压力({sr.resistance:.2f})")
 
@@ -427,8 +493,8 @@ class T0MonitorThread(threading.Thread):
         if quote.volume_ratio and quote.volume_ratio > 1.3:
             reasons.append(f"放量(比{quote.volume_ratio:.2f})")
 
-        # 条件5：MA20空头方向
-        if tech.ma_alignment in ("空头排列", "空头反弹"):
+        # 条件5：MA20非多方向（空头 / 中性震荡均可卖出）
+        if tech.ma_alignment in ("空头排列", "空头反弹", "缠绕"):
             reasons.append(f"趋势({tech.ma_alignment})")
 
         # 条件6：委比空头（卖单挂单占优）
@@ -467,6 +533,15 @@ class T0MonitorThread(threading.Thread):
         # 条件13：振幅充裕（波动空间大，做T利润高）
         if intrabar["amplitude"] >= 2.0:
             reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
+
+        # 条件14：主力净流出（资金方向与卖出一致）
+        if quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
+            if quote.main_net_inflow < 0 and abs(quote.main_net_inflow) / quote.amount >= 0.05:
+                reasons.append(f"主力流出({abs(quote.main_net_inflow)/1e4:.0f}万)")
+
+        # 条件15：向上跳空回补（日内均值回归机会）
+        if tech.has_gap and tech.gap_type == "向上跳空" and not tech.gap_filled_pct >= 100:
+            reasons.append(f"跳空回补({tech.gap_detail})")
 
         # ---- 背离加分：接近压力 + 内盘>外盘 = 隐藏出货 ----
         has_divergence = near_resistance and bs_ratio and bs_ratio < 1.0

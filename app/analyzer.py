@@ -358,11 +358,47 @@ def analyze(
         if amp is not None and amp >= amp_warn:
             items.append(f"💫 振幅 {amp:.2f}%")
 
+        # ---- 主力资金异动 ----
+        inflow = q.main_net_inflow
+        amount = q.amount
+        if inflow is not None and amount and amount > 0:
+            inflow_pct = inflow / amount * 100  # 主力净流入占成交额百分比
+            if inflow > 0 and inflow_pct >= 15 and cp is not None and cp > 0:
+                items.append(f"🔵 主力大幅买入(净{inflow/1e8:.2f}亿, 占{inflow_pct:.0f}%)")
+                alert_count += 1
+            elif inflow < 0 and abs(inflow_pct) >= 10 and cp is not None and cp < -1:
+                items.append(f"🔴 主力大幅出逃(净{inflow/1e8:.2f}亿, 占{abs(inflow_pct):.0f}%)")
+                alert_count += 1
+
+            # 量价背离
+            if cp is not None and cp > 2 and inflow < 0:
+                items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
+                alert_count += 1
+            elif cp is not None and cp < -2 and inflow > 0 and inflow_pct >= 5:
+                items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
+                alert_count += 1
+
         # ---- 技术指标信号 ----
         if tech_summaries and q.code in tech_summaries:
             tech = tech_summaries[q.code]
-            if tech.signals:
-                for sig in tech.signals:
+            # 跳空信号单独处理（醒目 + 计为异动）
+            if tech.has_gap:
+                gap_emoji = "⬆️" if tech.gap_type == "向上跳空" else "⬇️"
+                if abs(tech.gap_pct) >= 2:
+                    items.append(f"{gap_emoji} 大幅跳空({tech.gap_detail})")
+                    alert_count += 1
+                elif tech.gap_filled_pct >= 80 and tech.gap_filled_pct < 100:
+                    items.append(f"{gap_emoji} 跳空近回补({tech.gap_detail})")
+                elif not tech.signals or all("跳空" not in s for s in tech.signals):
+                    items.append(f"{gap_emoji} {tech.gap_detail}")
+            # 突破信号单独处理
+            if tech.breakout_type:
+                items.append(f"🎯 {tech.breakout_detail}")
+                alert_count += 1
+            # 其他指标信号
+            for sig in tech.signals:
+                # 跳过已在上面处理过的跳空/突破信号
+                if "跳空" not in sig and "突破" not in sig and "跌破" not in sig:
                     items.append(f"📐 {sig}")
 
         if items:

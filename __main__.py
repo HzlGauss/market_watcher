@@ -1098,6 +1098,25 @@ def main() -> None:
                         log.warning(f"LLM 龙虎榜分析异常: {e}")
                         print(f"  {Color.YELLOW}⚠️ AI 解读异常: {e}{Color.RESET}")
 
+                # 4.6. Agent 深度挖掘（LLM 自主调用工具，多轮推理）
+                if config.dragon_tiger_llm_enabled and config.deepseek_key:
+                    print(f"\n  {Color.DIM}🔍 Agent 正在深度挖掘龙虎榜数据...{Color.RESET}")
+                    try:
+                        agent_result = _run_dragon_tiger_agent(
+                            summary=summary,
+                            seat_analyses=analyses if analyses else [],
+                            config=config,
+                        )
+                        if agent_result:
+                            report_lines.append("\n---\n")
+                            report_lines.append(agent_result)
+                            print(f"  {Color.GREEN}✅ Agent 挖掘完成{Color.RESET}")
+                        else:
+                            print(f"  {Color.YELLOW}⚠️ Agent 挖掘跳过{Color.RESET}")
+                    except Exception as e:
+                        log.warning(f"Agent 挖掘异常: {e}")
+                        print(f"  {Color.YELLOW}⚠️ Agent 挖掘异常: {e}{Color.RESET}")
+
                 # 5. 写入报告
                 full_report = "\n".join(report_lines)
                 from pathlib import Path
@@ -1113,6 +1132,224 @@ def main() -> None:
             except Exception as e:
                 log.error(f"龙虎榜分析失败: {e}")
                 print(f"{Color.RED}❌ 龙虎榜分析失败: {e}{Color.RESET}")
+
+
+def _run_dragon_tiger_agent(
+    summary,
+    seat_analyses: list,
+    config,
+) -> str | None:
+    """运行 Agent 深度挖掘龙虎榜数据
+
+    LLM 可主动调用工具函数查询：
+    - 具体个股的席位明细
+    - 连续上榜历史
+    - 行业分类
+    - 技术指标
+    - 主力资金流向
+    """
+    try:
+        from app.llm_agent import LLMAgent, AgentTool
+        from app.dragon_tiger import format_dragon_tiger_report, build_llm_context
+        from app.dragon_seat import generate_seat_report, fetch_seat_details
+        from app.dragon_seat import detect_consecutive_listings
+
+        # ---- 构建工具列表 ----
+
+        # 预建索引用于工具函数
+        all_records = summary.records or []
+        record_map = {r.code: r for r in all_records}
+        seat_map: dict[str, list] = {}
+        if seat_analyses:
+            for sa in seat_analyses:
+                seat_map[sa.code] = [
+                    {
+                        "seat_name": s.seat_name,
+                        "seat_type": s.seat_type,
+                        "buy_amount": s.buy_amount,
+                        "sell_amount": s.sell_amount,
+                        "net_amount": s.net_amount,
+                        "buy_rank": s.buy_rank,
+                        "sell_rank": s.sell_rank,
+                    }
+                    for s in (sa.seats or [])
+                ]
+
+        def tool_query_seat_details(codes: list[str]) -> dict:
+            """查询指定股票的席位买卖明细"""
+            result = {}
+            for code in codes:
+                if code in seat_map:
+                    result[code] = seat_map[code]
+                else:
+                    result[code] = []
+            return result
+
+        def tool_query_industry(codes: list[str]) -> dict:
+            """查询股票的所属行业"""
+            result = {}
+            for code in codes:
+                record = record_map.get(code)
+                industry = getattr(record, "industry", "") if record else ""
+                result[code] = industry or "未知"
+            return result
+
+        def tool_query_record_detail(codes: list[str]) -> dict:
+            """查询龙虎榜上榜记录详情（净买额/涨跌幅/上榜原因/买卖比）"""
+            result = {}
+            for code in codes:
+                record = record_map.get(code)
+                if record:
+                    result[code] = {
+                        "name": record.name,
+                        "net_buy": f"{record.net_buy/1e8:.2f}亿",
+                        "change_pct": f"{record.change_pct:+.1f}%" if record.change_pct else "--",
+                        "buy_sell_ratio": f"{record.buy_sell_ratio:.2f}" if record.buy_sell_ratio else "--",
+                        "turnover_rate": f"{record.turnover_rate:.1f}%" if record.turnover_rate else "--",
+                        "reason": getattr(record, "reason", ""),
+                    }
+                else:
+                    result[code] = None
+            return result
+
+        def tool_query_abnormal_patterns(codes: list[str]) -> dict:
+            """查询指定股票的异常形态（涨停板出货/跌停接筹/对倒等）"""
+            result = {}
+            patterns = summary.abnormal_patterns or []
+            for code in codes:
+                matched = [p for p in patterns if p.get("code") == code]
+                if matched:
+                    result[code] = [
+                        {
+                            "形态": p.get("pattern_label", ""),
+                            "详情": p.get("detail", ""),
+                        }
+                        for p in matched
+                    ]
+                else:
+                    result[code] = []
+            return result
+
+        # ---- 定义工具 ----
+        tools = [
+            AgentTool(
+                name="query_seat_details",
+                description="查询指定股票的龙虎榜席位买卖明细。返回每个席位的名称、类型（机构/游资/量化/散户）、买入额、卖出额、净额、排名。",
+                func=tool_query_seat_details,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，如 ['000977', '300017']，最多5只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_record_detail",
+                description="查询股票的龙虎榜上榜详情：净买额、涨跌幅、买卖比、换手率、上榜原因。",
+                func=tool_query_record_detail,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_abnormal_patterns",
+                description="查询指定股票的异常交易形态：涨停板出货、跌停接筹、封板缩量、放量烂板、机构对倒等。",
+                func=tool_query_abnormal_patterns,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_industry",
+                description="查询股票所属行业分类。",
+                func=tool_query_industry,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+        ]
+
+        # ---- 构建初始 prompt ----
+        init_prompt_parts = [
+            f"请对今日({summary.date})龙虎榜数据进行深度挖掘分析。",
+            f"上榜个股共 {summary.total_count} 只。",
+            "",
+            "以下是已预计算的汇总数据，请先仔细阅读，然后使用工具函数进一步查询你感兴趣的股票：",
+            "",
+        ]
+
+        # 加入汇总数据
+        report_md = format_dragon_tiger_report(summary)
+        init_prompt_parts.append(report_md)
+
+        if seat_analyses:
+            seat_md = generate_seat_report(seat_analyses)
+            init_prompt_parts.append("\n---\n")
+            init_prompt_parts.append(seat_md)
+
+        init_prompt_parts.append("\n---\n")
+        init_prompt_parts.append("""
+**分析要求**：
+1. 从汇总数据中找出 2-4 只资金博弈最激烈的股票。
+2. 使用工具函数查询这些股票的席位明细、异常形态等深度数据。
+3. 结合查询结果，给出每只股票的资金博弈解读和次日走势预判。
+4. 最终按 Agent 深度挖掘的格式输出完整分析。
+
+**可用的工具**：
+- `query_seat_details`: 查询席位买卖明细（机构/游资/量化/散户的买卖金额和排名）
+- `query_record_detail`: 查询上榜详情（净买额/涨跌幅/买卖比/上榜原因）
+- `query_abnormal_patterns`: 查询异常形态（涨停板出货/跌停接筹/对倒等）
+- `query_industry`: 查询行业分类
+
+开始分析吧。""")
+
+        initial_prompt = "\n".join(init_prompt_parts)
+
+        # ---- 运行 Agent ----
+        agent = LLMAgent(config, tools=tools)
+        log.info("Agent: 开始龙虎榜深度挖掘...")
+        result = agent.run(initial_prompt)
+
+        if result and "Agent 未启用" not in result:
+            log.info("Agent: 挖掘完成")
+            return result
+        return None
+
+    except ImportError as e:
+        log.debug(f"Agent 依赖缺失: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Agent 挖掘失败: {e}")
+        return None
 
 
 if __name__ == "__main__":
