@@ -450,8 +450,15 @@ class T0MonitorThread(threading.Thread):
         if intrabar["amplitude"] >= 2.5:
             reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
 
-        # 条件14：主力净流入（资金方向与买入一致）
-        if quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
+        # 条件14：资金流向方向（优先使用明细数据）
+        ff = quote.fund_flow
+        if ff and ff.is_valid:
+            if ff.is_institution_driven and ff.super_large_net is not None and ff.super_large_net > 0:
+                reasons.append(f"机构吸筹(超大单+{ff.super_large_net/1e4:.0f}万)")
+            elif ff.main_net is not None and ff.main_net > 0 and quote.amount and quote.amount > 0:
+                if ff.main_net / quote.amount >= 0.05:
+                    reasons.append(f"主力流入({ff.main_net/1e4:.0f}万)")
+        elif quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
             if quote.main_net_inflow > 0 and quote.main_net_inflow / quote.amount >= 0.05:
                 reasons.append(f"主力流入({quote.main_net_inflow/1e4:.0f}万)")
 
@@ -534,8 +541,15 @@ class T0MonitorThread(threading.Thread):
         if intrabar["amplitude"] >= 2.0:
             reasons.append(f"高振幅({intrabar['amplitude']:.1f}%)")
 
-        # 条件14：主力净流出（资金方向与卖出一致）
-        if quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
+        # 条件14：资金流向方向（优先使用明细数据）
+        ff = quote.fund_flow
+        if ff and ff.is_valid:
+            if ff.is_distribution and ff.super_large_net is not None and ff.super_large_net < 0:
+                reasons.append(f"机构出逃(超大单{ff.super_large_net/1e4:.0f}万)")
+            elif ff.main_net is not None and ff.main_net < 0 and quote.amount and quote.amount > 0:
+                if abs(ff.main_net) / quote.amount >= 0.05:
+                    reasons.append(f"主力流出({abs(ff.main_net)/1e4:.0f}万)")
+        elif quote.main_net_inflow is not None and quote.amount and quote.amount > 0:
             if quote.main_net_inflow < 0 and abs(quote.main_net_inflow) / quote.amount >= 0.05:
                 reasons.append(f"主力流出({abs(quote.main_net_inflow)/1e4:.0f}万)")
 

@@ -13,6 +13,59 @@ from app.utils import log
 from app.llm_client import get_llm_client, SYSTEM_PROMPTS
 
 
+def _format_flow_breakdown_for_llm(quotes: list[Quote]) -> str:
+    """汇总所有标的的资金结构，生成紧凑的 LLM 提示文本"""
+    total_sl = 0.0  # 超大单
+    total_lg = 0.0  # 大单
+    total_md = 0.0  # 中单
+    total_sm = 0.0  # 小单
+    inst_count = 0   # 机构主导标的数
+    retail_count = 0 # 散户主导标的数
+    dist_count = 0   # 出货标的数
+    has_data = False
+
+    for q in quotes:
+        ff = q.fund_flow
+        if ff:
+            if ff.super_large_net is not None:
+                total_sl += ff.super_large_net
+                has_data = True
+            if ff.large_net is not None:
+                total_lg += ff.large_net
+            if ff.medium_net is not None:
+                total_md += ff.medium_net
+            if ff.small_net is not None:
+                total_sm += ff.small_net
+            if ff.is_institution_driven:
+                inst_count += 1
+            if ff.is_distribution:
+                dist_count += 1
+            if ff.is_retail_driven:
+                retail_count += 1
+
+    if not has_data:
+        return "暂无资金结构数据"
+
+    parts = []
+    if abs(total_sl) >= 1e8:
+        parts.append(f"超大单{total_sl/1e8:+.2f}亿")
+    elif abs(total_sl) >= 1e6:
+        parts.append(f"超大单{total_sl/1e4:+.0f}万")
+    if abs(total_sm) >= 1e8:
+        parts.append(f"散户{total_sm/1e8:+.2f}亿")
+    elif abs(total_sm) >= 1e6:
+        parts.append(f"散户{total_sm/1e4:+.0f}万")
+
+    if inst_count > 0:
+        parts.append(f"{inst_count}只机构主导")
+    if dist_count > 0:
+        parts.append(f"{dist_count}只疑似出货")
+    if retail_count > 0:
+        parts.append(f"{retail_count}只散户推升")
+
+    return " | ".join(parts) if parts else "资金结构均衡"
+
+
 def _build_prompt(
     quotes: list[Quote],
     alerts: list[Alert],
@@ -37,6 +90,8 @@ def _build_prompt(
             f"- 全市场成交(累计): {b.total_amount:.0f}亿"
             f" | 估算全天: ~{b.estimated_full_day_amount:.0f}亿"
             f" | 主力净流入: {b.main_net_inflow:+.1f}亿",
+            f"- 资金结构(超大/大/中/小): "
+            f"{_format_flow_breakdown_for_llm(quotes)}",
             f"- 参考指数: {b.index_name} {b.index_change_pct:+.2f}% ({b.index_price:.2f})",
             f"- 数据时间: {b.update_time}",
             "",

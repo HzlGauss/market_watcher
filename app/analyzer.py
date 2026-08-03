@@ -361,22 +361,45 @@ def analyze(
         # ---- 主力资金异动 ----
         inflow = q.main_net_inflow
         amount = q.amount
+        ff = q.fund_flow  # 资金流向明细
         if inflow is not None and amount and amount > 0:
             inflow_pct = inflow / amount * 100  # 主力净流入占成交额百分比
             if inflow > 0 and inflow_pct >= 15 and cp is not None and cp > 0:
-                items.append(f"🔵 主力大幅买入(净{inflow/1e8:.2f}亿, 占{inflow_pct:.0f}%)")
+                # 用资金明细增强描述
+                if ff and ff.is_institution_driven:
+                    items.append(f"🔵 机构吸筹(超大单+{ff.super_large_net/1e8:.2f}亿,散户{ff.small_net/1e8:+.2f}亿)")
+                else:
+                    items.append(f"🔵 主力大幅买入(净{inflow/1e8:.2f}亿, 占{inflow_pct:.0f}%)")
                 alert_count += 1
             elif inflow < 0 and abs(inflow_pct) >= 10 and cp is not None and cp < -1:
-                items.append(f"🔴 主力大幅出逃(净{inflow/1e8:.2f}亿, 占{abs(inflow_pct):.0f}%)")
+                if ff and ff.is_distribution:
+                    items.append(f"🔴 机构出货(超大单{ff.super_large_net/1e8:+.2f}亿,散户接盘+{ff.small_net/1e8:.2f}亿)")
+                else:
+                    items.append(f"🔴 主力大幅出逃(净{inflow/1e8:.2f}亿, 占{abs(inflow_pct):.0f}%)")
                 alert_count += 1
 
             # 量价背离
             if cp is not None and cp > 2 and inflow < 0:
-                items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
+                if ff and ff.super_large_net is not None and ff.super_large_net < 0:
+                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但超大单净流出{abs(ff.super_large_net)/1e8:.2f}亿)")
+                else:
+                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
                 alert_count += 1
             elif cp is not None and cp < -2 and inflow > 0 and inflow_pct >= 5:
-                items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
+                if ff and ff.is_institution_driven:
+                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但超大单流入+{ff.super_large_net/1e8:.2f}亿)")
+                else:
+                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
                 alert_count += 1
+
+            # 新增：散户主导上涨（追高风险）
+            if ff and ff.is_retail_driven and cp is not None and cp > 3:
+                items.append(f"🟡 散户推涨(小单+{ff.small_net/1e8:.2f}亿,主力{ff.main_net/1e8:+.2f}亿) — 注意追高风险")
+                alert_count += 1
+
+            # 新增：主力减仓散户接盘（下跌中继）
+            if ff and ff.is_distribution and cp is not None and cp < 0:
+                items.append(f"🟠 散户接盘(超大单{ff.super_large_net/1e8:+.2f}亿,散户+{ff.small_net/1e8:.2f}亿)")
 
         # ---- 技术指标信号 ----
         if tech_summaries and q.code in tech_summaries:

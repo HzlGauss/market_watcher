@@ -51,6 +51,63 @@ class Holding:
 
 
 @dataclass
+class FundFlowDetail:
+    """
+    个股资金流向明细（东方财富逐笔分类）
+
+    主力 = 超大单 + 大单，散户 ≈ 小单。
+
+    Attributes:
+        main_net: 主力净流入（元）= super_large_net + large_net
+        main_pct: 主力净流入占成交额比例 (%)
+        super_large_net: 超大单净流入（元），通常代表机构/国家队
+        super_large_pct: 超大单净占比 (%)
+        large_net: 大单净流入（元），通常代表游资/私募
+        large_pct: 大单净占比 (%)
+        medium_net: 中单净流入（元），游资/中型资金
+        medium_pct: 中单净占比 (%)
+        small_net: 小单净流入（元），散户行为
+        small_pct: 小单净占比 (%)
+    """
+    main_net: Optional[float] = None
+    main_pct: Optional[float] = None
+    super_large_net: Optional[float] = None
+    super_large_pct: Optional[float] = None
+    large_net: Optional[float] = None
+    large_pct: Optional[float] = None
+    medium_net: Optional[float] = None
+    medium_pct: Optional[float] = None
+    small_net: Optional[float] = None
+    small_pct: Optional[float] = None
+
+    @property
+    def is_valid(self) -> bool:
+        """数据是否有效（至少有主力净流入数据）"""
+        return self.main_net is not None
+
+    @property
+    def is_institution_driven(self) -> bool:
+        """是否机构主导（超大单净买 + 散户净卖）"""
+        if self.super_large_net is None or self.small_net is None:
+            return False
+        return self.super_large_net > 0 and self.small_net < 0
+
+    @property
+    def is_retail_driven(self) -> bool:
+        """是否散户主导（小单净买为主，主力净卖或中性）"""
+        if self.small_net is None or self.main_net is None:
+            return False
+        return self.small_net > 0 and self.main_net <= 0
+
+    @property
+    def is_distribution(self) -> bool:
+        """是否主力出货散户接盘（跌或平盘时超大单出+散户接）"""
+        if self.super_large_net is None or self.small_net is None:
+            return False
+        return self.super_large_net < 0 and self.small_net > 0
+
+
+@dataclass
 class Quote:
     """
     单个标的的实时行情快照
@@ -74,7 +131,8 @@ class Quote:
         market_cap: 总市值（元）
         turnover_rate: 换手率 (%)
         volume_ratio: 量比
-        main_net_inflow: 主力净流入（元）
+        main_net_inflow: 主力净流入（元），向后兼容，优先使用 fund_flow
+        fund_flow: 资金流向明细（超大/大/中/小单）
         upper_limit: 涨停价
         lower_limit: 跌停价
     """
@@ -97,6 +155,7 @@ class Quote:
     turnover_rate: Optional[float] = None
     volume_ratio: Optional[float] = None
     main_net_inflow: Optional[float] = None
+    fund_flow: Optional[FundFlowDetail] = None
     bid_volume: Optional[float] = None  # 外盘（主动买入）
     ask_volume: Optional[float] = None  # 内盘（主动卖出）
     bid_ask_ratio: Optional[float] = None  # 委比

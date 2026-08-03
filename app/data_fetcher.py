@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -285,16 +285,81 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         return None  # 静默失败
 
 
+def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
+    """获取个股实时资金流向明细（超大单/大单/中单/小单）
+
+    使用东方财富 fflow/kline/get 接口（与 fetch_main_net_inflow 相同数据源），
+    解析 f52-f61 全部字段。
+
+    字段映射（fflow/kline/get）：
+        f52: 主力净流入（元）
+        f53: 小单净流入（元）
+        f54: 中单净流入（元）
+        f55: 大单净流入（元）
+        f56: 超大单净流入（元）
+        f57: 主力净占比（%）
+        f58: 小单净占比（%）
+        f59: 中单净占比（%）
+        f60: 大单净占比（%）
+        f61: 超大单净占比（%）
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+
+    Returns:
+        FundFlowDetail 或 None（静默失败）
+    """
+    secid = _get_secid(code, market)
+    import requests
+    try:
+        resp = requests.get(
+            f"{STOCK_FLOW_API}?secid={secid}"
+            f"&fields1=f1,f2,f3"
+            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            timeout=5,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://data.eastmoney.com/",
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data")
+        if not data:
+            return None
+
+        flow = FundFlowDetail(
+            main_net=_parse_float(data.get("f52")),
+            main_pct=_parse_float(data.get("f57")),
+            super_large_net=_parse_float(data.get("f56")),
+            super_large_pct=_parse_float(data.get("f61")),
+            large_net=_parse_float(data.get("f55")),
+            large_pct=_parse_float(data.get("f60")),
+            medium_net=_parse_float(data.get("f54")),
+            medium_pct=_parse_float(data.get("f59")),
+            small_net=_parse_float(data.get("f53")),
+            small_pct=_parse_float(data.get("f58")),
+        )
+        # 如果所有字段都是 None，视为无效
+        if flow.main_net is None and flow.super_large_net is None:
+            return None
+        return flow
+    except Exception:
+        return None  # 静默失败
+
+
 def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
-    """为 Quote 列表批量补充主力净流入（原地修改）
+    """为 Quote 列表批量补充资金流向明细（原地修改）
 
     使用线程池并发请求，每只股票独立请求东方财富资金流接口。
+    同时填充 main_net_inflow（向后兼容）和 fund_flow（资金明细）两个字段。
     """
     if not quotes:
         return
 
-    def _fetch_one(q: Quote) -> tuple[str, Optional[float]]:
-        flow = fetch_main_net_inflow(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
+    def _fetch_one(q: Quote) -> tuple[str, Optional[FundFlowDetail]]:
+        flow = fetch_fund_flow_detail(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
         return (q.code, flow)
 
     try:
@@ -305,7 +370,10 @@ def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
                     code, flow = fut.result(timeout=5)
                     for q in quotes:
                         if q.code == code:
-                            q.main_net_inflow = flow
+                            q.fund_flow = flow
+                            # 向后兼容：同时填充 main_net_inflow
+                            if flow is not None and flow.main_net is not None:
+                                q.main_net_inflow = flow.main_net
                             break
                 except Exception:
                     pass
@@ -822,8 +890,8 @@ class BackgroundDataCache:
         self._refresh_interval = refresh_interval
         self._lock = threading.Lock()
 
-        # 缓存数据: {code: {volume_ratio: x, turnover_rate: y, main_net_inflow: z}}
-        self._cache: Dict[str, Dict[str, Optional[float]]] = {}
+        # 缓存数据: {code: {volume_ratio: x, turnover_rate: y, main_net_inflow: z, fund_flow: FundFlowDetail}}
+        self._cache: Dict[str, Dict[str, Optional[float | FundFlowDetail]]] = {}
         self._last_update: float = 0.0
 
         # 控制线程
@@ -917,7 +985,7 @@ class BackgroundDataCache:
         with self._lock:
             for code, data in tencent_data.items():
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
                 if data.get("volume_ratio") is not None:
                     self._cache[code]["volume_ratio"] = data["volume_ratio"]
                 if data.get("turnover_rate") is not None:
@@ -931,7 +999,7 @@ class BackgroundDataCache:
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
-        """刷新主力净流入（东方财富，静默失败）"""
+        """刷新资金流向明细（东方财富，静默失败）"""
         if not self._items:
             return
 
@@ -939,12 +1007,15 @@ class BackgroundDataCache:
             if self._stop_event.is_set():
                 return
             code = item.code
-            # 每只股票单独请求，加延迟避免限流
-            flow = fetch_main_net_inflow(code, item.market)
+            # 获取完整资金流向明细
+            detail = fetch_fund_flow_detail(code, item.market)
             with self._lock:
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None}
-                if flow is not None:
-                    self._cache[code]["main_net_inflow"] = flow
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
+                if detail is not None:
+                    self._cache[code]["fund_flow"] = detail
+                    # 向后兼容：同时存 main_net_inflow
+                    if detail.main_net is not None:
+                        self._cache[code]["main_net_inflow"] = detail.main_net
             time.sleep(0.5)  # 请求间隔
 

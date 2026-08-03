@@ -786,6 +786,7 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     """生成主力资金流向摘要，返回 (数据区Markdown, LLM紧凑文本)
 
     汇总主力净流入/流出情况，标注重点关注标的。
+    包含超大单/大单/中单/小单资金结构。
     """
     has_flow = [q for q in quotes if q.main_net_inflow is not None and q.amount and q.amount > 0]
     if not has_flow:
@@ -794,50 +795,113 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     # 按主力净流入占比排序
     scored = []
     total_inflow = 0.0
+    total_super_large = 0.0
+    total_large = 0.0
+    total_medium = 0.0
+    total_small = 0.0
+    has_detail = False
     for q in has_flow:
         pct = q.main_net_inflow / q.amount * 100  # type: ignore[operator]
         total_inflow += q.main_net_inflow  # type: ignore[operator]
+        ff = q.fund_flow
+        if ff:
+            if ff.super_large_net is not None:
+                total_super_large += ff.super_large_net
+                has_detail = True
+            if ff.large_net is not None:
+                total_large += ff.large_net
+            if ff.medium_net is not None:
+                total_medium += ff.medium_net
+            if ff.small_net is not None:
+                total_small += ff.small_net
         scored.append((q, pct))
     scored.sort(key=lambda x: x[1], reverse=True)
 
     # ---- Markdown 数据区 ----
-    md_lines = [f"### 💰 {label}主力资金流向"]
+    md_lines = [f"### 💰 {label}主力资金动向"]
     md_lines.append("")
-    md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 信号 |")
-    md_lines.append("|------|--------|-----------|---------|------|")
 
-    top_in = scored[:3]
-    top_out = sorted(scored, key=lambda x: x[1])[:3]
+    if has_detail:
+        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占比 | 超大单 | 大单 | 中单 | 散户(小单) | 信号 |")
+        md_lines.append("|------|--------|-----------|------|--------|------|------|-----------|------|")
 
-    for q, pct in scored[:8]:
-        chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
-        inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
-        if pct >= 15:
-            sig = "🔵 大幅流入"
-        elif pct >= 5:
-            sig = "🟢 流入"
-        elif pct <= -10:
-            sig = "🔴 大幅流出"
-        elif pct <= -5:
-            sig = "🟠 流出"
-        else:
-            sig = "⚪ 中性"
-        md_lines.append(f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% | {sig} |")
+        for q, pct in scored[:8]:
+            chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
+            inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
+            ff = q.fund_flow
+            if ff:
+                sl_str = _format_money(ff.super_large_net) if ff.super_large_net is not None else "--"
+                lg_str = _format_money(ff.large_net) if ff.large_net is not None else "--"
+                md_str = _format_money(ff.medium_net) if ff.medium_net is not None else "--"
+                sm_str = _format_money(ff.small_net) if ff.small_net is not None else "--"
+                # 信号判断
+                if ff.is_institution_driven:
+                    sig = "🔵 机构主导"
+                elif ff.is_distribution:
+                    sig = "🔴 机构出货"
+                elif ff.is_retail_driven and pct < 0:
+                    sig = "🟠 散户接盘"
+                elif ff.is_retail_driven:
+                    sig = "🟡 散户主导"
+                elif pct >= 10:
+                    sig = "🟢 主力流入"
+                elif pct <= -10:
+                    sig = "🔴 主力流出"
+                else:
+                    sig = "⚪ 中性"
+            else:
+                sl_str = lg_str = md_str = sm_str = "--"
+                sig = "⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出")
+            md_lines.append(
+                f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% "
+                f"| {sl_str} | {lg_str} | {md_str} | {sm_str} | {sig} |"
+            )
+    else:
+        # 无明细数据时沿用旧格式
+        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 信号 |")
+        md_lines.append("|------|--------|-----------|---------|------|")
+        for q, pct in scored[:8]:
+            chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
+            inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
+            if pct >= 15:
+                sig = "🔵 大幅流入"
+            elif pct >= 5:
+                sig = "🟢 流入"
+            elif pct <= -10:
+                sig = "🔴 大幅流出"
+            elif pct <= -5:
+                sig = "🟠 流出"
+            else:
+                sig = "⚪ 中性"
+            md_lines.append(f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% | {sig} |")
 
-    if total_inflow >= 1e8:
+    # 合计汇总
+    if abs(total_inflow) >= 1e8:
         direction = "净流入" if total_inflow > 0 else "净流出"
-        md_lines.append(f"\n> 合计主力资金: **{direction} {abs(total_inflow)/1e8:.2f}亿**")
+        summary = f"> 合计主力资金: **{direction} {abs(total_inflow)/1e8:.2f}亿**"
+        if has_detail:
+            summary += f" | 超大单: {total_super_large/1e8:+.2f}亿 | 大单: {total_large/1e8:+.2f}亿"
+            summary += f" | 中单: {total_medium/1e8:+.2f}亿 | 散户: {total_small/1e8:+.2f}亿"
+        md_lines.append(f"\n{summary}")
     elif abs(total_inflow) >= 1e6:
         direction = "净流入" if total_inflow > 0 else "净流出"
-        md_lines.append(f"\n> 合计主力资金: **{direction} {abs(total_inflow)/1e4:.0f}万**")
+        summary = f"> 合计主力资金: **{direction} {abs(total_inflow)/1e4:.0f}万**"
+        if has_detail:
+            summary += f" | 超大单: {total_super_large/1e4:+.0f}万"
+            summary += f" | 散户: {total_small/1e4:+.0f}万"
+        md_lines.append(f"\n{summary}")
 
     md = "\n".join(md_lines) + "\n"
 
     # ---- LLM 紧凑文本 ----
+    top_in = scored[:3]
+    top_out = sorted(scored, key=lambda x: x[1])[:3]
     llm_parts = [f"[{label}主力资金]"]
-    if total_inflow >= 1e8:
+    if abs(total_inflow) >= 1e8:
         direction = "净流入" if total_inflow > 0 else "净流出"
         llm_parts.append(f"合计{direction}{abs(total_inflow)/1e8:.2f}亿")
+    if has_detail:
+        llm_parts.append(f"超大单{total_super_large/1e8:+.2f}亿/散户{total_small/1e8:+.2f}亿")
     top_in_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_in)
     top_out_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_out)
     llm_parts.append(f"流入前3: {top_in_str}")
@@ -919,32 +983,69 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
     """
     分析个股资金流向，判断主力/散户行为
 
-    判断依据：
-    1. 真实成交量倍率：当日成交量 / 前日成交量（核心指标）
-    2. 量价关系：放量上涨倾向于主力入场，缩量上涨可能是散户行为
-    3. 开盘表现：高开高走且放量可能是主力
-    4. 日内位置：收盘接近高点且放量倾向于主力
-    5. 振幅与波动：大幅波动且放量可能是主力博弈
+    优先使用东方财富真实资金流向明细（FundFlowDetail），
+    没有时回退到量价关系的启发式判断。
 
     Args:
         quote: 实时行情数据
-        prev_volume: 前一日成交量（用于计算倍率）
+        prev_volume: 前一日成交量（用于计算倍率，仅启发式回退时使用）
     """
     from app.technical import estimate_full_day_volume
 
-    if not quote.price or not quote.open or not quote.high or not quote.low or not quote.pre_close:
+    if not quote.price:
         return "数据不足"
 
     change_pct = quote.change_pct or 0
+
+    # ================================================================
+    # 优先：使用东方财富真实资金流向明细
+    # ================================================================
+    ff = quote.fund_flow
+    if ff and ff.is_valid and ff.main_net is not None:
+        parts = []
+        # 主力净流入概述
+        if ff.main_net >= 1e8:
+            parts.append(f"主力净流入{ff.main_net/1e8:+.2f}亿")
+        elif abs(ff.main_net) >= 1e6:
+            parts.append(f"主力净流入{ff.main_net/1e4:+.0f}万")
+        elif abs(ff.main_net) >= 1e4:
+            parts.append(f"主力净流入{ff.main_net/1e4:+.1f}万")
+        else:
+            parts.append(f"主力净流入{ff.main_net/1e4:+.2f}万")
+
+        # 资金结构
+        if ff.is_institution_driven:
+            parts.append("机构吸筹(超大单买+散户卖)")
+        elif ff.is_distribution:
+            parts.append("机构出货(超大单卖+散户接)⚠️")
+        elif ff.is_retail_driven:
+            parts.append("散户主导(小单推升)⚠️")
+        elif ff.main_net > 0:
+            parts.append("主力偏多")
+        elif ff.main_net < 0:
+            parts.append("主力偏空")
+
+        # 补充量价信息
+        if ff.super_large_net is not None and abs(ff.super_large_net) >= 5e7:
+            parts.append(f"超大单{ff.super_large_net/1e8:+.2f}亿")
+        if ff.small_net is not None and abs(ff.small_net) >= 5e7:
+            parts.append(f"散户{ff.small_net/1e8:+.2f}亿")
+
+        return "; ".join(parts)
+
+    # ================================================================
+    # 回退：量价关系启发式判断
+    # ================================================================
+    if not quote.open or not quote.high or not quote.low or not quote.pre_close:
+        return "数据不足"
+
     amplitude = quote.amplitude or 0
-    # 估算全天量，避免午盘半日量导致量比失真
     volume = estimate_full_day_volume(quote) or 0
     qtype = quote.type or ""
 
     is_etf = "ETF" in qtype
     is_index = "指数" in qtype
 
-    # 涨跌幅阈值（按标的类型调整）
     if is_index:
         pct_high = 0.5
     elif is_etf:
@@ -952,54 +1053,37 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
     else:
         pct_high = 2.0
 
-    # 计算成交量倍率（核心判断指标）
     vol_ratio = None
     if prev_volume and prev_volume > 0 and volume > 0:
         vol_ratio = volume / prev_volume
 
-    # 放量/缩量判断阈值
-    VOL_EXPANSION_THRESHOLD = 1.5   # 成交量是前日的1.5倍以上为放量
-    VOL_SHRINK_THRESHOLD = 0.6      # 成交量不到前日的60%为缩量
+    VOL_EXPANSION_THRESHOLD = 1.5
+    VOL_SHRINK_THRESHOLD = 0.6
 
-    # 日内位置百分比 (0-100)
     if quote.high > quote.low:
         position = ((quote.price - quote.low) / (quote.high - quote.low)) * 100
     else:
         position = 50
 
-    # 开盘溢价
     gap_up = quote.open > quote.pre_close
     gap_pct = ((quote.open - quote.pre_close) / quote.pre_close * 100) if gap_up else 0
 
     signals = []
 
-    # ---- 基于真实成交量的判断（优先）----
     if vol_ratio is not None:
-        # 放量上涨 = 主力入场信号
         if change_pct > pct_high and vol_ratio >= VOL_EXPANSION_THRESHOLD:
             signals.append(f"放量上涨（{vol_ratio:.1f}倍），主力入场")
-
-        # 缩量上涨 = 散户行为或锁仓
         elif change_pct > pct_high * 0.5 and vol_ratio <= VOL_SHRINK_THRESHOLD:
             signals.append(f"缩量上涨（{vol_ratio:.1f}倍），买盘不强")
-
-        # 放量下跌 = 主力出逃
         elif change_pct < -pct_high and vol_ratio >= VOL_EXPANSION_THRESHOLD:
             signals.append(f"放量下跌（{vol_ratio:.1f}倍），主力出逃⚠️")
-
-        # 缩量下跌 = 散户抛售或惜售
         elif change_pct < -pct_high * 0.5 and vol_ratio <= VOL_SHRINK_THRESHOLD:
             signals.append(f"缩量下跌（{vol_ratio:.1f}倍），抛压减弱")
-
-        # 平盘放量
         elif abs(change_pct) <= pct_high * 0.3 and vol_ratio >= VOL_EXPANSION_THRESHOLD:
             signals.append(f"平盘放量（{vol_ratio:.1f}倍），资金博弈")
-
-    # ---- 没有历史成交量时，使用振幅作为辅助判断 ----
-    elif vol_ratio is None:
+    else:
         amp_high = 1.0 if is_index else (1.5 if is_etf else 4.0)
         amp_low = 0.3 if is_index else (0.6 if is_etf else 1.5)
-
         if change_pct > pct_high and amplitude > amp_high:
             signals.append("振幅较大上涨，疑似放量（无历史数据）")
         elif change_pct > pct_high * 0.7 and amplitude < amp_low:
@@ -1009,27 +1093,20 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
         elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
             signals.append("振幅较小下跌，疑似缩量（无历史数据）")
 
-    # ---- 辅助判断因素 ----
-
-    # 高位收盘 + 放量 = 强势主力
     if position > 80 and change_pct > pct_high * 0.7:
         if signals and "放量" in signals[0]:
             signals[0] = signals[0].replace("主力", "强势主力")
         elif not signals:
             signals.append("强势资金主导（收盘接近日内高点）")
-
-    # 低位收盘 + 放量 = 恐慌抛盘
     elif position < 20 and change_pct < -pct_high * 0.7:
         if signals and "放量" in signals[0]:
             signals[0] = signals[0].replace("出逃", "恐慌出逃")
         elif not signals:
             signals.append("恐慌抛压（收盘接近日内低点）")
 
-    # 高开低走 = 主力出货
     if gap_up and gap_pct > pct_high * 0.7 and change_pct < 0:
         signals.append("高开低走，疑似出货")
 
-    # 尾盘拉升 = 主力做盘
     tail_amp = 0.6 if is_etf else 2.0
     if position > 85 and change_pct > pct_high * 0.5 and amplitude > tail_amp:
         signals.append("尾盘拉升，主力做盘")

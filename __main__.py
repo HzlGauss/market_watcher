@@ -344,7 +344,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         log.warning("No quote data received")
         return
 
-    # 从后台缓存获取量比、换手率、主力净流入（不阻塞主循环）
+    # 从后台缓存获取量比、换手率、资金流向明细（不阻塞主循环）
     if hasattr(_run_once, '_bg_cache') and _run_once._bg_cache.is_fresh():
         for q in quotes:
             cached = _run_once._bg_cache.get_data(q.code)
@@ -355,6 +355,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     q.turnover_rate = cached["turnover_rate"]
                 if cached.get("main_net_inflow") is not None:
                     q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("fund_flow") is not None:
+                    q.fund_flow = cached["fund_flow"]
                 if cached.get("bid_volume") is not None:
                     q.bid_volume = cached["bid_volume"]
                 if cached.get("ask_volume") is not None:

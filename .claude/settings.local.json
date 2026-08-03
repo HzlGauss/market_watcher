@@ -2,7 +2,14 @@
   "permissions": {
     "allow": [
       "Bash(python *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "WebSearch",
+      "Bash(where python *)",
+      "Bash(where python3 *)",
+      "Read(//c//**)",
+      "Read(//c/Users/hanzhanli/AppData/Local/Programs/**)",
+      "Bash(C:/Users/hanzhanli/AppData/Local/Programs/Python/Python312/python.exe *)",
+      "Bash(curl *)"
     ]
   }
 }
