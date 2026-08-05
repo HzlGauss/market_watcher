@@ -569,6 +569,27 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         log.warning("No quote data available in data pool")
         return
 
+    # Apply background cache data (fund flow, volume ratio, turnover rate)
+    bg = getattr(_run_once_new, '_bg_cache', None)
+    if bg and bg.is_fresh():
+        for q in quotes:
+            cached = bg.get_data(q.code)
+            if cached:
+                if cached.get("volume_ratio") is not None:
+                    q.volume_ratio = cached["volume_ratio"]
+                if cached.get("turnover_rate") is not None:
+                    q.turnover_rate = cached["turnover_rate"]
+                if cached.get("main_net_inflow") is not None:
+                    q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("fund_flow") is not None:
+                    q.fund_flow = cached["fund_flow"]
+                if cached.get("bid_volume") is not None:
+                    q.bid_volume = cached["bid_volume"]
+                if cached.get("ask_volume") is not None:
+                    q.ask_volume = cached["ask_volume"]
+                if cached.get("bid_ask_ratio") is not None:
+                    q.bid_ask_ratio = cached["bid_ask_ratio"]
+
     # Get K-line data from shared pool
     klines_map = {}
     for q in quotes:
@@ -838,6 +859,12 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
                                     enable_sound=True, enable_push=False)
         t0_thread.start()
 
+    # Start background cache for fund flow / volume ratio / turnover rate
+    from app.data_fetcher import BackgroundDataCache
+    bg_cache = BackgroundDataCache(monitor_items, refresh_interval=60)
+    bg_cache.start()
+    _run_once_new._bg_cache = bg_cache  # attach to function for access in _run_once_new
+
     # Wait for initial data to be ready (up to 10 seconds)
     log.info("Initializing data pool...")
     pool_ready = False
@@ -857,7 +884,7 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         while True:
             if is_trading_time(datetime.now(), config.sessions)[0]:
                 scan_count += 1
-                call_llm = (scan_count % 2 == 0)
+                call_llm = (scan_count % 10 == 0)
                 _run_once_new(config, north_fetcher, data_pool, call_llm=call_llm, scan_count=scan_count)
             else:
                 now = datetime.now()
@@ -875,6 +902,8 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         if t0_thread:
             t0_thread.stop()
         fetcher_thread.stop()
+        if bg_cache:
+            bg_cache.stop()
         log.info("All threads stopped")
 
 

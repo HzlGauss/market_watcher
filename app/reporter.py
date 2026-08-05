@@ -664,6 +664,12 @@ def generate_midday_review(config: Config) -> Path | None:
         data_lines.append(f"\n## 七、💰 主力资金动向")
         data_lines.append(fund_md_mid)
 
+    # 量能分析（午间，使用量比作为近似对比）
+    vol_mid_md, vol_mid_llm = _format_volume_section(quotes, holdings, {})
+    if vol_mid_md:
+        data_lines.append(f"\n## 八、📊 量能分析（半日数据）")
+        data_lines.append(vol_mid_md)
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 3. Build LLM prompt (compact)
@@ -738,6 +744,9 @@ def generate_midday_review(config: Config) -> Path | None:
 
     if fund_llm_mid:
         llm_lines.append(f"\n{fund_llm_mid}")
+
+    if vol_mid_llm:
+        llm_lines.append(f"\n{vol_mid_llm}")
 
     llm_lines.append(f"""
 
@@ -1112,6 +1121,137 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
         signals.append("尾盘拉升，主力做盘")
 
     return "; ".join(signals) if signals else "资金面中性"
+
+
+# ============================================================
+# 量能分析（独立章节，成交量对比 + 量价关系）
+# ============================================================
+
+def _format_volume_section(
+    quotes: list[Quote],
+    holdings: list[Holding],
+    prev_state: dict,
+) -> tuple[str, str]:
+    """生成量能分析章节，返回 (数据区Markdown, LLM紧凑文本)
+
+    对每个持仓标的，对比今日成交量与前日成交量，判断量能变化。
+    """
+    from app.technical import estimate_full_day_volume
+
+    if not quotes:
+        return "", ""
+
+    holding_codes = {h.code for h in holdings}
+    quote_map = {q.code: q for q in quotes}
+
+    rows: list[dict] = []
+    for code in holding_codes:
+        q = quote_map.get(code)
+        if not q or not q.volume or q.volume <= 0:
+            continue
+
+        # 估算今日全天成交量
+        today_vol = estimate_full_day_volume(q) or q.volume
+
+        # 前日成交量（从 monitor_state 取）
+        prev_vol = None
+        ps = prev_state.get(code, {})
+        if isinstance(ps, dict):
+            prev_vol = ps.get("volume")
+        # prev_state 也可能是数字（旧格式）
+        elif isinstance(ps, (int, float)):
+            prev_vol = float(ps)
+
+        # 量比（优先用 prev_state 计算，回退到 quote.volume_ratio）
+        vol_ratio = None
+        vol_signal = ""
+        if prev_vol and prev_vol > 0:
+            vol_ratio = today_vol / prev_vol
+        elif q.volume_ratio is not None and q.volume_ratio > 0:
+            vol_ratio = q.volume_ratio
+
+        if vol_ratio is not None:
+            if vol_ratio >= 2.0:
+                vol_signal = "🔴 大幅放量"
+            elif vol_ratio >= 1.5:
+                vol_signal = "🟠 放量"
+            elif vol_ratio >= 0.8:
+                vol_signal = "⚪ 持平"
+            elif vol_ratio >= 0.5:
+                vol_signal = "🔵 缩量"
+            else:
+                vol_signal = "🔷 大幅缩量"
+
+        # 量价关系
+        chg = q.change_pct or 0
+        if vol_signal and chg != 0:
+            if "放量" in vol_signal and chg > 0:
+                vol_signal += "上涨"
+            elif "放量" in vol_signal and chg < 0:
+                vol_signal += "下跌⚠️"
+            elif "缩量" in vol_signal and chg > 0:
+                vol_signal += "上涨"
+            elif "缩量" in vol_signal and chg < 0:
+                vol_signal += "下跌"
+
+        rows.append({
+            "name": q.name,
+            "code": q.code,
+            "today_vol": today_vol,
+            "prev_vol": prev_vol,
+            "vol_ratio": vol_ratio,
+            "vol_signal": vol_signal,
+            "turnover": q.turnover_rate,
+            "change_pct": chg,
+        })
+
+    if not rows:
+        return "", ""
+
+    # ---- Markdown 数据区 ----
+    md_lines = ["### 📊 量能分析", ""]
+    md_lines.append("| 标的 | 涨跌幅 | 今日量(估算) | 前日量 | 量比 | 换手率 | 量价信号 |")
+    md_lines.append("|------|--------|-------------|--------|------|--------|----------|")
+
+    llm_parts = ["[量能]"]
+    alerts_for_llm = []
+
+    for r in rows:
+        chg = f"{r['change_pct']:+.2f}%" if r['change_pct'] is not None else "--"
+        today_str = _format_volume_compact(r['today_vol'])
+        prev_str = _format_volume_compact(r['prev_vol']) if r['prev_vol'] else "--"
+        ratio_str = f"{r['vol_ratio']:.1f}x" if r['vol_ratio'] else "--"
+        tr_str = f"{r['turnover']:.2f}%" if r['turnover'] else "--"
+        sig = r['vol_signal'] or "--"
+
+        md_lines.append(
+            f"| {r['name']}({r['code']}) | {chg} | {today_str} "
+            f"| {prev_str} | {ratio_str} | {tr_str} | {sig} |"
+        )
+
+        # LLM 紧凑文本
+        if r['vol_signal']:
+            alerts_for_llm.append(f"{r['name']} {r['vol_signal']}({ratio_str})")
+
+    if alerts_for_llm:
+        llm_parts.append("; ".join(alerts_for_llm[:5]))
+    else:
+        llm_parts.append("量能平稳")
+
+    md = "\n".join(md_lines) + "\n"
+    return md, "\n".join(llm_parts)
+
+
+def _format_volume_compact(vol: float | None) -> str:
+    """紧凑格式化成交量"""
+    if vol is None:
+        return "--"
+    if vol >= 1e8:
+        return f"{vol/1e8:.2f}亿"
+    elif vol >= 1e4:
+        return f"{vol/1e4:.0f}万"
+    else:
+        return f"{vol:.0f}"
 
 
 # ============================================================
@@ -1510,6 +1650,7 @@ def generate_evening_review(config: Config) -> Path | None:
     data_lines.append(f"\n## 三、市场背景")
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
+    vol_llm = ""  # 量能分析 LLM 紧凑文本（在 h_results 块中填充）
     if h_results:
         holdings_with_analysis = []
         for h in h_results:
@@ -1596,6 +1737,12 @@ def generate_evening_review(config: Config) -> Path | None:
         for h in holdings_with_analysis:
             flow_color = "🔵" if "主力" in h["capital_flow"] else "⚪"
             data_lines.append(f"  {flow_color} {h['name']}({h['code']}): {h['capital_flow']}")
+
+        # 量能分析章节
+        vol_md, vol_llm = _format_volume_section(quotes, holdings, prev_state)
+        if vol_md:
+            data_lines.append(f"\n### 3.4 量能分析")
+            data_lines.append(vol_md)
 
     # Technical analysis for holdings
     tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
@@ -1776,6 +1923,9 @@ def generate_evening_review(config: Config) -> Path | None:
 
     if fund_llm_ev:
         llm_lines.append(f"\n{fund_llm_ev}")
+
+    if vol_llm:
+        llm_lines.append(f"\n{vol_llm}")
 
     if gap_bo_llm:
         llm_lines.append(f"\n{gap_bo_llm}")

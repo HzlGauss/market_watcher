@@ -265,10 +265,11 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         主力净流入金额（元），失败返回 None（静默失败，不记录日志）
     """
     secid = _get_secid(code, market)
+    # lmt=1 只取最新一条数据，klt=1 为1分钟粒度
     url = (f"{STOCK_FLOW_API}?secid={secid}"
-           f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
+           f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+           f"&lmt=1&klt=1")
 
-    # 使用无重试的session，避免产生大量WARNING日志
     import requests
     try:
         resp = requests.get(url, timeout=3, headers={
@@ -278,9 +279,16 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        if data.get("data") is None or not data["data"].get("f52"):
+        if data.get("data") is None:
             return None
-        return _parse_float(data["data"]["f52"])
+        # 数据在 klines 数组中，取最后一条的 f52（主力净流入）
+        klines = data["data"].get("klines")
+        if klines and len(klines) > 0:
+            last = klines[-1].split(",")
+            if len(last) > 1:
+                return _parse_float(last[1])
+        # 兼容旧格式：直接取顶层 f52
+        return _parse_float(data["data"].get("f52"))
     except Exception:
         return None  # 静默失败
 
@@ -288,20 +296,8 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
 def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
     """获取个股实时资金流向明细（超大单/大单/中单/小单）
 
-    使用东方财富 fflow/kline/get 接口（与 fetch_main_net_inflow 相同数据源），
-    解析 f52-f61 全部字段。
-
-    字段映射（fflow/kline/get）：
-        f52: 主力净流入（元）
-        f53: 小单净流入（元）
-        f54: 中单净流入（元）
-        f55: 大单净流入（元）
-        f56: 超大单净流入（元）
-        f57: 主力净占比（%）
-        f58: 小单净占比（%）
-        f59: 中单净占比（%）
-        f60: 大单净占比（%）
-        f61: 超大单净占比（%）
+    使用东方财富 fflow/kline/get 接口，lmt=1 取最新一条数据。
+    返回 klines 数组，每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单)
 
     Args:
         code: 股票代码
@@ -316,7 +312,8 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
         resp = requests.get(
             f"{STOCK_FLOW_API}?secid={secid}"
             f"&fields1=f1,f2,f3"
-            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+            f"&lmt=1&klt=1",
             timeout=5,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -329,19 +326,28 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
         if not data:
             return None
 
+        klines = data.get("klines")
+        if not klines or len(klines) == 0:
+            return None
+
+        # 解析最后一条 kline: 日期,f52,f53,f54,f55,f56,...
+        parts = klines[-1].split(",")
+        if len(parts) < 6:
+            return None
+
         flow = FundFlowDetail(
-            main_net=_parse_float(data.get("f52")),
-            main_pct=_parse_float(data.get("f57")),
-            super_large_net=_parse_float(data.get("f56")),
-            super_large_pct=_parse_float(data.get("f61")),
-            large_net=_parse_float(data.get("f55")),
-            large_pct=_parse_float(data.get("f60")),
-            medium_net=_parse_float(data.get("f54")),
-            medium_pct=_parse_float(data.get("f59")),
-            small_net=_parse_float(data.get("f53")),
-            small_pct=_parse_float(data.get("f58")),
+            main_net=_parse_float(parts[1]) if len(parts) > 1 else None,           # f52 主力净流入
+            small_net=_parse_float(parts[2]) if len(parts) > 2 else None,          # f53 小单（散户）
+            medium_net=_parse_float(parts[3]) if len(parts) > 3 else None,         # f54 中单
+            large_net=_parse_float(parts[4]) if len(parts) > 4 else None,          # f55 大单
+            super_large_net=_parse_float(parts[5]) if len(parts) > 5 else None,    # f56 超大单
+            # 占比字段在 f57-f61，当前 kline 可能不包含，暂设为 None
+            main_pct=None,
+            super_large_pct=None,
+            large_pct=None,
+            medium_pct=None,
+            small_pct=None,
         )
-        # 如果所有字段都是 None，视为无效
         if flow.main_net is None and flow.super_large_net is None:
             return None
         return flow
