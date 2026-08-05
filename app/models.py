@@ -482,6 +482,18 @@ class TechnicalSummary:
     gap_filled_pct: float = 0.0
     breakout_type: str = ""  # "突破近期高点" / "跌破近期低点" / ""
     breakout_detail: str = ""
+    # 关键位动态行为分析
+    has_resistance_rejection: bool = False
+    resistance_rejection_detail: str = ""
+    has_support_confirmation: bool = False
+    support_confirmation_detail: str = ""
+    has_support_breakdown: bool = False
+    support_breakdown_detail: str = ""
+    has_breakout_retest: bool = False
+    breakout_retest_detail: str = ""
+    support_strength: str = ""       # "强" / "中" / "弱"
+    resistance_strength: str = ""    # "强" / "中" / "弱"
+    strength_summary: str = ""
     signals: list[str] = field(default_factory=list)
 
 

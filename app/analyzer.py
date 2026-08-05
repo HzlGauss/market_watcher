@@ -418,11 +418,26 @@ def analyze(
             if tech.breakout_type:
                 items.append(f"🎯 {tech.breakout_detail}")
                 alert_count += 1
+            # 关键位动态行为信号
+            if tech.has_resistance_rejection:
+                items.append(f"🔴 {tech.resistance_rejection_detail}")
+                alert_count += 1
+            if tech.has_support_confirmation:
+                items.append(f"🟢 {tech.support_confirmation_detail}")
+                alert_count += 1
+            if tech.has_support_breakdown:
+                items.append(f"🚨 {tech.support_breakdown_detail}")
+                alert_count += 1
+            if tech.has_breakout_retest:
+                items.append(f"✅ {tech.breakout_retest_detail}")
+                alert_count += 1
             # 其他指标信号
+            KEY_LEVEL_FILTERS = ("跳空", "突破", "跌破", "受压回落", "支撑确认", "突破回踩确认", "支撑", "压力")
             for sig in tech.signals:
-                # 跳过已在上面处理过的跳空/突破信号
-                if "跳空" not in sig and "突破" not in sig and "跌破" not in sig:
-                    items.append(f"📐 {sig}")
+                # 跳过已在上面处理过的跳空/突破/关键位信号
+                if any(kw in sig for kw in KEY_LEVEL_FILTERS):
+                    continue
+                items.append(f"📐 {sig}")
 
         if items:
             alerts.append(Alert(code=q.code, name=q.name, messages=items))

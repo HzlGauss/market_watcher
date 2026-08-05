@@ -1253,6 +1253,32 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
     if breakout.has_breakout:
         signals.append(breakout.detail)
 
+    # ---- 关键位动态行为分析 ----
+    key_level = analyze_key_level_behavior(
+        klines,
+        quote.price or 0,
+        support=sr.support,
+        resistance=sr.resistance,
+        atr=sr.atr,
+        swing_supports=sr.swing_supports,
+        swing_resistances=sr.swing_resistances,
+        pivot_supports=sr.pivot_supports,
+        pivot_resistances=sr.pivot_resistances,
+        volume_clusters=sr.volume_clusters,
+    )
+    if key_level.has_resistance_rejection:
+        signals.append(f"🔴 受压回落: {key_level.resistance_rejection_detail}")
+    if key_level.has_support_confirmation:
+        signals.append(f"🟢 支撑确认: {key_level.support_confirmation_detail}")
+    if key_level.has_support_breakdown:
+        signals.append(f"🚨 跌破支撑: {key_level.support_breakdown_detail}")
+    if key_level.has_breakout_retest:
+        signals.append(f"✅ 突破回踩确认: {key_level.breakout_retest_detail}")
+    if key_level.support_strength in ("强", "中"):
+        signals.append(f"📊 支撑{key_level.support_strength}度: {key_level.strength_summary}")
+    if key_level.resistance_strength in ("强", "中"):
+        signals.append(f"📊 压力{key_level.resistance_strength}度: {key_level.strength_summary}")
+
     return TechnicalSummary(
         rsi=rsi,
         rsi_signal=rsi_signal(rsi),
@@ -1291,6 +1317,17 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         gap_filled_pct=gap.filled_pct,
         breakout_type=breakout.breakout_type,
         breakout_detail=breakout.detail,
+        has_resistance_rejection=key_level.has_resistance_rejection,
+        resistance_rejection_detail=key_level.resistance_rejection_detail,
+        has_support_confirmation=key_level.has_support_confirmation,
+        support_confirmation_detail=key_level.support_confirmation_detail,
+        has_support_breakdown=key_level.has_support_breakdown,
+        support_breakdown_detail=key_level.support_breakdown_detail,
+        has_breakout_retest=key_level.has_breakout_retest,
+        breakout_retest_detail=key_level.breakout_retest_detail,
+        support_strength=key_level.support_strength,
+        resistance_strength=key_level.resistance_strength,
+        strength_summary=key_level.strength_summary,
         signals=signals,
     )
 
@@ -1455,3 +1492,335 @@ def check_key_level_breakout(
         )
 
     return info
+
+
+# ============================================================
+# 支撑/压力位动态行为分析
+# ============================================================
+
+@dataclass
+class KeyLevelBehavior:
+    """支撑/压力位动态行为分析结果
+
+    检测价格在关键位（支撑/压力位）上的动态行为：
+    受压回落、支撑确认、跌破支撑、突破后回踩确认、关键位强度。
+    """
+    # 压力位受阻回落
+    has_resistance_rejection: bool = False
+    resistance_rejection_level: Optional[float] = None
+    resistance_rejection_detail: str = ""
+
+    # 支撑位有效确认
+    has_support_confirmation: bool = False
+    support_confirmation_level: Optional[float] = None
+    support_confirmation_detail: str = ""
+
+    # 跌破支撑位
+    has_support_breakdown: bool = False
+    support_breakdown_level: Optional[float] = None
+    support_breakdown_detail: str = ""
+
+    # 突破后回踩确认
+    has_breakout_retest: bool = False
+    breakout_retest_level: Optional[float] = None
+    breakout_retest_detail: str = ""
+
+    # 支撑/压力位强度
+    support_strength: str = ""       # "强" / "中" / "弱"
+    resistance_strength: str = ""    # "强" / "中" / "弱"
+    support_tests: int = 0
+    resistance_tests: int = 0
+    strength_summary: str = ""
+
+
+def _merge_nearby_levels(levels: list[float], atr: float, zone_mult: float = 0.5) -> list[float]:
+    """合并距离过近的关键位，返回去重后的关键位列表
+
+    两个价位在 ATR * zone_mult 范围内视为同一个区域，
+    取平均值作为合并后的价位。
+    """
+    if not levels or atr <= 0:
+        return list(levels)
+
+    merged: list[float] = []
+    zone = atr * zone_mult
+    remaining = sorted(set(levels))
+
+    while remaining:
+        pivot_level = remaining.pop(0)
+        group = [pivot_level]
+        # 收集所有在 zone 内的价位
+        i = 0
+        while i < len(remaining):
+            if abs(remaining[i] - pivot_level) <= zone:
+                group.append(remaining.pop(i))
+            else:
+                i += 1
+        merged.append(round(sum(group) / len(group), 3))
+
+    merged.sort()
+    return merged
+
+
+def _count_level_tests(
+    klines: list[KlineData],
+    level: float,
+    atr: float,
+    is_support: bool = True,
+    zone_mult: float = 0.5,
+) -> tuple[int, float]:
+    """统计历史K线中关键位被测试的次数，带时间衰减
+
+    Args:
+        klines: K线数据
+        level: 关键价位
+        atr: ATR
+        is_support: True=支撑位(看低点)，False=压力位(看高点)
+        zone_mult: 接近区域的ATR倍数
+
+    Returns:
+        (weighted_tests, raw_tests) 时间衰减后的测试次数和原始次数
+    """
+    if atr <= 0 or level <= 0:
+        return 0, 0
+
+    zone = atr * zone_mult
+    n = len(klines)
+    total_weight = 0.0
+    raw_count = 0
+
+    for idx, k in enumerate(klines):
+        if is_support:
+            price = k.low
+        else:
+            price = k.high
+        if price is None:
+            continue
+
+        if abs(price - level) <= zone:
+            raw_count += 1
+            # 时间衰减：最近 5 根权重 1.0，5-10 根 0.5，>10 根 0.25
+            bars_ago = n - 1 - idx
+            if bars_ago <= 5:
+                weight = 1.0
+            elif bars_ago <= 10:
+                weight = 0.5
+            else:
+                weight = 0.25
+            total_weight += weight
+
+    return round(total_weight, 1), raw_count
+
+
+def _calc_level_confluence(
+    level: float,
+    all_levels: list[float],
+    atr: float,
+    zone_mult: float = 0.5,
+) -> int:
+    """计算有多少个不同方法的关键位收敛在同一区域
+
+    Returns:
+        收敛的方法数 (≥3 → 强, 2 → 中, 1 → 弱)
+    """
+    if atr <= 0 or level <= 0:
+        return 1
+    zone = atr * zone_mult
+    count = sum(1 for lv in all_levels if abs(lv - level) <= zone)
+    return count
+
+
+def _assess_level_strength(
+    klines: list[KlineData],
+    support: Optional[float],
+    resistance: Optional[float],
+    atr: Optional[float],
+    all_supports: list[float],
+    all_resistances: list[float],
+) -> tuple[str, str, int, int, str]:
+    """评估支撑位和压力位的强度
+
+    Returns:
+        (support_strength, resistance_strength, support_tests, resistance_tests, summary)
+    """
+    if atr is None or atr <= 0:
+        return "", "", 0, 0, ""
+
+    sup_strength = ""
+    res_strength = ""
+    sup_tests = 0
+    res_tests = 0
+    parts: list[str] = []
+
+    # 支撑位强度
+    if support is not None and support > 0:
+        weighted, _ = _count_level_tests(klines, support, atr, is_support=True)
+        sup_tests = max(1, round(weighted)) if weighted > 0 else 0
+        confluence = _calc_level_confluence(support, all_supports, atr)
+        if confluence >= 3 and weighted >= 3:
+            sup_strength = "强"
+        elif confluence >= 2 and weighted >= 2:
+            sup_strength = "中"
+        elif weighted >= 0.5:
+            sup_strength = "弱"
+        parts.append(f"支撑{support:.3f}: {sup_strength}({confluence}法共振,{weighted:.0f}次测试)")
+
+    # 压力位强度
+    if resistance is not None and resistance > 0:
+        weighted, _ = _count_level_tests(klines, resistance, atr, is_support=False)
+        res_tests = max(1, round(weighted)) if weighted > 0 else 0
+        confluence = _calc_level_confluence(resistance, all_resistances, atr)
+        if confluence >= 3 and weighted >= 3:
+            res_strength = "强"
+        elif confluence >= 2 and weighted >= 2:
+            res_strength = "中"
+        elif weighted >= 0.5:
+            res_strength = "弱"
+        parts.append(f"压力{resistance:.3f}: {res_strength}({confluence}法共振,{weighted:.0f}次测试)")
+
+    return sup_strength, res_strength, sup_tests, res_tests, "; ".join(parts)
+
+
+def analyze_key_level_behavior(
+    klines: list[KlineData],
+    current_price: float,
+    support: Optional[float],
+    resistance: Optional[float],
+    atr: Optional[float],
+    swing_supports: Optional[list[float]] = None,
+    swing_resistances: Optional[list[float]] = None,
+    pivot_supports: Optional[list[float]] = None,
+    pivot_resistances: Optional[list[float]] = None,
+    volume_clusters: Optional[list[float]] = None,
+) -> KeyLevelBehavior:
+    """分析价格在支撑/压力位上的动态行为
+
+    检测 5 类信号：
+    1. 压力位受阻回落：近期高点接近压力位后回落
+    2. 支撑位有效确认：近期低点接近支撑位后反弹
+    3. 跌破支撑位：当前价跌破关键支撑
+    4. 突破后回踩确认：突破压力位后回落并站稳原压力位上方
+    5. 支撑/压力位强度：多方法共振 + 历史测试次数评估
+
+    Args:
+        klines: 历史K线数据（至少 10 根）
+        current_price: 当前价格
+        support: 主支撑位
+        resistance: 主压力位
+        atr: ATR 值
+        swing_supports: 摆动低点支撑位列表
+        swing_resistances: 摆动高点压力位列表
+        pivot_supports: 枢轴支撑位列表
+        pivot_resistances: 枢轴压力位列表
+        volume_clusters: 成交密集区列表
+
+    Returns:
+        KeyLevelBehavior 对象
+    """
+    result = KeyLevelBehavior()
+
+    if not klines or len(klines) < 5 or current_price <= 0:
+        return result
+
+    if atr is None or atr <= 0:
+        atr = current_price * 0.02  # 回退：假设 2% ATR
+
+    # 收集所有支撑和压力位
+    swing_supports = swing_supports or []
+    swing_resistances = swing_resistances or []
+    pivot_supports = pivot_supports or []
+    pivot_resistances = pivot_resistances or []
+    volume_clusters = volume_clusters or []
+    all_sups = swing_supports + pivot_supports + volume_clusters
+    all_res = swing_resistances + pivot_resistances + volume_clusters
+
+    # 接近阈值
+    proximity_zone = atr * 0.8       # "接近" 关键位的区域
+    meaningful_move = atr * 0.4      # "有效" 反弹/回落的最小幅度
+    retest_zone = atr * 0.6          # 回踩确认的容忍区域
+    lookback_bars = min(15, len(klines) - 1)
+
+    recent_bars = klines[-lookback_bars - 1:]  # 包含最近 lookback 根K线（不含可能的当日）
+
+    # ---- 1. 压力位受阻回落 ----
+    if resistance is not None and resistance > 0:
+        recent_highs = [(k.high, k.date) for k in recent_bars if k.high is not None]
+        for high, date in recent_highs:
+            if abs(high - resistance) <= proximity_zone:
+                # 高点接近压力位，检查是否有回落
+                decline = high - current_price
+                if decline >= meaningful_move and current_price < resistance:
+                    decline_pct = (decline / high) * 100
+                    result.has_resistance_rejection = True
+                    result.resistance_rejection_level = resistance
+                    result.resistance_rejection_detail = (
+                        f"价格在{date}触及压力{resistance:.3f}(高点{high:.3f})后回落，"
+                        f"当前{current_price:.3f}低于该高点{decline_pct:.1f}%，压力有效"
+                    )
+                    break
+
+    # ---- 2. 支撑位有效确认 ----
+    if support is not None and support > 0:
+        recent_lows = [(k.low, k.date) for k in recent_bars if k.low is not None]
+        for low, date in recent_lows:
+            if abs(low - support) <= proximity_zone:
+                # 低点接近支撑位，检查是否有反弹
+                bounce = current_price - low
+                if bounce >= meaningful_move and current_price > support:
+                    bounce_pct = (bounce / low) * 100
+                    result.has_support_confirmation = True
+                    result.support_confirmation_level = support
+                    result.support_confirmation_detail = (
+                        f"价格在{date}回踩支撑{support:.3f}(低点{low:.3f})后反弹，"
+                        f"当前{current_price:.3f}高于该低点{bounce_pct:.1f}%，支撑有效"
+                    )
+                    break
+
+    # ---- 3. 跌破支撑位 ----
+    if support is not None and support > 0 and current_price < support:
+        breakdown_pct = (support - current_price) / support * 100
+        # 跌破幅度需要有意义（超过 0.3 × ATR 的百分比）
+        if breakdown_pct >= (atr / current_price * 30):  # at least 30% of daily ATR as %
+            result.has_support_breakdown = True
+            result.support_breakdown_level = support
+            result.support_breakdown_detail = (
+                f"当前价{current_price:.3f}跌破主支撑{support:.3f}，"
+                f"偏离{breakdown_pct:.1f}%，支撑可能失效"
+            )
+
+    # ---- 4. 突破压力位后回踩确认 ----
+    if resistance is not None and resistance > 0 and current_price > resistance:
+        # 1) 先找是否有近期突破（高点 > 压力位）
+        breakout_found = False
+        breakout_bar_idx = -1
+        for i, k in enumerate(recent_bars):
+            if k.high is not None and k.high > resistance:
+                breakout_found = True
+                breakout_bar_idx = i
+                break
+
+        if breakout_found:
+            # 2) 突破后是否有回踩（低点回到原压力位 ± retest_zone）
+            for j in range(breakout_bar_idx + 1, len(recent_bars)):
+                k = recent_bars[j]
+                if k.low is not None and abs(k.low - resistance) <= retest_zone:
+                    # 回踩确认：低点触及原压力位（现为支撑），且当前价站稳上方
+                    result.has_breakout_retest = True
+                    result.breakout_retest_level = resistance
+                    result.breakout_retest_detail = (
+                        f"突破压力{resistance:.3f}后在{k.date}回踩确认"
+                        f"(低点{k.low:.3f})，当前{current_price:.3f}站稳上方，突破有效"
+                    )
+                    break
+
+    # ---- 5. 支撑/压力位强度 ----
+    sup_str, res_str, sup_t, res_t, str_summary = _assess_level_strength(
+        klines, support, resistance, atr, all_sups, all_res
+    )
+    result.support_strength = sup_str
+    result.resistance_strength = res_str
+    result.support_tests = sup_t
+    result.resistance_tests = res_t
+    result.strength_summary = str_summary
+
+    return result
