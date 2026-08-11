@@ -90,12 +90,12 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         return
 
     header = (
-        f"{'代码':>8} {'名称':<12} {'最新价':>8} "
+        f"{'代码':>8} {'名称':<12} {'最新价':>8} {'均价':>8} "
         f"{'涨跌幅':>8} {'主力净流入':>10} {'资金信号':<8} "
         f"{'委比':>6} {'量比':>6} {'成交量':>10} {'换手率':>8} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 101}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 110}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -167,8 +167,18 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         else:
             tr_str = f"{Color.DIM}--{Color.RESET}"
 
+        # 均价（黄线）：现价与均价对比着色
+        if q.avg_price is not None and q.avg_price > 0:
+            avg_str = f"{q.avg_price:.3f}"
+            if q.price and q.price > q.avg_price * 1.01:
+                avg_str = f"{Color.RED}{avg_str}{Color.RESET}"  # 现价高于均价=偏强
+            elif q.price and q.price < q.avg_price * 0.99:
+                avg_str = f"{Color.GREEN}{avg_str}{Color.RESET}"  # 现价低于均价=偏弱
+        else:
+            avg_str = f"{Color.DIM}--{Color.RESET}"
+
         line = (
-            f"{q.code:>8} {q.name:<12} {price:>8} {cp:>8} "
+            f"{q.code:>8} {q.name:<12} {price:>8} {avg_str:>8} {cp:>8} "
             f"{flow_str:>10} {sig_str:<8} "
             f"{bar_str:>6} {vr_str:>6} {vol_str:>10} {tr_str:>8} {amp_str:>7}"
         )

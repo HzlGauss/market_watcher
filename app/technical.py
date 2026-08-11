@@ -1304,6 +1304,7 @@ def get_technical_summary(quote: Quote, klines: list[KlineData]) -> TechnicalSum
         bb_width=bb.width,
         bb_signal=bb.signal,
         obv=obv.obv,
+        obv_signal=obv.signal,
         ma5=ma.ma5,
         ma10=ma.ma10,
         ma20=ma.ma20,
@@ -1824,3 +1825,212 @@ def analyze_key_level_behavior(
     result.strength_summary = str_summary
 
     return result
+
+
+# ============================================================
+# 市场状态识别 + 多信号共振评分
+# ============================================================
+
+@dataclass
+class MarketRegime:
+    """市场状态评估"""
+    regime: str = ""          # "趋势上涨"/"趋势下跌"/"震荡偏多"/"震荡偏空"/"窄幅震荡"
+    confidence: str = ""      # "高"/"中"/"低"
+    suggestion: str = ""      # 策略建议
+    trend_strength: float = 0.0  # 趋势强度 0-100
+    bb_squeeze: bool = False  # 布林带收窄（变盘前兆）
+
+
+def detect_market_regime(
+    tech: TechnicalSummary,
+    price: float,
+    atr: Optional[float] = None,
+) -> MarketRegime:
+    """识别当前市场状态（趋势/震荡），指导策略选择
+
+    规则：
+    - 均线多头/空头 + BB 带宽 > 中位值 → 趋势市
+    - 均线缠绕 + BB 带宽 < 中位值 → 震荡市
+    - 趋势强度 = |price - MA20| / ATR，> 2 为强趋势
+    """
+    result = MarketRegime()
+
+    if not price or price <= 0:
+        return result
+
+    ma_align = tech.ma_alignment
+    bb_width = tech.bb_width
+    rsi = tech.rsi
+
+    # 趋势强度
+    if tech.ma20 and tech.ma20 > 0 and atr and atr > 0:
+        result.trend_strength = round(abs(price - tech.ma20) / atr, 1)
+    else:
+        result.trend_strength = 1.0
+
+    # BB 收窄检测
+    if bb_width and bb_width < 5.0:
+        result.bb_squeeze = True
+
+    # 状态判断
+    if ma_align in ("多头排列",):
+        if result.trend_strength >= 2.0:
+            result.regime = "趋势上涨"
+            result.confidence = "高"
+        else:
+            result.regime = "趋势上涨"
+            result.confidence = "中"
+    elif ma_align in ("空头排列",):
+        if result.trend_strength >= 2.0:
+            result.regime = "趋势下跌"
+            result.confidence = "高"
+        else:
+            result.regime = "趋势下跌"
+            result.confidence = "中"
+    elif ma_align in ("多头回调",) and rsi and rsi < 50:
+        result.regime = "震荡偏多"
+        result.confidence = "中"
+    elif ma_align in ("空头反弹",) and rsi and rsi > 50:
+        result.regime = "震荡偏空"
+        result.confidence = "中"
+    elif result.bb_squeeze:
+        result.regime = "窄幅震荡"
+        result.confidence = "高"
+    else:
+        result.regime = "震荡"
+        result.confidence = "低"
+
+    # 策略建议
+    if result.regime.startswith("趋势上涨"):
+        result.suggestion = "顺势做多，回调买入，不逆势做空"
+    elif result.regime.startswith("趋势下跌"):
+        result.suggestion = "反弹减仓，不抄底"
+    elif result.regime.startswith("震荡"):
+        result.suggestion = "高抛低吸，支撑买压力卖"
+    elif result.regime == "窄幅震荡":
+        result.suggestion = "观望等突破，做T空间小"
+
+    return result
+
+
+def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
+    """多信号共振加权评分（0-100）
+
+    权重分配：
+    - 趋势（MA 排列）: 25分
+    - 动量（RSI + KDJ）: 25分
+    - 量价（量比 + OBV）: 20分
+    - 资金（主力流向）: 15分（外部传入）
+    - 关键位（支撑/压力）: 15分
+
+    Returns:
+        {"score": int, "label": str, "breakdown": dict, "signals": list}
+    """
+    score = 50  # 中性起始
+    breakdown: dict[str, int] = {"趋势": 0, "动量": 0, "量价": 0, "资金": 0, "关键位": 0}
+    signals: list[str] = []
+
+    # 趋势 25分
+    ma = tech.ma_alignment
+    if ma == "多头排列":
+        breakdown["趋势"] = 20
+        signals.append("MA多头")
+    elif ma == "多头回调":
+        breakdown["趋势"] = 10
+        signals.append("MA多头回调(回踩)")
+    elif ma == "空头反弹":
+        breakdown["趋势"] = -10
+        signals.append("MA空头反弹(反压)")
+    elif ma == "空头排列":
+        breakdown["趋势"] = -20
+        signals.append("MA空头")
+    # MA20 斜率辅助
+    if tech.ma5 and tech.ma20 and tech.ma5 > tech.ma20:
+        breakdown["趋势"] += 5 if breakdown["趋势"] > 0 else -5
+
+    # 动量 25分（RSI + KDJ）
+    rsi = tech.rsi
+    if rsi is not None:
+        if 40 <= rsi <= 60:
+            breakdown["动量"] = 0  # 中性
+        elif 30 <= rsi < 40:
+            breakdown["动量"] = 10
+            signals.append("RSI偏低(超卖边缘)")
+        elif 60 < rsi <= 70:
+            breakdown["动量"] = -10
+            signals.append("RSI偏高(超买边缘)")
+        elif rsi < 30:
+            breakdown["动量"] = 15
+            signals.append("RSI超卖")
+        elif rsi > 70:
+            breakdown["动量"] = -15
+            signals.append("RSI超买")
+    # KDJ 交叉
+    kdj_sig = tech.kdj_signal
+    if "金叉" in kdj_sig:
+        breakdown["动量"] += 10 if breakdown["动量"] >= 0 else 5
+    elif "死叉" in kdj_sig:
+        breakdown["动量"] -= 10
+
+    # 量价 20分
+    obv_sig = tech.obv_signal
+    bb_sig = tech.bb_signal
+    if obv_sig and obv_sig not in ("中性", "数据不足"):
+        if "流入" in obv_sig or "背离" in obv_sig:
+            breakdown["量价"] += 10
+            signals.append(f"OBV{obv_sig}")
+        elif "流出" in obv_sig:
+            breakdown["量价"] -= 10
+            signals.append(f"OBV{obv_sig}")
+    # BB 位置 + 带宽
+    if "下轨" in bb_sig:
+        breakdown["量价"] += 5
+        signals.append("BB下轨(超跌)")
+    elif "上轨" in bb_sig:
+        breakdown["量价"] -= 5
+        signals.append("BB上轨(超涨)")
+    if tech.bb_width is not None and tech.bb_width < 5.0:
+        breakdown["量价"] += 3
+        signals.append("BB挤压(变盘临近)")
+
+    # 均线乖离（中期极端）
+    if tech.ma60 and price and tech.ma60 > 0:
+        dev = (price - tech.ma60) / tech.ma60 * 100
+        if dev > 25:
+            breakdown["趋势"] -= 10
+            signals.append(f"MA60乖离+{dev:.0f}%(顶部)")
+        elif dev < -20:
+            breakdown["趋势"] += 10
+            signals.append(f"MA60乖离{dev:.0f}%(底部)")
+
+    # 关键位 15分
+    if tech.has_support_confirmation:
+        breakdown["关键位"] = 10
+        signals.append("支撑确认")
+    elif tech.has_resistance_rejection:
+        breakdown["关键位"] = -10
+        signals.append("压力受阻")
+    if tech.has_breakout_retest:
+        breakdown["关键位"] += 5
+        signals.append("突破回踩")
+    if tech.has_support_breakdown:
+        breakdown["关键位"] -= 10
+        signals.append("跌破支撑")
+
+    # 汇总
+    for v in breakdown.values():
+        score += v
+    score = max(0, min(100, score))
+
+    if score >= 70:
+        label = "🟢 强烈看多"
+    elif score >= 60:
+        label = "🟢 偏多"
+    elif score >= 45:
+        label = "⚪ 中性"
+    elif score >= 35:
+        label = "🟡 偏空"
+    else:
+        label = "🔴 强烈看空"
+
+    return {"score": score, "label": label, "breakdown": breakdown, "signals": signals}

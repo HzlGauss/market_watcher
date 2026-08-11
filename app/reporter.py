@@ -158,6 +158,69 @@ def _get_holdings_strategy_signals(
     return results
 
 
+def _format_nearby_levels(
+    sr, price: float, atr: Optional[float]
+) -> tuple[str, str]:
+    """提取附近较强的支撑位和压力位列表
+
+    Returns:
+        (support_list_str, resistance_list_str) 格式化的字符串
+    """
+    if not price or price <= 0:
+        return "", ""
+
+    atr_val = atr if atr and atr > 0 else price * 0.02
+    zone = atr_val * 0.5  # 合并阈值
+
+    def _collect_and_merge(levels: list[float], above: bool) -> list[tuple[float, str]]:
+        """收集并合并邻近价位，标注来源"""
+        if not levels:
+            return []
+        # 筛选方向上合理的价位
+        if above:
+            candidates = [lv for lv in levels if lv and lv > price * 1.005]
+        else:
+            candidates = [lv for lv in levels if lv and lv < price * 0.995]
+        if not candidates:
+            return []
+        # 合并邻近的
+        candidates.sort(reverse=not above)
+        merged: list[tuple[float, str]] = []
+        used = set()
+        for i, lv1 in enumerate(candidates):
+            if i in used:
+                continue
+            group = [lv1]
+            for j in range(i + 1, len(candidates)):
+                if j in used:
+                    continue
+                if abs(candidates[j] - lv1) <= zone:
+                    group.append(candidates[j])
+                    used.add(j)
+            merged.append((round(sum(group) / len(group), 3),
+                           f"{len(group)}重" if len(group) > 1 else ""))
+        return merged
+
+    # 收集各类支撑/压力
+    all_sups = (sr.swing_supports or []) + (sr.pivot_supports or []) + (sr.volume_clusters or [])
+    all_res = (sr.swing_resistances or []) + (sr.pivot_resistances or []) + (sr.volume_clusters or [])
+
+    sup_list = _collect_and_merge(all_sups, above=False)
+    res_list = _collect_and_merge(all_res, above=True)
+
+    # 只保留距离在合理范围内的（< 15%）
+    sup_str = ", ".join(
+        f"{lv:.3f}{'(' + tag + ')' if tag else ''}(距{(price-lv)/price*100:.1f}%)"
+        for lv, tag in sup_list[:5] if (price - lv) / price < 0.15
+    ) if sup_list else ""
+    res_str = ", ".join(
+        f"{lv:.3f}{'(' + tag + ')' if tag else ''}(距{(lv-price)/price*100:.1f}%)"
+        for lv, tag in res_list[:5] if (lv - price) / price < 0.15
+    ) if res_list else ""
+
+    return sup_str, res_str
+
+
 def _get_holdings_tech_analysis(
     holdings: list[Holding],
     quotes: list[Quote],
@@ -175,6 +238,11 @@ def _get_holdings_tech_analysis(
         calc_macd,
         calc_kdj,
         calc_obv,
+        calc_ma_alignment,
+        get_technical_summary,
+        calc_composite_score,
+        detect_market_regime,
+        MarketRegime,
         rsi_signal,
         detect_gap,
         check_key_level_breakout,
@@ -218,6 +286,9 @@ def _get_holdings_tech_analysis(
             volume_clusters=sr.volume_clusters,
         )
 
+        # 附近较强的支撑/压力位
+        nearby_sups, nearby_res = _format_nearby_levels(sr, quote.price or 0, sr.atr)
+
         # 技术指标
         closes = [k.close for k in klines if k.close is not None]
         highs = [k.high for k in klines if k.high is not None]
@@ -227,8 +298,18 @@ def _get_holdings_tech_analysis(
         macd = calc_macd(closes)
         kdj = calc_kdj(highs, lows, closes)
         obv = calc_obv(klines)
+        ma = calc_ma_alignment(klines)
 
-        # 综合支撑/压力位描述
+        # 复合评分 + 市场状态（独立 try，不影响其他数据返回）
+        try:
+            tech_summary = get_technical_summary(quote, klines)
+            composite = calc_composite_score(tech_summary, quote.price or 0)
+            regime = detect_market_regime(tech_summary, quote.price or 0, sr.atr)
+        except Exception as exc:
+            composite = {"score": 0, "label": "", "signals": [], "breakdown": {}}
+            regime = MarketRegime(regime="未知", suggestion="", confidence="低")
+            from app.utils import log
+            log.warning(f"复合评分计算失败 [{h.code}]: {exc}")
         support_parts = []
         if sr.support:
             support_parts.append(f"主支撑:{sr.support:.3f}")
@@ -244,6 +325,22 @@ def _get_holdings_tech_analysis(
             resistance_parts.append(f"摆动压力:{','.join(f'{r:.3f}' for r in sr.swing_resistances[:2])}")
         if sr.pivot_resistances:
             resistance_parts.append(f"枢轴压力:{sr.pivot_resistances[0]:.3f}")
+
+        # 拥挤度检测
+        crowd_score = 0
+        if quote.change_pct and abs(quote.change_pct) > 3:
+            crowd_score += 1
+        if quote.volume_ratio and quote.volume_ratio >= 2.5:
+            crowd_score += 1
+        if quote.main_net_inflow and quote.amount and quote.amount > 0:
+            if abs(quote.main_net_inflow) / quote.amount * 100 >= 25:
+                crowd_score += 2
+        if quote.turnover_rate and quote.turnover_rate >= 10:
+            crowd_score += 1
+        if quote.avg_price and quote.price and quote.avg_price > 0:
+            if abs(quote.price - quote.avg_price) / quote.avg_price * 100 > 4:
+                crowd_score += 1
+        crowd_label = f"🚨 极高拥挤(×{crowd_score})" if crowd_score >= 4 else (f"⚠️ 高拥挤(×{crowd_score})" if crowd_score >= 3 else "")
 
         return {
             "name": h.name,
@@ -264,8 +361,12 @@ def _get_holdings_tech_analysis(
             "kdj_k": kdj.k,
             "obv": obv.obv,
             "obv_signal": obv.signal,
+            "ma_alignment": ma.alignment,
+            "ma_alignment_detail": ma.detail,
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
+            "volume_ratio": quote.volume_ratio,
+            "avg_price": quote.avg_price,
             "volume_clusters": sr.volume_clusters,
             # 跳空缺口 & 关键位突破
             "has_gap": gap.has_gap,
@@ -287,6 +388,16 @@ def _get_holdings_tech_analysis(
             "support_strength": key_level.support_strength,
             "resistance_strength": key_level.resistance_strength,
             "strength_summary": key_level.strength_summary,
+            # 附近较强的支撑/压力位
+            "nearby_supports": nearby_sups,
+            "nearby_resistances": nearby_res,
+            "composite_score": composite["score"],
+            "composite_label": composite["label"],
+            "composite_signals": composite["signals"],
+            "market_regime": regime.regime,
+            "regime_suggestion": regime.suggestion,
+            "crowd_score": crowd_score,
+            "crowd_label": crowd_label,
         }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -398,6 +509,19 @@ def generate_morning_brief(config: Config) -> Path | None:
     quotes = fetch_quotes_rich(all_items)
 
     # 2. Build data section (shown in report)
+    # 加载前日收盘缓存（晚报运行时保存的）
+    import json
+    morning_cache = {}
+    cache_path = Path(__file__).resolve().parent.parent / "state" / "morning_cache.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                morning_cache = json.load(f)
+            if morning_cache.get("_date") != datetime.now().strftime("%Y-%m-%d"):
+                morning_cache = {}  # 过期缓存
+        except Exception:
+            morning_cache = {}
+
     data_lines = []
 
     if global_data:
@@ -414,16 +538,18 @@ def generate_morning_brief(config: Config) -> Path | None:
     if quotes:
         # 使用全部标的（持仓+自选）计算情绪评分
         all_quotes = [q for q in quotes if q.change_pct is not None]
-        from app.data_fetcher import fetch_market_breadth
+        from app.data_fetcher import fetch_market_breadth, enrich_quotes_with_industry, fetch_sector_boards, fetch_major_indices
         sentiment = calc_market_sentiment(all_quotes, breadth=fetch_market_breadth())
-        data_lines.append(f"\n## 三、昨日A股收盘数据")
-        data_lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
 
-        index_quotes = [q for q in quotes if q.type == "指数"]
-        for idx in index_quotes:
-            close = f"{idx.price:.2f}" if idx.price else "--"
-            chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
-            data_lines.append(f"- {idx.name}: {close} ({chg})")
+        # 大盘及行业板块（昨收参考）
+        enrich_quotes_with_industry(quotes)
+        sector_boards_mb = fetch_sector_boards()
+        major_indices_mb = fetch_major_indices()
+        sector_md_mb, sector_llm_mb = _format_market_sector_section(quotes, major_indices_mb, sector_boards_mb)
+        if sector_md_mb:
+            data_lines.append(f"\n## 三、📈 大盘及行业板块（昨收参考）")
+            data_lines.append(f"- 情绪评分: {sentiment.score}/100 ({sentiment.label})")
+            data_lines.append(sector_md_mb)
 
         holdings = config.holdings
         if holdings:
@@ -432,6 +558,17 @@ def generate_morning_brief(config: Config) -> Path | None:
                 data_lines.append(f"\n## 四、持仓概况（昨收，开盘前参考）")
                 for h in h_results[:5]:
                     data_lines.append(f"  - {h['name']}（昨收）")
+            elif morning_cache.get("holdings"):
+                # 从缓存加载昨收数据
+                cached_holdings = morning_cache["holdings"]
+                data_lines.append(f"\n## 四、持仓概况（昨收，来自缓存）")
+                for h in cached_holdings[:5]:
+                    chg = f"({h['change_pct']:+.2f}%)" if h.get("change_pct") is not None else ""
+                    data_lines.append(f"  - {h['name']}: 收盘{h['price']:.3f}{chg}")
+                # 缓存中取更多数据显示
+                for h in cached_holdings[5:]:
+                    chg = f"({h['change_pct']:+.2f}%)" if h.get("change_pct") is not None else ""
+                    data_lines.append(f"  - {h['name']}: 收盘{h['price']:.3f}{chg}")
 
     # Fetch technical analysis and strategy signals (shared by data section + LLM)
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings and quotes else []
@@ -445,6 +582,21 @@ def generate_morning_brief(config: Config) -> Path | None:
 
     # 主力资金动向（昨日参考）
     fund_md, fund_llm = _format_fund_flow_section(quotes, label="自选")
+    if not fund_md and morning_cache.get("fund_flow"):
+        # 从缓存加载资金流数据
+        cached_flow = morning_cache["fund_flow"]
+        if cached_flow:
+            fund_llm_parts = ["[自选主力资金(缓存)]"]
+            data_lines.append(f"\n## 六、💰 主力资金动向（昨收，来自缓存）")
+            data_lines.append("| 标的 | 涨跌幅 | 主力净流入占比 | 资金结构 |")
+            data_lines.append("|------|--------|--------------|---------|")
+            for f in cached_flow[:10]:
+                chg = f"{f['change_pct']:+.2f}%" if f.get("change_pct") is not None else "--"
+                fp = f"{f['flow_pct']:+.1f}%" if f.get("flow_pct") is not None else "--"
+                label = f.get("flow_label", "--")
+                data_lines.append(f"| {f['name']}({f['code']}) | {chg} | {fp} | {label} |")
+            data_lines.append("")
+            fund_llm = "\n".join(fund_llm_parts) if fund_llm_parts else ""
     if fund_md:
         data_lines.append(f"\n## 六、💰 主力资金动向（昨收参考）")
         data_lines.append(fund_md)
@@ -514,6 +666,9 @@ def generate_morning_brief(config: Config) -> Path | None:
                 clusters = t['volume_clusters']
                 parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
+            vr_v = t.get("volume_ratio")
+            if vr_v is not None and vr_v > 0:
+                parts.append(f"量比{vr_v:.1f}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
@@ -532,8 +687,22 @@ def generate_morning_brief(config: Config) -> Path | None:
         llm_lines.append("\n[📊 仓位建议摘要]")
         llm_lines.append(pos_llm)
 
+    if sector_llm_mb:
+        llm_lines.append("\n[📈 大盘及行业板块（昨收）]")
+        llm_lines.append(sector_llm_mb)
+
     if fund_llm:
         llm_lines.append(f"\n{fund_llm}")
+
+    # 附近关键位（紧凑格式）
+    nearby_mb = []
+    for t in (tech_data or []):
+        sups = t.get("nearby_supports", "")
+        ress = t.get("nearby_resistances", "")
+        if sups or ress:
+            nearby_mb.append(f"{t['name']}: 支撑[{sups}] 压力[{ress}]")
+    if nearby_mb:
+        llm_lines.append("\n[📌 附近关键位] " + "; ".join(nearby_mb[:8]))
 
     # 关键位动态行为
     key_level_md, key_level_llm = _format_key_level_behavior_section(tech_data)
@@ -574,7 +743,7 @@ def generate_morning_brief(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 6. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="morning_brief", temperature=0.4, max_tokens=2000)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="morning_brief", temperature=0.4, max_tokens=2500)
     if not llm_content:
         log.warning("Morning brief: LLM generation failed")
 
@@ -659,11 +828,21 @@ def generate_midday_review(config: Config) -> Path | None:
             detail += f" | 换手:{q.turnover_rate:.2f}%"
         data_lines.append(detail)
 
+    # 大盘及行业板块（午间实时）
+    from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards, fetch_major_indices
+    enrich_quotes_with_industry(quotes)
+    sector_boards_mid = fetch_sector_boards()
+    major_indices_mid = fetch_major_indices()
+    sector_md_mid, sector_llm_mid = _format_market_sector_section(quotes, major_indices_mid, sector_boards_mid)
+    if sector_md_mid:
+        data_lines.append(f"\n## 四、📈 大盘及行业板块（午间实时）")
+        data_lines.append(sector_md_mid)
+
     holdings = config.holdings
     if holdings:
         h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
         if h_results:
-            data_lines.append(f"\n## 四、持仓午间扫描")
+            data_lines.append(f"\n## 五、持仓午间扫描")
             for h in h_results:
                 data_lines.append(f"  - {h['name']}({h['code']}): {h['amount']}股")
 
@@ -671,12 +850,14 @@ def generate_midday_review(config: Config) -> Path | None:
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings else []
     strategy_signals = _get_holdings_strategy_signals(holdings, quotes) if holdings else []
     if tech_data:
-        data_lines.append("\n## 五、持仓技术分析")
+        data_lines.append("\n## 六、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|------|--------|------|------|-----|------|-----|-----|--------|--------|")
         for t in tech_data:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
+            avg_p_val = t.get('avg_price')
+            avg_str = f"{avg_p_val:.3f}" if avg_p_val else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
             sup = t.get('support_desc', '--')
             res = t.get('resistance_desc', '--')
@@ -689,10 +870,12 @@ def generate_midday_review(config: Config) -> Path | None:
             obv_val = f"{t['obv']:.0f}({t['obv_signal']})" if t.get('obv') is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
+            vr_val = t.get('volume_ratio')
+            vr_str = f"{vr_val:.1f}" if vr_val is not None and vr_val > 0 else "--"
+            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals:
-        data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，下午操作参考）")
+        data_lines.append(f"\n## 七、⭐ 组合策略信号（多指标共振，下午操作参考）")
         for s in strategy_signals:
             for sig_text in s['signals']:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
@@ -700,25 +883,25 @@ def generate_midday_review(config: Config) -> Path | None:
     # 仓位建议摘要
     pos_md_mid, pos_llm_mid2 = _format_position_summary(strategy_signals if strategy_signals else [], tech_data if tech_data else [])
     if pos_md_mid:
-        data_lines.append(f"\n## 七、📊 仓位操作建议")
+        data_lines.append(f"\n## 八、📊 仓位操作建议")
         data_lines.append(pos_md_mid)
 
     # 主力资金流向
     fund_md_mid, fund_llm_mid = _format_fund_flow_section(quotes, label="自选")
     if fund_md_mid:
-        data_lines.append(f"\n## 八、💰 主力资金动向")
+        data_lines.append(f"\n## 九、💰 主力资金动向")
         data_lines.append(fund_md_mid)
 
     # 量能分析（午间，使用量比作为近似对比）
     vol_mid_md, vol_mid_llm = _format_volume_section(quotes, holdings, {})
     if vol_mid_md:
-        data_lines.append(f"\n## 九、📊 量能分析（半日数据）")
+        data_lines.append(f"\n## 十、📊 量能分析（半日数据）")
         data_lines.append(vol_mid_md)
 
     # 关键位动态行为
     key_level_mid_md, key_level_mid_llm = _format_key_level_behavior_section(tech_data)
     if key_level_mid_md:
-        data_lines.append(f"\n## 十、🎯 关键位动态行为")
+        data_lines.append(f"\n## 十一、🎯 关键位动态行为")
         data_lines.append(key_level_mid_md)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
@@ -779,6 +962,9 @@ def generate_midday_review(config: Config) -> Path | None:
                 clusters = t['volume_clusters']
                 parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
+            vr_v = t.get("volume_ratio")
+            if vr_v is not None and vr_v > 0:
+                parts.append(f"量比{vr_v:.1f}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
@@ -804,6 +990,20 @@ def generate_midday_review(config: Config) -> Path | None:
 
     if vol_mid_llm:
         llm_lines.append(f"\n{vol_mid_llm}")
+
+    if sector_llm_mid:
+        llm_lines.append("\n[📈 大盘及行业板块（午间实时）]")
+        llm_lines.append(sector_llm_mid)
+
+    # 附近关键位
+    nearby_mid = []
+    for t in (tech_data or []):
+        sups = t.get("nearby_supports", "")
+        ress = t.get("nearby_resistances", "")
+        if sups or ress:
+            nearby_mid.append(f"{t['name']}: 支撑[{sups}] 压力[{ress}]")
+    if nearby_mid:
+        llm_lines.append("\n[📌 附近关键位] " + "; ".join(nearby_mid[:8]))
 
     if key_level_mid_llm:
         llm_lines.append(f"\n[关键位动态行为（上午盘中）]")
@@ -833,7 +1033,7 @@ def generate_midday_review(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 4. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="midday_review", temperature=0.3, max_tokens=1500)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="midday_review", temperature=0.3, max_tokens=2000)
     if not llm_content:
         log.warning("Midday review: LLM generation failed")
 
@@ -905,21 +1105,20 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                 lg_str = _format_money(ff.large_net) if ff.large_net is not None else "--"
                 md_str = _format_money(ff.medium_net) if ff.medium_net is not None else "--"
                 sm_str = _format_money(ff.small_net) if ff.small_net is not None else "--"
-                # 信号判断
-                if ff.is_institution_driven:
-                    sig = "🔵 机构主导"
-                elif ff.is_distribution:
-                    sig = "🔴 机构出货"
-                elif ff.is_retail_driven and pct < 0:
-                    sig = "🟠 散户接盘"
-                elif ff.is_retail_driven:
-                    sig = "🟡 散户主导"
-                elif pct >= 10:
-                    sig = "🟢 主力流入"
-                elif pct <= -10:
-                    sig = "🔴 主力流出"
-                else:
-                    sig = "⚪ 中性"
+                # 信号判断（使用增强的资金结构标签）
+                sig = ff.flow_structure if ff.is_valid else ("⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出"))
+                # 映射到带图标的标签
+                sig_map = {
+                    "机构主导(中小资金出逃)": "🔵🔥 深度吸筹",
+                    "机构主导": "🔵 机构吸筹",
+                    "机构出货": "🔴 机构出货",
+                    "游资活跃": "🟣 游资活跃",
+                    "散户主导": "🟡 散户主导",
+                    "主力偏多": "🟢 主力流入",
+                    "主力偏空": "🔴 主力流出",
+                    "均衡": "⚪ 均衡",
+                }
+                sig = sig_map.get(sig, sig)
             else:
                 sl_str = lg_str = md_str = sm_str = "--"
                 sig = "⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出")
@@ -972,13 +1171,68 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
         direction = "净流入" if total_inflow > 0 else "净流出"
         llm_parts.append(f"合计{direction}{abs(total_inflow)/1e8:.2f}亿")
     if has_detail:
-        llm_parts.append(f"超大单{total_super_large/1e8:+.2f}亿/散户{total_small/1e8:+.2f}亿")
+        llm_parts.append(f"超大单{total_super_large/1e8:+.2f}亿/中单{total_medium/1e8:+.2f}亿/散户{total_small/1e8:+.2f}亿")
+        # 统计资金结构分布
+        inst_count = sum(1 for q, _ in scored if q.fund_flow and q.fund_flow.is_institution_absorbing)
+        dist_count = sum(1 for q, _ in scored if q.fund_flow and q.fund_flow.is_distribution)
+        mid_count = sum(1 for q, _ in scored if q.fund_flow and q.fund_flow.is_mid_capital_active)
+        if inst_count or dist_count or mid_count:
+            structs = []
+            if inst_count:
+                structs.append(f"{inst_count}只深度吸筹")
+            if mid_count:
+                structs.append(f"{mid_count}只游资活跃")
+            if dist_count:
+                structs.append(f"{dist_count}只疑似出货")
+            llm_parts.append("结构: " + ", ".join(structs))
     top_in_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_in)
     top_out_str = " ".join(f"{q.name}({pct:.0f}%)" for q, pct in top_out)
     llm_parts.append(f"流入前3: {top_in_str}")
     llm_parts.append(f"流出前3: {top_out_str}")
 
     return md, "\n".join(llm_parts)
+
+
+def _format_composite_scoring(tech_data: list[dict]) -> tuple[str, str]:
+    """生成多信号共振评分摘要，返回 (Markdown, LLM紧凑文本)"""
+    if not tech_data:
+        return "", ""
+    scores = [(t["name"], t.get("composite_score", 0), t.get("composite_label", ""),
+               t.get("market_regime", ""), t.get("composite_signals", []),
+               t.get("crowd_label", ""))
+              for t in tech_data if t.get("composite_score")]
+    if not scores:
+        return "", ""
+    scores.sort(key=lambda x: x[1], reverse=True)
+    regimes = [s[3] for s in scores if s[3]]
+    dominant_regime = max(set(regimes), key=regimes.count) if regimes else "未知"
+    avg_score = round(sum(s[1] for s in scores) / len(scores))
+    regime_map = {"趋势上涨": "🟢", "趋势下跌": "🔴", "震荡偏多": "🟡", "震荡偏空": "🟡", "窄幅震荡": "⚪", "震荡": "⚪"}
+    regime_emoji = regime_map.get(dominant_regime, "⚪")
+
+    md_lines = []
+    md_lines.append(f"### 📊 多信号共振评分")
+    md_lines.append(f"**市场状态**: {regime_emoji} {dominant_regime} | **平均评分**: {avg_score}/100")
+    md_lines.append("")
+    md_lines.append("| 标的 | 评分 | 标签 | 状态 | 拥挤度 | 关键信号 |")
+    md_lines.append("|------|------|------|------|--------|---------|")
+    for name, score, label, regime, signals, crowd in scores[:10]:
+        sig_str = ", ".join(signals[:3]) if signals else "--"
+        crowd_str = crowd if crowd else "—"
+        md_lines.append(f"| {name} | {score} | {label} | {regime} | {crowd_str} | {sig_str} |")
+    md_lines.append("")
+
+    # 高拥挤度标的汇总
+    high_crowd = [(name, label, crowd) for name, _, _, _, _, crowd in scores if crowd]
+    if high_crowd:
+        md_lines.append(f"**⚠️ 拥挤度预警**: {'; '.join(f'{name}:{crowd}' for name, _, crowd in high_crowd)}")
+        md_lines.append("")
+
+    llm_parts = [f"[多信号评分] {regime_emoji}{dominant_regime} 均分{avg_score} | " +
+                 " ".join(f"{name}({score})" for name, score, _, _, _, _ in scores[:5])]
+    if high_crowd:
+        llm_parts.append(f"[拥挤度] {'; '.join(f'{name}:{crowd}' for name, _, crowd in high_crowd)}")
+    return "\n".join(md_lines) + "\n", "\n".join(llm_parts)
 
 
 def _format_gap_breakout_section(tech_data: list[dict]) -> tuple[str, str]:
@@ -1274,7 +1528,7 @@ def _format_position_summary(
     tech_map = {t["code"]: t for t in tech_data} if tech_data else {}
 
     def _build_reasons(tech: dict) -> str:
-        """从技术数据中提取简明理由"""
+        """从技术数据中提取详细理由（含趋势判断和具体数值）"""
         parts: list[str] = []
         rsi = tech.get("rsi")
         rsi_sig = tech.get("rsi_signal", "")
@@ -1282,20 +1536,70 @@ def _format_position_summary(
         kdj_sig = tech.get("kdj_signal", "")
         vol_price = tech.get("vol_price", "")
         obv_sig = tech.get("obv_signal", "")
+        ma_align = tech.get("ma_alignment", "")
+
+        # 趋势背景 + 价格与均线位置
+        if ma_align and ma_align not in ("数据不足", "缠绕"):
+            parts.append(f"均线{ma_align}")
+        price = tech.get("price")
+        for ma_name, ma_key, label in [
+            ("MA5", "ma5", "MA5"), ("MA10", "ma10", "MA10"),
+            ("MA20", "ma20", "MA20"), ("MA60", "ma60", "MA60"),
+        ]:
+            ma_val = tech.get(ma_key)
+            if ma_val and price and ma_val > 0 and price > 0:
+                dev = (price - ma_val) / ma_val * 100
+                if abs(dev) >= 1.0:
+                    direction = "站上" if dev > 0 else "跌破"
+                    parts.append(f"{direction}{label}{abs(dev):.1f}%")
+
+        # RSI 详细
         if rsi is not None and rsi_sig:
-            parts.append(f"RSI{rsi:.0f}({rsi_sig})")
+            level = "低位" if rsi <= 35 else ("高位" if rsi >= 65 else "中位")
+            parts.append(f"RSI={rsi:.0f}({rsi_sig},{level})")
+
+        # MACD
         if macd_sig:
-            parts.append(macd_sig)
+            dif_val = tech.get("macd_dif")
+            if dif_val is not None:
+                direction = "向上" if dif_val > 0 else "向下"
+                parts.append(f"MACD{direction}({macd_sig})")
+            else:
+                parts.append(f"MACD{macd_sig}")
+
+        # KDJ
         if kdj_sig:
-            parts.append(kdj_sig)
+            k_val = tech.get("kdj_k")
+            if k_val is not None:
+                parts.append(f"KDJ-K={k_val:.0f}({kdj_sig})")
+            else:
+                parts.append(f"KDJ{kdj_sig}")
+
+        # 量价 + 量比
         if vol_price and "数据不足" not in vol_price:
             parts.append(vol_price.split("（")[0])
+        vr = tech.get("volume_ratio")
+        if vr is not None and vr > 0:
+            if vr >= 2.0:
+                parts.append(f"量比={vr:.1f}(大幅放量)")
+            elif vr >= 1.5:
+                parts.append(f"量比={vr:.1f}(放量)")
+            elif vr <= 0.5:
+                parts.append(f"量比={vr:.1f}(缩量)")
+
+        # OBV 资金流
         if obv_sig and obv_sig not in ("中性", "数据不足"):
-            parts.append(f"OBV{obv_sig}")
+            parts.append(f"OBV:{obv_sig}")
+
+        # 关键位动态
         if tech.get("has_resistance_rejection"):
-            parts.append("受压回落")
+            parts.append("⚠️受阻于压力位")
         if tech.get("has_support_confirmation"):
-            parts.append("支撑确认")
+            parts.append("✅支撑位有效确认")
+        if tech.get("has_support_breakdown"):
+            parts.append("🚨跌破支撑位")
+        if tech.get("has_breakout_retest"):
+            parts.append("✅突破后回踩站稳")
         if tech.get("has_support_breakdown"):
             parts.append("跌破支撑")
         if tech.get("has_breakout_retest"):
@@ -1311,6 +1615,12 @@ def _format_position_summary(
             parts.append(f"支撑{tech['support_strength']}")
         if tech.get("resistance_strength") in ("强", "中"):
             parts.append(f"压力{tech['resistance_strength']}")
+        # 均价（黄线）
+        avg_p = tech.get("avg_price")
+        if avg_p and price and avg_p > 0:
+            dev = (price - avg_p) / avg_p * 100
+            direction = "高于" if dev > 0 else "低于"
+            parts.append(f"均价{avg_p:.3f}({direction}{abs(dev):.1f}%)")
         return "; ".join(parts) if parts else ""
 
     buy_signals: list[dict] = []
@@ -1386,6 +1696,101 @@ def _format_position_summary(
         md_lines.append("")
         llm_parts.append(f"[中性] {' '.join(h['name'] for h in hold_signals[:3])}")
 
+    return "\n".join(md_lines) + "\n", "\n".join(llm_parts)
+
+
+# ============================================================
+# 大盘及板块分析（早报/午评/晚报用）
+# ============================================================
+
+
+def _format_market_sector_section(
+    quotes: list[Quote],
+    major_indices: list[Quote],
+    sector_boards: list,
+) -> tuple[str, str]:
+    """生成大盘及行业板块摘要，返回 (Markdown数据区, LLM紧凑文本)"""
+    md_lines = []
+    llm_parts = []
+
+    # 大盘指数
+    if major_indices:
+        md_lines.append("### 大盘指数")
+        md_lines.append("| 指数 | 最新 | 涨跌幅 |")
+        md_lines.append("|------|------|--------|")
+        idx_names = []
+        for idx in major_indices[:7]:
+            price = f"{idx.price:.2f}" if idx.price else "--"
+            chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
+            md_lines.append(f"| {idx.name} | {price} | {chg} |")
+            if idx.change_pct is not None:
+                idx_names.append(f"{idx.name}{idx.change_pct:+.1f}%")
+        md_lines.append("")
+        if idx_names:
+            llm_parts.append(f"[大盘] {' '.join(idx_names[:5])}")
+
+    # 行业板块排名
+    if sector_boards:
+        top5 = [sb for sb in sector_boards[:5] if sb.change_pct is not None]
+        bot5 = [sb for sb in sector_boards[-5:] if sb.change_pct is not None]
+        md_lines.append("### 行业板块 Top5 / Bottom5")
+        md_lines.append("| 排名 | 板块 | 涨跌幅 | 领涨股 |")
+        md_lines.append("|------|------|--------|--------|")
+        for i, sb in enumerate(top5):
+            md_lines.append(f"| ▲{i+1} | {sb.name} | {sb.change_pct:+.2f}% | {sb.leader_stock} |")
+        md_lines.append("| ... | ... | ... | ... |")
+        for i, sb in enumerate(bot5):
+            rank = len(sector_boards) - len(bot5) + i + 1
+            md_lines.append(f"| ▼{rank} | {sb.name} | {sb.change_pct:+.2f}% | {sb.leader_stock} |")
+        md_lines.append("")
+        llm_parts.append(
+            f"[板块Top3] {' '.join(f'{sb.name}{sb.change_pct:+.1f}%' for sb in top5[:3])}"
+        )
+        llm_parts.append(
+            f"[板块Bot3] {' '.join(f'{sb.name}{sb.change_pct:+.1f}%' for sb in bot5[:3])}"
+        )
+
+    # 持仓板块归位
+    holding_industries: dict[str, list[Quote]] = {}
+    for q in quotes:
+        ind = q.industry or ""
+        if not ind:
+            continue
+        if ind not in holding_industries:
+            holding_industries[ind] = []
+        holding_industries[ind].append(q)
+
+    if holding_industries:
+        md_lines.append("### 持仓板块归位")
+        md_lines.append("| 板块 | 持仓标的 | 板块涨跌 | 个股涨跌 | 相对强弱 |")
+        md_lines.append("|------|---------|---------|---------|---------|")
+        sector_chg_map = {sb.name: sb.change_pct for sb in sector_boards} if sector_boards else {}
+        for ind, group in sorted(holding_industries.items(), key=lambda x: len(x[1]), reverse=True):
+            sector_chg = sector_chg_map.get(ind)
+            for q in group[:3]:  # 每个板块最多显示3只
+                chg_str = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
+                if sector_chg is not None and q.change_pct is not None:
+                    rs = q.change_pct - sector_chg
+                    if rs > 1:
+                        rs_str = f"领先{rs:+.1f}%"
+                    elif rs < -1:
+                        rs_str = f"落后{rs:+.1f}%"
+                    else:
+                        rs_str = "同步"
+                else:
+                    rs_str = "--"
+                sec_str = f"{sector_chg:+.2f}%" if sector_chg is not None else "--"
+                md_lines.append(f"| {ind} | {q.name}({q.code}) | {sec_str} | {chg_str} | {rs_str} |")
+            if len(group) > 3:
+                md_lines.append(f"| {ind} | ... 等{len(group)}只 | | | |")
+        md_lines.append("")
+        llm_parts.append(
+            f"[持仓板块] {' '.join(f'{ind}({len(group)}只)' for ind, group in
+             sorted(holding_industries.items(), key=lambda x: len(x[1]), reverse=True)[:5])}"
+        )
+
+    if not md_lines:
+        return "", ""
     return "\n".join(md_lines) + "\n", "\n".join(llm_parts)
 
 
@@ -1971,32 +2376,6 @@ def _compute_trading_suggestions(
             suggestion = "⚪ 多空博弈"
             priority = 0
 
-        # ---- 4.5 仓位比例计算（ATR波动率仓位法） ----
-        # 单笔最大亏损 = 总资金 1%, 每股风险 = 现价 - 止损价
-        # 仓位% = 1% × 现价 / 每股风险, 限制在[3%, 25%]
-        position_pct = 0.0
-        position_reason = ""
-        if "吸纳" in suggestion or "抄底" in suggestion:
-            if stop_loss > 0 and price > stop_loss:
-                risk_per_share = price - stop_loss
-                risk_pct = risk_per_share / price * 100
-                if risk_pct > 0.1:  # 止损幅度 > 0.1%，避免除零
-                    raw_pct = 1.0 / risk_pct * 100  # 1% 风险预算
-                    position_pct = round(max(3.0, min(25.0, raw_pct)), 1)
-                    position_reason = f"止损{stop_loss:.3f}(幅度{risk_pct:.1f}%)，1%风险预算→仓位{position_pct:.1f}%"
-                else:
-                    position_pct = 5.0
-                    position_reason = "止损幅度极小，保守建议仓位5%"
-            else:
-                position_pct = 5.0
-                position_reason = "止损距现价太近，保守仓位5%"
-            # 试探仓位用更保守的比例
-            if "抄底" in suggestion:
-                position_pct = round(position_pct * 0.5, 1)
-                suggestion = f"🟡 关注抄底(试探仓位{position_pct:.0f}%)"
-            else:
-                suggestion = f"🟢 逢低吸纳(建议仓位{position_pct:.0f}%)"
-
         # ---- 5. 止盈/止损价（代码计算 + 理由） ----
         stop_loss = 0.0
         stop_loss_reason = ""
@@ -2047,6 +2426,30 @@ def _compute_trading_suggestions(
         if take_profit <= price:
             take_profit = round(price * 1.05, 3)
             take_profit_reason = "无有效压力，按现价+5%硬止盈"
+
+        # ---- 5.5 仓位比例计算（ATR波动率仓位法） ----
+        # 必须在止损价计算完成后执行
+        position_pct = 0.0
+        position_reason = ""
+        if "吸纳" in suggestion or "抄底" in suggestion:
+            if stop_loss > 0 and price > stop_loss:
+                risk_per_share = price - stop_loss
+                risk_pct = risk_per_share / price * 100
+                if risk_pct > 0.1:
+                    raw_pct = 1.0 / risk_pct * 100
+                    position_pct = round(max(3.0, min(25.0, raw_pct)), 1)
+                    position_reason = f"止损{stop_loss:.3f}(幅度{risk_pct:.1f}%)，1%风险预算→仓位{position_pct:.1f}%"
+                else:
+                    position_pct = 5.0
+                    position_reason = "止损幅度极小，保守建议仓位5%"
+            else:
+                position_pct = 5.0
+                position_reason = "止损距现价太近，保守仓位5%"
+            if "抄底" in suggestion:
+                position_pct = round(position_pct * 0.5, 1)
+                suggestion = f"🟡 关注抄底(试探仓位{position_pct:.0f}%)"
+            else:
+                suggestion = f"🟢 逢低吸纳(建议仓位{position_pct:.0f}%)"
 
         results.append({
             "name": h.name,
@@ -2166,7 +2569,17 @@ def generate_evening_review(config: Config) -> Path | None:
         data_lines.append(f"\n## 二、龙虎榜资金分析")
         data_lines.append(f"\n{dragon_tiger_report}")
 
-    data_lines.append(f"\n## 三、市场背景")
+    # 大盘及行业板块
+    from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards, fetch_major_indices
+    enrich_quotes_with_industry(quotes)
+    sector_boards_ev = fetch_sector_boards()
+    major_indices_ev = fetch_major_indices()
+    sector_md, sector_llm = _format_market_sector_section(quotes, major_indices_ev, sector_boards_ev)
+    if sector_md:
+        data_lines.append(f"\n## 三、📈 大盘及行业板块")
+        data_lines.append(sector_md)
+
+    data_lines.append(f"\n## 五、市场背景")
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     vol_llm = ""  # 量能分析 LLM 紧凑文本（在 h_results 块中填充）
@@ -2202,7 +2615,7 @@ def generate_evening_review(config: Config) -> Path | None:
                     "capital_flow": capital_flow,
                 })
 
-        data_lines.append(f"\n## 四、持仓表现")
+        data_lines.append(f"\n## 五、持仓表现")
 
         data_lines.append("\n### 3.1 持仓详情")
         for h in holdings_with_analysis:
@@ -2266,13 +2679,22 @@ def generate_evening_review(config: Config) -> Path | None:
     # Technical analysis for holdings
     tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
     strategy_signals_evening = _get_holdings_strategy_signals(holdings, quotes)
+
+    # 多信号共振评分
+    score_md, score_llm = _format_composite_scoring(tech_data_evening)
+    if score_md:
+        data_lines.append(f"\n## 六、📊 多信号共振评分")
+        data_lines.append(score_md)
+
     if tech_data_evening:
-        data_lines.append("\n## 五、持仓技术分析")
+        data_lines.append("\n## 七、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 涨跌幅 | 支撑位详情 | 压力位详情 | 成交密集区 | ATR | 量价关系 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
-        data_lines.append("|------|------|--------|------------|------------|------------|-----|----------|-----|------|-----|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|------|--------|------|------|-----|------|-----|-----|--------|--------|")
         for t in tech_data_evening:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
+            avg_p_val = t.get('avg_price')
+            avg_str = f"{avg_p_val:.3f}" if avg_p_val else "--"
             chg = f"{t['change_pct']:+.2f}%" if t.get('change_pct') is not None else "--"
             sup = t.get('support_desc', '--')
             res = t.get('resistance_desc', '--')
@@ -2285,10 +2707,12 @@ def generate_evening_review(config: Config) -> Path | None:
             obv_val = f"{t['obv']:.0f}({t['obv_signal']})" if t.get('obv') is not None else "--"
             vol = f"{t['volume']/10000:.0f}万" if t.get('volume') and t['volume'] > 0 else "--"
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
-            data_lines.append(f"| {t['name']} | {price} | {chg} | {sup} | {res} | {cluster_str} | {atr} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
+            vr_val = t.get('volume_ratio')
+            vr_str = f"{vr_val:.1f}" if vr_val is not None and vr_val > 0 else "--"
+            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals_evening:
-        data_lines.append(f"\n## 六、⭐ 组合策略信号（多指标共振，明日操作参考）")
+        data_lines.append(f"\n## 八、⭐ 组合策略信号（多指标共振，明日操作参考）")
         for s in strategy_signals_evening:
             for sig_text in s['signals']:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
@@ -2297,20 +2721,35 @@ def generate_evening_review(config: Config) -> Path | None:
     # 跳空缺口 & 关键位突破
     gap_bo_md, gap_bo_llm = _format_gap_breakout_section(tech_data_evening)
     if gap_bo_md:
-        data_lines.append(f"\n## 七、📊 缺口与突破")
+        data_lines.append(f"\n## 九、📊 缺口与突破")
         data_lines.append(gap_bo_md)
+
+    # 附近较强的支撑/压力位全景
+    nearby_items = [(t["name"], t["code"], t.get("nearby_supports", ""), t.get("nearby_resistances", ""),
+                     t.get("price"), t.get("support"), t.get("resistance"), t.get("atr"))
+                    for t in tech_data_evening
+                    if t.get("nearby_supports") or t.get("nearby_resistances")]
+    if nearby_items:
+        data_lines.append(f"\n## 十、📌 附近关键位全景")
+        data_lines.append("")
+        data_lines.append("| 标的 | 现价 | 较强支撑(距现价) | 较强压力(距现价) |")
+        data_lines.append("|------|------|------------------|------------------|")
+        for name, code, sups, ress, pr, _, _, _ in nearby_items:
+            p_str = f"{pr:.3f}" if pr else "--"
+            data_lines.append(f"| {name}({code}) | {p_str} | {sups or '无'} | {ress or '无'} |")
+        data_lines.append("")
 
     # 关键位动态行为
     key_level_ev_md, key_level_ev_llm = _format_key_level_behavior_section(tech_data_evening)
     if key_level_ev_md:
-        data_lines.append(f"\n## 八、🎯 关键位动态行为")
+        data_lines.append(f"\n## 十一、🎯 关键位动态行为")
         data_lines.append(key_level_ev_md)
 
     trade_suggestions = _compute_trading_suggestions(
         holdings, quotes, tech_data_evening, dragon_tiger_summary
     )
     if trade_suggestions:
-        data_lines.append(f"\n## 九、🎯 交易辅助数据（网格挂单 / 逃顶 / 抄底）")
+        data_lines.append(f"\n## 十二、🎯 交易辅助数据（网格挂单 / 逃顶 / 抄底）")
         data_lines.append("")
         data_lines.append(f"*价格点由代码计算，建议由 AI 解读*")
         data_lines.append("")
@@ -2384,7 +2823,7 @@ def generate_evening_review(config: Config) -> Path | None:
     # 主力资金流向
     fund_md_ev, fund_llm_ev = _format_fund_flow_section(quotes, label="自选")
     if fund_md_ev:
-        data_lines.append(f"\n## 十、💰 主力资金动向（全天）")
+        data_lines.append(f"\n## 十三、💰 主力资金动向（全天）")
         data_lines.append(fund_md_ev)
 
     # 自选标的建仓机会分析
@@ -2404,7 +2843,7 @@ def generate_evening_review(config: Config) -> Path | None:
             watchlist, holdings, watch_quotes, watch_tech, dragon_tiger_summary
         )
         if entry_suggestions:
-            data_lines.append(f"\n## 十一、🔍 自选标的建仓机会")
+            data_lines.append(f"\n## 十四、🔍 自选标的建仓机会")
             data_lines.append("")
             data_lines.append("| 标的 | 类型 | 现价 | 涨跌幅 | 建仓评分 | 风险评分 | 建议 | 理想建仓价 | 止损 |")
             data_lines.append("|------|------|------|--------|---------|---------|------|-----------|------|")
@@ -2466,6 +2905,9 @@ def generate_evening_review(config: Config) -> Path | None:
                 clusters = t['volume_clusters']
                 parts.append(f"成交密集区:{','.join(f'{c:.3f}' for c in clusters[:2])}")
             parts.append(f"量价:{t['vol_price']}")
+            vr_v = t.get("volume_ratio")
+            if vr_v is not None and vr_v > 0:
+                parts.append(f"量比{vr_v:.1f}")
             if t['rsi']:
                 parts.append(f"RSI:{t['rsi']:.1f}({t['rsi_signal']})")
             parts.append(f"MACD:{t['macd_signal']}")
@@ -2534,6 +2976,25 @@ def generate_evening_review(config: Config) -> Path | None:
                 f"→ {es['label']} | 理想建仓价{es['entry_price']:.3f}"
             )
 
+    # 大盘及行业板块
+    if sector_llm:
+        llm_lines.append("\n[📈 大盘及行业板块]")
+        llm_lines.append(sector_llm)
+
+    # 多信号评分
+    if score_llm:
+        llm_lines.append("\n[📊 多信号评分] " + score_llm)
+
+    # 附近关键位（紧凑格式）
+    nearby_parts = []
+    for t in tech_data_evening:
+        sups = t.get("nearby_supports", "")
+        ress = t.get("nearby_resistances", "")
+        if sups or ress:
+            nearby_parts.append(f"{t['name']}: 支撑[{sups}] 压力[{ress}]")
+    if nearby_parts:
+        llm_lines.append("\n[📌 附近关键位] " + "; ".join(nearby_parts[:8]))
+
     llm_lines.append(f"""
 
 请按以下结构生成晚报（约 800 字）：
@@ -2584,6 +3045,10 @@ def generate_evening_review(config: Config) -> Path | None:
 
 要求：必须使用条件格式（if-then），标注置信度。交易建议必须给出具体的仓位比例和触发价格，不写"适当减仓"这种模糊表述。
 
+**推理深度要求**：每条买卖建议必须写明推理链条，格式为：
+`结论 → 直接原因(技术指标+具体数值) → 深层逻辑(为什么这个指标此时重要) → 风险提示(什么情况下判断失效)`
+示例："建议减仓至20%[高] → RSI=78超买+接近压力位1.35仅2%→ 双重阻力叠加，历史回测该组合回调概率>70% → 若放量突破1.35则止损上移"
+
 ---
 **置信度标注规则**：对于每一个判断性结论，请在括号中标注你的确定程度。
 - [高]：数据充分、指标一致、历史模式明确
@@ -2593,7 +3058,7 @@ def generate_evening_review(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 4. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=2500)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=4000)
     if not llm_content:
         log.warning("Evening review: LLM generation failed")
 
@@ -2605,5 +3070,68 @@ def generate_evening_review(config: Config) -> Path | None:
     push_title = f"Evening Review {datetime.now().strftime('%m-%d')}"
     _push_report(push_title, report, config)
 
+    # 缓存收盘数据供次日早报使用
+    _save_morning_cache(quotes, holdings, tech_data_evening, sector_boards_ev, major_indices_ev)
+
     log.info(f"Evening review generated: {filepath}")
     return filepath
+
+
+def _save_morning_cache(
+    quotes: list[Quote],
+    holdings: list[Holding],
+    tech_data: list[dict],
+    sector_boards: list,
+    major_indices: list[Quote],
+) -> None:
+    """保存次日早报所需数据到缓存文件"""
+    from pathlib import Path
+    import json
+    cache_path = Path(__file__).resolve().parent.parent / "state" / "morning_cache.json"
+    try:
+        cache_dir = cache_path.parent
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        data = {
+            "_date": datetime.now().strftime("%Y-%m-%d"),
+            "_time": datetime.now().strftime("%H:%M"),
+            "holdings": [],
+            "fund_flow": [],
+            "scores": [],
+            "sectors": [],
+            "indices": [],
+        }
+        # 持仓收盘数据 + 资金流
+        for q in quotes:
+            entry = {
+                "code": q.code, "name": q.name, "price": q.price, "change_pct": q.change_pct,
+            }
+            flow_entry = None
+            if q.main_net_inflow is not None and q.amount and q.amount > 0:
+                fp = round(q.main_net_inflow / q.amount * 100, 1)
+                entry["flow_pct"] = fp
+                ff = q.fund_flow
+                label = ff.flow_structure if ff else ""
+                entry["flow_label"] = label
+                flow_entry = {"code": q.code, "name": q.name, "change_pct": q.change_pct, "flow_pct": fp, "flow_label": label}
+            if flow_entry:
+                data["fund_flow"].append(flow_entry)
+            data["holdings"].append(entry)
+        # 技术评分
+        for t in tech_data:
+            data["scores"].append({
+                "code": t["code"], "name": t["name"],
+                "score": t.get("composite_score", 0),
+                "label": t.get("composite_label", ""),
+                "regime": t.get("market_regime", ""),
+            })
+        # 板块
+        for sb in sector_boards[:10]:
+            data["sectors"].append({"name": sb.name, "change_pct": sb.change_pct})
+        # 指数
+        for idx in major_indices[:7]:
+            data["indices"].append({"name": idx.name, "price": idx.price, "change_pct": idx.change_pct})
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=str)
+        log.debug(f"早报缓存已保存: {cache_path}")
+    except Exception as e:
+        log.debug(f"早报缓存保存失败: {e}")

@@ -9,6 +9,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+# LLM 调用冷却（模块级，跨 scan 持久）
+_last_llm_call_time: float = 0.0
+LLM_COOLDOWN: int = 1800  # 30 分钟最小间隔
+
 from app.config import Config
 from app.data_fetcher import NorthFlowFetcher
 from app.reporter import generate_morning_brief, generate_midday_review, generate_evening_review
@@ -445,9 +449,17 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     )
     print_sentiment(stats)
 
-    # 保存当前成交量，供下一周期量价分析
+    # 保存当前成交量和资金流，供下一周期对比
     try:
-        cur_state = {q.code: {"volume": q.volume} for q in quotes if q.volume is not None}
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         log.warning(f"保存状态文件失败: {e}")
@@ -544,6 +556,21 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     scan_history.append(scan_record)
     _save_scan_history(scan_history)
 
+    # 保存当前成交量和资金流状态，供下一轮对比（趋势检测用）
+    try:
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry: dict = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
+        STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
 
@@ -551,6 +578,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                   call_llm: bool = False, scan_count: int = 0) -> None:
     """Run one scan cycle using shared data pool"""
+    global _last_llm_call_time
     from app.analyzer import analyze, _load_scan_history, _save_scan_history
     from app.ai_analyzer import analyze as analyze_with_llm
     from app.notifier import push_alert, send_desktop_notification
@@ -599,6 +627,11 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     # Build holdings code set for dragon tiger check
     holding_codes = {h.code for h in config.holdings}
+
+    # Enrich quotes with industry classification
+    from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards
+    enrich_quotes_with_industry(quotes)
+    sector_boards = fetch_sector_boards()  # 5分钟缓存
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -747,6 +780,34 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             print(f"  {Color.BOLD}{name}({code}){Color.RESET}  →  {sig_text}")
         print()
 
+    # Sector analysis display
+    if sector_boards:
+        from app.analyzer import analyze_sector_context
+        sector_ctx = analyze_sector_context(quotes, sector_boards)
+        from app.presenter import Color
+        print(f"{Color.BOLD}{Color.CYAN}═══ 行业板块 ═══{Color.RESET}")
+        # Top 3 / Bottom 3
+        top3 = sector_ctx["top_sectors"][:3]
+        bot3 = sector_ctx["bottom_sectors"][:3]
+        print(f"  {Color.GREEN}▲{Color.RESET} ", end="")
+        for name, chg in top3:
+            print(f"{name}{chg:+.1f}%  ", end="")
+        print(f"\n  {Color.RED}▼{Color.RESET} ", end="")
+        for name, chg in bot3:
+            print(f"{name}{chg:+.1f}%  ", end="")
+        print()
+        # Per-stock sector context (only show deviating ones)
+        deviating = [(q.code, info) for q in quotes
+                     if (info := sector_ctx["per_stock"].get(q.code)) and info["label"]
+                     and "同步" not in info["label"]]
+        if deviating:
+            for code, info in deviating[:5]:
+                q = next((x for x in quotes if x.code == code), None)
+                if q:
+                    emoji = "🔥" if info.get("relative_strength", 0) > 0 else "❄️"
+                    print(f"  {emoji} {q.name}({q.code}): {info['label']} [{info.get('sector', '')}]")
+        print()
+
     # Fetch market breadth data (cached, 5-min TTL)
     from app.data_fetcher import fetch_market_breadth
     breadth = fetch_market_breadth()
@@ -776,15 +837,20 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         )
 
     # LLM analysis (with full alerts + tech data)
-    # 有异动时强制调 LLM（即使奇数轮），无异动时维持隔轮调用
+    # 有异动时强制调 LLM（即使奇数轮），但受冷却时间限制
     llm_result = ""
     should_call_llm = call_llm
     if not should_call_llm and config.llm_enabled and alerts and config.llm_trigger == "仅异动时":
-        should_call_llm = True  # override: alerts present → analyze now
+        should_call_llm = True
+    # 冷却检查：距上次 LLM 调用不足 30 分钟时跳过
+    if should_call_llm and time.time() - _last_llm_call_time < LLM_COOLDOWN:
+        log.info(f"LLM 冷却中（距上次调用 {(time.time() - _last_llm_call_time) / 60:.0f} 分钟），跳过本轮")
+        should_call_llm = False
     if should_call_llm and config.llm_enabled:
         try:
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
+            _last_llm_call_time = time.time()  # 记录调用时间，启动冷却
         except Exception as e:
             log.error(f"LLM analysis failed: {e}")
 
@@ -824,6 +890,21 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     scan_history.append(scan_record)
     _save_scan_history(scan_history)
+
+    # 保存当前成交量和资金流状态，供下一轮对比（趋势检测用）
+    try:
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry: dict = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
+        STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
@@ -885,6 +966,7 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
             if is_trading_time(datetime.now(), config.sessions)[0]:
                 scan_count += 1
                 call_llm = (scan_count % 10 == 0)
+                # 冷却已在 _run_once_new 内部处理
                 _run_once_new(config, north_fetcher, data_pool, call_llm=call_llm, scan_count=scan_count)
             else:
                 now = datetime.now()

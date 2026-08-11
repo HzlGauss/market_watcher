@@ -141,6 +141,7 @@ class T0MonitorThread(threading.Thread):
         self._enable_push = enable_push
         self._running = False
         self._last_signals: Dict[str, T0Signal] = {}
+        self._last_signal_time: Dict[str, float] = {}   # 信号冷却计时
         # 5分钟K线缓存：{code: (klines, fetch_time)}
         self._klines_cache: Dict[str, tuple[List[KlineData], float]] = {}
 
@@ -276,86 +277,137 @@ class T0MonitorThread(threading.Thread):
         # 判断卖出信号
         sell_reasons = self._check_sell_conditions(quote, tech, sr, price, risk_reward, intrabar)
 
-        # 判断信号：买卖两侧都评估，选条件数更多的一方
-        # 若同等条件数，选盈亏比更有利的一方
+        # 判断信号：选条件数更多的一方，附带概率和空间评估
         buy_count = len(buy_reasons)
         sell_count = len(sell_reasons)
+        BUY_TOTAL = 13   # 买入总条件数
+        SELL_TOTAL = 12  # 卖出总条件数
+
+        # RR 门槛：根据支撑/压力强度动态调整
+        # 强支撑（3重共振）→ 0.15, 中支撑（2重）→ 0.2, 弱支撑（单一）→ 0.3
+        sup_info2 = self._find_nearby_strong_levels(price, sr, sr.atr or price * 0.02, is_buy=True)
+        res_info2 = self._find_nearby_strong_levels(price, sr, sr.atr or price * 0.02, is_buy=False)
+        sup_confluence = len([lv for lv, cnt, d in sup_info2.get("levels", []) if cnt >= 2])
+        res_confluence = len([lv for lv, cnt, d in res_info2.get("levels", []) if cnt >= 2])
+        MIN_RR_BUY = 0.15 if sup_confluence >= 2 else (0.2 if sup_confluence >= 1 else 0.3)
+        MIN_RR_SELL = 0.15 if res_confluence >= 2 else (0.2 if res_confluence >= 1 else 0.3)
+
+        # 市场状态自适应：趋势市调整 RR 阈值
+        from app.technical import detect_market_regime
+        regime = detect_market_regime(tech, price, sr.atr)
+        if regime.regime == "趋势上涨":
+            MIN_RR_BUY = max(0.10, MIN_RR_BUY - 0.05)  # 顺势买入门槛更低
+            MIN_RR_SELL = min(0.40, MIN_RR_SELL + 0.10)  # 逆势卖出门槛更高
+        elif regime.regime == "趋势下跌":
+            MIN_RR_BUY = min(0.40, MIN_RR_BUY + 0.10)
+            MIN_RR_SELL = max(0.10, MIN_RR_SELL - 0.05)
+
+        # 信号冷却：同一标的至少间隔 300 秒才允许翻转方向
+        COOLDOWN_SEC = 300
+        now_ts = time.time()
+
+        # 计算概率和空间
+        buy_prob = round(buy_count / BUY_TOTAL * 100) if buy_count > 0 else 0
+        sell_prob = round(sell_count / SELL_TOTAL * 100) if sell_count > 0 else 0
+        upside_pct = round((sr.resistance - price) / price * 100, 1) if price > 0 else 0
+        downside_pct = round((price - sr.support) / price * 100, 1) if price > 0 else 0
+
+        def _build_signal(reasons_list, sig_type, prob, space_pct, space_label, rr):
+            reason = "; ".join(reasons_list)
+            # 概率评估
+            prob_label = "高" if prob >= 50 else ("中" if prob >= 30 else "低")
+            prob_note = f"[概率{prob_label}({prob}%满足条件)]"
+            # 空间评估
+            if space_pct >= 3:
+                space_note = f"[{space_label}空间大({space_pct}%)]"
+            elif space_pct >= 1.5:
+                space_note = f"[{space_label}空间中({space_pct}%)]"
+            else:
+                space_note = f"[{space_label}空间小({space_pct}%)]"
+            # RR 过大警告：目标位太远，日内触及概率低
+            rr_note = ""
+            MAX_RR = 4.0
+            if rr > MAX_RR:
+                rr_note = f"[⚠️RR={rr:.1f}x目标偏远，日内触及概率低] "
+            return f"{rr_note}{prob_note}{space_note} {reason}"
+
+        # 冷却检查：同一标的短时间内不得翻转信号方向
+        last_sig = self._last_signals.get(item.code)
+        last_ts = self._last_signal_time.get(item.code, 0)
+        in_cooldown = last_sig is not None and (now_ts - last_ts) < COOLDOWN_SEC
 
         if buy_count > sell_count and buy_reasons:
-            reason = "; ".join(buy_reasons)
-            return T0Signal(
-                code=item.code, name=item.name,
-                signal_type=T0Signal.SIGNAL_BUY,
-                reason=reason, price=price,
-                support=sr.support, resistance=sr.resistance,
-                risk_reward=risk_reward,
-                buy_price=suggested["buy_price"],
-                sell_price=suggested["sell_price"],
-            )
+            # RR 过滤（动态门槛）
+            if risk_reward < MIN_RR_BUY:
+                log.debug(f"{item.name}: 买入条件{buy_count}个但RR={risk_reward}<{MIN_RR_BUY}(支撑{sup_confluence}重)，跳过")
+                return None
+            # 冷却过滤
+            if in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL:
+                log.info(f"{item.name}: 买入信号冷却中(上次为卖出，{now_ts-last_ts:.0f}秒前)")
+                return None
+            # 冲突标注
+            conflict_note = ""
+            if sell_count >= buy_count - 1 and sell_count >= 4:
+                conflict_note = "⚠️多空分歧(买卖条件接近) "
+            reason = conflict_note + _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
+            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
+                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            self._last_signal_time[item.code] = now_ts
+            return sig
 
         if sell_count > buy_count and sell_reasons:
-            reason = "; ".join(sell_reasons)
-            return T0Signal(
-                code=item.code, name=item.name,
-                signal_type=T0Signal.SIGNAL_SELL,
-                reason=reason, price=price,
-                support=sr.support, resistance=sr.resistance,
-                risk_reward=risk_reward,
-                buy_price=suggested["buy_price"],
-                sell_price=suggested["sell_price"],
-            )
+            if risk_reward < MIN_RR_SELL:
+                log.debug(f"{item.name}: 卖出条件{sell_count}个但RR={risk_reward}<{MIN_RR_SELL}(压力{res_confluence}重)，跳过")
+                return None
+            if in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY:
+                log.info(f"{item.name}: 卖出信号冷却中(上次为买入，{now_ts-last_ts:.0f}秒前)")
+                return None
+            conflict_note = ""
+            if buy_count >= sell_count - 1 and buy_count >= 4:
+                conflict_note = "⚠️多空分歧(买卖条件接近) "
+            reason = conflict_note + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
+                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            self._last_signal_time[item.code] = now_ts
+            return sig
 
-        # 条件数相等时，优先选有背离信号的
+        # 条件数相等时，优先选有背离信号的（但也受RR限制）
         if buy_reasons and sell_reasons:
             buy_has_divergence = any("背离" in r for r in buy_reasons)
             sell_has_divergence = any("背离" in r for r in sell_reasons)
-            if buy_has_divergence and not sell_has_divergence:
-                reason = "; ".join(buy_reasons)
-                return T0Signal(
-                    code=item.code, name=item.name,
-                    signal_type=T0Signal.SIGNAL_BUY,
-                    reason=reason, price=price,
-                    support=sr.support, resistance=sr.resistance,
-                    risk_reward=risk_reward,
-                    buy_price=suggested["buy_price"],
-                    sell_price=suggested["sell_price"],
-                )
-            if sell_has_divergence and not buy_has_divergence:
-                reason = "; ".join(sell_reasons)
-                return T0Signal(
-                    code=item.code, name=item.name,
-                    signal_type=T0Signal.SIGNAL_SELL,
-                    reason=reason, price=price,
-                    support=sr.support, resistance=sr.resistance,
-                    risk_reward=risk_reward,
-                    buy_price=suggested["buy_price"],
-                    sell_price=suggested["sell_price"],
-                )
+            if buy_has_divergence and not sell_has_divergence and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
+                reason = "⚠️多空分歧(背离偏多) " + _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
+                sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
+                               reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                               risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                self._last_signal_time[item.code] = now_ts
+                return sig
+            if sell_has_divergence and not buy_has_divergence and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
+                reason = "⚠️多空分歧(背离偏空) " + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+                sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
+                               reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                               risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                self._last_signal_time[item.code] = now_ts
+                return sig
 
-        # 仅一侧有信号
-        if buy_reasons:
-            reason = "; ".join(buy_reasons)
-            return T0Signal(
-                code=item.code, name=item.name,
-                signal_type=T0Signal.SIGNAL_BUY,
-                reason=reason, price=price,
-                support=sr.support, resistance=sr.resistance,
-                risk_reward=risk_reward,
-                buy_price=suggested["buy_price"],
-                sell_price=suggested["sell_price"],
-            )
+        # 仅一侧有信号（也需要 RR 过滤）
+        if buy_reasons and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
+            reason = _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
+            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
+                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            self._last_signal_time[item.code] = now_ts
+            return sig
 
-        if sell_reasons:
-            reason = "; ".join(sell_reasons)
-            return T0Signal(
-                code=item.code, name=item.name,
-                signal_type=T0Signal.SIGNAL_SELL,
-                reason=reason, price=price,
-                support=sr.support, resistance=sr.resistance,
-                risk_reward=risk_reward,
-                buy_price=suggested["buy_price"],
-                sell_price=suggested["sell_price"],
-            )
+        if sell_reasons and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
+            reason = _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
+                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            self._last_signal_time[item.code] = now_ts
+            return sig
 
         return None
 
@@ -386,61 +438,162 @@ class T0MonitorThread(threading.Thread):
             "above_open": quote.open is not None and quote.price > quote.open,
         }
 
+    @staticmethod
+    def _find_nearby_strong_levels(
+        price: float, sr, atr: float, is_buy: bool
+    ) -> dict:
+        """查找附近较强的支撑/压力位（多级分析）
+
+        收集 swing/pivot/cluster 三类来源的关键位，
+        合并邻近的，统计每个级别的共振次数和距离。
+
+        Returns:
+            {"levels": [(价格, 共振数, 距离%), ...], "strongest": 价格, "confluence_note": 说明}
+        """
+        result: dict = {"levels": [], "strongest": None, "confluence_note": ""}
+        if not price or price <= 0 or atr <= 0:
+            return result
+
+        zone = atr * 0.5
+
+        if is_buy:
+            # 找支撑位（< 现价）
+            candidates = []
+            for lv in (sr.swing_supports or []):
+                if lv and lv < price * 0.995:
+                    candidates.append((lv, "swing"))
+            for lv in (sr.pivot_supports or []):
+                if lv and lv < price * 0.995:
+                    candidates.append((lv, "pivot"))
+            for lv in (sr.volume_clusters or []):
+                if lv and lv < price * 0.995:
+                    candidates.append((lv, "cluster"))
+        else:
+            # 找压力位（> 现价）
+            candidates = []
+            for lv in (sr.swing_resistances or []):
+                if lv and lv > price * 1.005:
+                    candidates.append((lv, "swing"))
+            for lv in (sr.pivot_resistances or []):
+                if lv and lv > price * 1.005:
+                    candidates.append((lv, "pivot"))
+            for lv in (sr.volume_clusters or []):
+                if lv and lv > price * 1.005:
+                    candidates.append((lv, "cluster"))
+
+        if not candidates:
+            return result
+
+        # 合并邻近价位
+        candidates.sort(key=lambda x: x[0], reverse=is_buy)
+        merged: list[tuple[float, int, float]] = []  # (价格, 共振数, 距离%)
+        seen = set()
+        for i, (lv1, _) in enumerate(candidates):
+            if i in seen:
+                continue
+            count = 1
+            for j in range(i + 1, len(candidates)):
+                if j in seen:
+                    continue
+                if abs(candidates[j][0] - lv1) <= zone:
+                    count += 1
+                    seen.add(j)
+            dist = abs(lv1 - price) / price * 100
+            if dist <= 10:  # 只保留 10% 以内的
+                merged.append((round(lv1, 3), count, round(dist, 1)))
+
+        if merged:
+            merged.sort(key=lambda x: (x[1], -x[2]), reverse=True)  # 共振数优先
+            result["levels"] = merged[:5]
+            result["strongest"] = merged[0][0]
+            strongest_count = merged[0][1]
+            if strongest_count >= 3:
+                result["confluence_note"] = f"{strongest_count}重共振(强)"
+            elif strongest_count >= 2:
+                result["confluence_note"] = f"{strongest_count}重共振(中)"
+            else:
+                result["confluence_note"] = "单一来源"
+
+        return result
+
     def _check_buy_conditions(self, quote: Quote, tech: TechnicalSummary,
                               sr, price: float, risk_reward: float,
                               intrabar: dict) -> List[str]:
         """检查买入条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
-        # 条件1：股价接近支撑位（1%以内）
-        near_support = price <= sr.support * 1.01
-        if near_support:
-            reasons.append(f"接近支撑({sr.support:.2f})")
+        # 条件1：接近强支撑位（多级分析）
+        atr_val = sr.atr or price * 0.02
+        sup_info = self._find_nearby_strong_levels(price, sr, atr_val, is_buy=True)
+        if sup_info["strongest"] is not None:
+            strong = sup_info["strongest"]
+            dist = (price - strong) / price * 100
+            note = sup_info["confluence_note"]
+            reasons.append(f"接近强支撑{strong:.3f}({note}，距{dist:.1f}%，下方买盘托底)")
+            # 显示其他级别的支撑
+            extra = [f"{lv:.3f}({cnt}重)" for lv, cnt, d in sup_info["levels"][1:3]]
+            if extra:
+                reasons.append(f"多级支撑: {', '.join(extra)}")
+        elif sr.support and price <= sr.support * 1.01:
+            dist = (price - sr.support) / sr.support * 100
+            reasons.append(f"接近支撑位{sr.support:.3f}(仅距{dist:.1f}%)")
 
-        # 条件2：RSI偏低
+        # 条件2：RSI偏低（超卖区域，反弹概率高）
         if tech.rsi and tech.rsi < 35:
-            reasons.append(f"RSI偏低({tech.rsi:.0f})")
+            reasons.append(f"RSI={tech.rsi:.0f}(超卖区域，短期超跌有反弹需求)")
 
-        # 条件3：KDJ超卖
+        # 条件3：KDJ超卖（K值低位，做空动能衰竭）
         if tech.kdj_k and tech.kdj_k < 25:
-            reasons.append(f"KDJ超卖(K={tech.kdj_k:.0f})")
+            reasons.append(f"KDJ超卖(K={tech.kdj_k:.0f}，做空动能衰竭)")
 
-        # 条件4：量能萎缩
+        # 条件4：量能萎缩（缩量下跌=抛压减轻）/ 地量见底
         if quote.volume_ratio and quote.volume_ratio < 0.6:
-            reasons.append(f"缩量(比{quote.volume_ratio:.2f})")
+            if quote.volume_ratio <= 0.25:
+                reasons.append(f"地量(量比{quote.volume_ratio:.2f}，底部信号强)")
+            else:
+                reasons.append(f"缩量(量比{quote.volume_ratio:.2f}，抛压减轻)")
 
-        # 条件5：MA20多头方向
+        # 条件5：MA20多头趋势（顺势做多胜率高）
         if tech.ma_alignment in ("多头排列", "多头回调"):
-            reasons.append(f"趋势({tech.ma_alignment})")
+            reasons.append(f"均线{tech.ma_alignment}(顺势做多，胜率偏高)")
 
-        # 条件6：委比多头（买单挂单占优）
+        # 条件6：委比多头（买单挂单占优，市场看多意愿强）
         if quote.bid_ask_ratio and quote.bid_ask_ratio > 25:
-            reasons.append(f"委比+{quote.bid_ask_ratio:.0f}%")
+            reasons.append(f"委比+{quote.bid_ask_ratio:.0f}%(挂单看多意愿强)")
 
-        # 条件7：外盘占优（主动买入 > 主动卖出）
+        # 条件7：外盘>内盘（主动买入量远超主动卖出量）
         bs_ratio = self._calc_buy_sell_ratio(quote.bid_volume, quote.ask_volume)
         if bs_ratio and bs_ratio > 1.4:
-            reasons.append(f"外盘优势(x{bs_ratio})")
+            reasons.append(f"外盘/内盘={bs_ratio}(主动买入是卖出的{bs_ratio}倍，买方积极)")
 
         # 条件8：MA20乖离（现价低于MA20，均值回归做多）
         if tech.ma20 and price < tech.ma20:
             deviation = (price - tech.ma20) / tech.ma20 * 100
             if deviation <= -1.5:
-                reasons.append(f"MA20乖离({deviation:.1f}%)")
+                reasons.append(f"MA20乖离{deviation:.1f}%(远离均线，均值回归动力强)")
 
-        # 条件9：MA20趋势向上（MA20 > MA60，中长线偏多）
+        # 条件9：MA20趋势向上（MA20 > MA60，中长线偏多背景）
         if tech.ma20 and tech.ma60 and tech.ma20 > tech.ma60:
-            reasons.append("MA20>MA60(偏多)")
+            reasons.append("MA20>MA60(中长期趋势偏多，回调做多胜率高)")
 
-        # 条件10：筹码峰支撑（现价接近下方密集成交区，资金成本线托底）
+        # 条件10：筹码峰支撑（现价接近下方密集成交区 + 多级支撑参考）
         clusters = sr.volume_clusters or []
         nearby_below = [c for c in clusters if c < price and price <= c * 1.02]
         if nearby_below:
-            reasons.append(f"筹码支撑({max(nearby_below):.2f})")
+            if sup_info["strongest"]:
+                cluster_near_sup = any(
+                    abs(c - sup_info["strongest"]) <= atr_val * 0.5 for c in nearby_below
+                )
+                if cluster_near_sup:
+                    reasons.append(f"筹码峰+多级支撑共振({max(nearby_below):.3f}，买盘集中)")
+                else:
+                    reasons.append(f"筹码峰支撑{max(nearby_below):.3f}(密集成交区支撑)")
+            else:
+                reasons.append(f"筹码峰支撑{max(nearby_below):.3f}(密集成交区支撑)")
 
-        # 条件11：日内低位（现价接近今日最低点）
+        # 条件11：日内低位（现价接近今日最低点，盈亏比好）
         if intrabar["position"] <= 30:
-            reasons.append(f"日内低位({intrabar['position']:.0f}%)")
+            reasons.append(f"日内低位(位置{intrabar['position']:.0f}%，盈亏比优)")
 
         # 条件12：低于开盘（日内偏弱接近支撑，可能反弹）
         if intrabar.get("below_open") and intrabar["position"] <= 50:
@@ -467,11 +620,26 @@ class T0MonitorThread(threading.Thread):
             reasons.append(f"跳空回补({tech.gap_detail})")
 
         # ---- 背离加分：接近支撑 + 外盘>内盘 = 隐藏吸筹 ----
-        has_divergence = near_support and bs_ratio and bs_ratio > 1.2
+        has_near_support = (sup_info["strongest"] is not None) or (sr.support and price <= sr.support * 1.01)
+        has_divergence = has_near_support and bs_ratio and bs_ratio > 1.2
         if has_divergence and len(reasons) < 2:
             # 只要有"接近支撑"+外盘占优(>1.0)，即使其他条件不满足也触发
             reasons.append("⭐内盘背离(主动买)")
             return reasons  # 背离信号直接触发
+
+        # 条件14/15：MA60乖离极值（中期顶/底）
+        if tech.ma60 and price and tech.ma60 > 0:
+            dev = (price - tech.ma60) / tech.ma60 * 100
+            if dev <= -15:  # 买入侧：中期底部
+                reasons.append(f"MA60乖离{dev:.0f}%(中期底部)")
+            elif dev >= 20:  # 卖出侧：中期顶部
+                reasons.append(f"MA60乖离+{dev:.0f}%(中期顶部)")
+        # 条件15/16：BB挤压变盘
+        if tech.bb_width and tech.bb_width < 5.0:
+            if "下轨" in tech.bb_signal:
+                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,下轨)")
+            elif "上轨" in tech.bb_signal:
+                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
 
         # RR过滤
         min_conditions = 3 if risk_reward < 1.2 and risk_reward > 0 else 2
@@ -483,51 +651,74 @@ class T0MonitorThread(threading.Thread):
         """检查卖出条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
-        # 条件1：股价接近压力位（3%以内）
-        near_resistance = price >= sr.resistance * 0.97
-        if near_resistance:
-            reasons.append(f"接近压力({sr.resistance:.2f})")
+        # 条件1：接近强压力位（多级分析）
+        atr_val2 = sr.atr or price * 0.02
+        res_info = self._find_nearby_strong_levels(price, sr, atr_val2, is_buy=False)
+        if res_info["strongest"] is not None:
+            strong = res_info["strongest"]
+            dist = (strong - price) / price * 100
+            note = res_info["confluence_note"]
+            reasons.append(f"接近强压力{strong:.3f}({note}，距{dist:.1f}%，上方阻力大)")
+            extra = [f"{lv:.3f}({cnt}重)" for lv, cnt, d in res_info["levels"][1:3]]
+            if extra:
+                reasons.append(f"多级压力: {', '.join(extra)}")
+        elif sr.resistance and price >= sr.resistance * 0.97:
+            dist = (sr.resistance - price) / price * 100
+            reasons.append(f"接近压力位{sr.resistance:.3f}(仅距{dist:.1f}%)")
 
-        # 条件2：RSI偏高
+        # 条件2：RSI偏高（超买区域，回调风险）
         if tech.rsi and tech.rsi > 65:
-            reasons.append(f"RSI偏高({tech.rsi:.0f})")
+            reasons.append(f"RSI={tech.rsi:.0f}(偏高区域，短期超买有回调压力)")
 
-        # 条件3：KDJ超买
+        # 条件3：KDJ超买（K值高位，做多动能衰竭）
         if tech.kdj_k and tech.kdj_k > 75:
-            reasons.append(f"KDJ超买(K={tech.kdj_k:.0f})")
+            reasons.append(f"KDJ超买(K={tech.kdj_k:.0f}，做多动能衰竭)")
 
-        # 条件4：量能放大
+        # 条件4：量能放大（高位放量可能是出货）/ 天量见顶
         if quote.volume_ratio and quote.volume_ratio > 1.3:
-            reasons.append(f"放量(比{quote.volume_ratio:.2f})")
+            if quote.volume_ratio >= 3.0:
+                reasons.append(f"天量(量比{quote.volume_ratio:.1f}，顶部信号强)")
+            else:
+                reasons.append(f"放量(量比{quote.volume_ratio:.2f}，高位放量需警惕出货)")
 
-        # 条件5：MA20非多方向（空头 / 中性震荡均可卖出）
+        # 条件5：MA20偏空（顺势做空或观望）
         if tech.ma_alignment in ("空头排列", "空头反弹", "缠绕"):
-            reasons.append(f"趋势({tech.ma_alignment})")
+            reasons.append(f"均线{tech.ma_alignment}(趋势偏空，不宜做多)")
 
-        # 条件6：委比空头（卖单挂单占优）
+        # 条件6：委比空头（卖单挂单占优，市场看空意愿强）
         if quote.bid_ask_ratio and quote.bid_ask_ratio < -25:
-            reasons.append(f"委比{quote.bid_ask_ratio:.0f}%")
+            reasons.append(f"委比{quote.bid_ask_ratio:.0f}%(挂单看空意愿强)")
 
-        # 条件7：内盘占优（主动卖出 > 主动买入）
+        # 条件7：内盘>外盘（主动卖出量远超主动买入量）
         bs_ratio = self._calc_buy_sell_ratio(quote.bid_volume, quote.ask_volume)
         if bs_ratio and bs_ratio < 1 / 1.4:  # 等价于 ask/bid > 1.4
-            reasons.append(f"内盘优势(x{1/bs_ratio:.1f})")
+            reasons.append(f"内盘/外盘={1/bs_ratio:.1f}(主动卖出是买入的{1/bs_ratio:.1f}倍，卖方主导)")
 
-        # 条件8：MA20乖离（现价高于MA20，均值回归做空）
+        # 条件8：MA20乖离（现价高于MA20，均值回归压力）
         if tech.ma20 and price > tech.ma20:
             deviation = (price - tech.ma20) / tech.ma20 * 100
             if deviation >= 1.5:
-                reasons.append(f"MA20乖离(+{deviation:.1f}%)")
+                reasons.append(f"MA20乖离+{deviation:.1f}%(远离均线，均值回归压力大)")
 
         # 条件9：MA20趋势向下（MA20 < MA60，中长线偏空）
         if tech.ma20 and tech.ma60 and tech.ma20 < tech.ma60:
             reasons.append("MA20<MA60(偏空)")
 
-        # 条件10：筹码峰压力（现价接近上方密集成交区，套牢盘抛压）
+        # 条件10：筹码峰压力（现价接近上方密集成交区 + 多级压力参考）
         clusters = sr.volume_clusters or []
         nearby_above = [c for c in clusters if c > price and c * 0.98 <= price]
         if nearby_above:
-            reasons.append(f"筹码压力({min(nearby_above):.2f})")
+            # 检查是否与多级压力共振
+            if res_info["strongest"]:
+                cluster_near_strongest = any(
+                    abs(c - res_info["strongest"]) <= atr_val2 * 0.5 for c in nearby_above
+                )
+                if cluster_near_strongest:
+                    reasons.append(f"筹码峰+多级压力共振({min(nearby_above):.3f}，抛压集中)")
+                else:
+                    reasons.append(f"筹码峰压力{min(nearby_above):.3f}(密集成交区套牢盘)")
+            else:
+                reasons.append(f"筹码峰压力{min(nearby_above):.3f}(密集成交区套牢盘)")
 
         # 条件11：日内高位（现价接近今日最高点）
         if intrabar["position"] >= 70:
@@ -558,10 +749,25 @@ class T0MonitorThread(threading.Thread):
             reasons.append(f"跳空回补({tech.gap_detail})")
 
         # ---- 背离加分：接近压力 + 内盘>外盘 = 隐藏出货 ----
-        has_divergence = near_resistance and bs_ratio and bs_ratio < 1.0
+        has_near_resistance = (res_info["strongest"] is not None) or (sr.resistance and price >= sr.resistance * 0.97)
+        has_divergence = has_near_resistance and bs_ratio and bs_ratio < 1.0
         if has_divergence and len(reasons) < 2:
             reasons.append("⭐外盘背离(主动卖)")
             return reasons  # 背离信号直接触发
+
+        # 条件14/15：MA60乖离极值（中期顶/底）
+        if tech.ma60 and price and tech.ma60 > 0:
+            dev = (price - tech.ma60) / tech.ma60 * 100
+            if dev <= -15:  # 买入侧：中期底部
+                reasons.append(f"MA60乖离{dev:.0f}%(中期底部)")
+            elif dev >= 20:  # 卖出侧：中期顶部
+                reasons.append(f"MA60乖离+{dev:.0f}%(中期顶部)")
+        # 条件15/16：BB挤压变盘
+        if tech.bb_width and tech.bb_width < 5.0:
+            if "下轨" in tech.bb_signal:
+                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,下轨)")
+            elif "上轨" in tech.bb_signal:
+                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
 
         # RR过滤
         min_conditions = 3 if risk_reward < 1.2 and risk_reward > 0 else 2
@@ -580,7 +786,7 @@ class T0MonitorThread(threading.Thread):
                 and last_signal.is_valid(max_age=120)
                 and abs(signal.price - last_signal.price) / last_signal.price < 0.005):
                 log.debug(f"跳过重复信号: {signal.code} {signal.signal_type} "
-                          f"(上次@{last_signal.price:.2f}, 本次@{signal.price:.2f})")
+                          f"(上次@{last_signal.price:.3f}, 本次@{signal.price:.3f})")
                 continue
             self._last_signals[signal.code] = signal
             new_signals.append(signal)
@@ -638,9 +844,9 @@ class T0MonitorThread(threading.Thread):
                 rr_str = f"⭐{rr_str}"
             elif s.risk_reward < 1.2 and s.risk_reward > 0:
                 rr_str = f"⚠️{rr_str}"
-            suggest_str = f"{suggest_val:.2f}" if suggest_val > 0 else "--"
+            suggest_str = f"{suggest_val:.3f}" if suggest_val > 0 else "--"
             rows.append(
-                f"  │ {name_col:<{name_w-2}} │ {s.price:>{price_w-2}.2f} │ "
+                f"  │ {name_col:<{name_w-2}} │ {s.price:>{price_w-2}.3f} │ "
                 f"{suggest_str:>{suggest_w-2}} │ "
                 f"{ref_label}{ref_val:>{ref_w-4}.2f} │ "
                 f"{rr_str:>{rr_w-2}} │ {s.reason}"
@@ -701,10 +907,10 @@ class T0MonitorThread(threading.Thread):
             lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
             for s in buys:
                 rr_str = f"{s.risk_reward:.1f}x ({s.rr_quality})"
-                buy_str = f"{s.buy_price:.2f}" if s.buy_price > 0 else "--"
+                buy_str = f"{s.buy_price:.3f}" if s.buy_price > 0 else "--"
                 lines.append(
-                    f"| {s.name}({s.code}) | {s.price:.2f} | {buy_str} | "
-                    f"{s.support:.2f} | {rr_str} | {s.reason} |")
+                    f"| {s.name}({s.code}) | {s.price:.3f} | {buy_str} | "
+                    f"{s.support:.3f} | {rr_str} | {s.reason} |")
             lines.append("")
 
         if sells:
@@ -713,9 +919,9 @@ class T0MonitorThread(threading.Thread):
             lines.append("| --- | ---: | ---: | ---: | ---: | --- |")
             for s in sells:
                 rr_str = f"{s.risk_reward:.1f}x ({s.rr_quality})"
-                sell_str = f"{s.sell_price:.2f}" if s.sell_price > 0 else "--"
+                sell_str = f"{s.sell_price:.3f}" if s.sell_price > 0 else "--"
                 lines.append(
-                    f"| {s.name}({s.code}) | {s.price:.2f} | {sell_str} | "
+                    f"| {s.name}({s.code}) | {s.price:.3f} | {sell_str} | "
                     f"{s.resistance:.2f} | {rr_str} | {s.reason} |")
             lines.append("")
 

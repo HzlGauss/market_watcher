@@ -29,6 +29,7 @@ class WatchItem:
     code: str = ""
     market: Literal["SH", "SZ", "HK"] = "SH"
     type: str = "宽基 ETF"
+    industry: str = ""  # 所属行业板块
 
 
 @dataclass
@@ -48,6 +49,7 @@ class Holding:
     market: Literal["SH", "SZ", "HK"] = "SH"
     amount: int = 0
     cost: float = 0.0
+    industry: str = ""  # 所属行业板块
 
 
 @dataclass
@@ -106,6 +108,46 @@ class FundFlowDetail:
             return False
         return self.super_large_net < 0 and self.small_net > 0
 
+    @property
+    def is_mid_capital_active(self) -> bool:
+        """中单活跃（游资/私募/大户主导，中单净流入占比 > 50%）"""
+        if self.medium_net is None or self.main_net is None:
+            return False
+        total = abs(self.medium_net) + abs(self.main_net)
+        if total == 0:
+            return False
+        return abs(self.medium_net) / total > 0.5
+
+    @property
+    def is_institution_absorbing(self) -> bool:
+        """机构吸筹深化（超大单净流入，且中单+小单都净流出）"""
+        if self.super_large_net is None or self.medium_net is None or self.small_net is None:
+            return False
+        return (self.super_large_net > 0
+                and self.medium_net < 0
+                and self.small_net < 0)
+
+    @property
+    def flow_structure(self) -> str:
+        """资金结构标签"""
+        if not self.is_valid:
+            return "无数据"
+        if self.is_institution_absorbing:
+            return "机构主导(中小资金出逃)"
+        if self.is_institution_driven:
+            return "机构主导"
+        if self.is_distribution:
+            return "机构出货"
+        if self.is_mid_capital_active:
+            return "游资活跃"
+        if self.is_retail_driven:
+            return "散户主导"
+        if self.main_net and self.main_net > 0:
+            return "主力偏多"
+        if self.main_net and self.main_net < 0:
+            return "主力偏空"
+        return "均衡"
+
 
 @dataclass
 class Quote:
@@ -149,6 +191,7 @@ class Quote:
     volume: Optional[float] = None
     amount: Optional[float] = None
     amplitude: Optional[float] = None
+    avg_price: Optional[float] = None  # 分时均价 = 成交额/成交量（日内VWAP）
     pe_ratio: Optional[float] = None
     pb_ratio: Optional[float] = None
     market_cap: Optional[float] = None
@@ -161,6 +204,7 @@ class Quote:
     bid_ask_ratio: Optional[float] = None  # 委比
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
+    industry: str = ""  # 所属行业板块（从东方财富行业分类获取）
 
 
 @dataclass
@@ -275,6 +319,37 @@ class NorthFlowData:
     def is_significant(self) -> bool:
         """判断北向资金是否显著 (净流入/流出超过 50 亿)"""
         return abs(self.total_net) > 50.0
+
+
+@dataclass
+class SectorBoard:
+    """行业板块实时数据
+
+    Attributes:
+        code: 板块代码（如 BK0477）
+        name: 板块名称（如 "半导体"）
+        change_pct: 板块涨跌幅 (%)
+        amount: 成交额（元）
+        leader_stock: 领涨股名称
+        leader_change_pct: 领涨股涨跌幅
+        main_net_inflow: 板块主力净流入（元）
+        stock_count: 板块成分股数量
+    """
+    code: str = ""
+    name: str = ""
+    change_pct: Optional[float] = None
+    amount: Optional[float] = None
+    leader_stock: str = ""
+    leader_change_pct: Optional[float] = None
+    main_net_inflow: Optional[float] = None
+    stock_count: int = 0
+
+    @property
+    def change_direction(self) -> str:
+        """涨跌方向"""
+        if self.change_pct is None:
+            return "平"
+        return "涨" if self.change_pct > 0 else ("跌" if self.change_pct < 0 else "平")
 
 
 @dataclass
@@ -469,6 +544,7 @@ class TechnicalSummary:
     bb_width: Optional[float] = None
     bb_signal: str = ""
     obv: Optional[float] = None
+    obv_signal: str = ""  # OBV 信号
     ma5: Optional[float] = None
     ma10: Optional[float] = None
     ma20: Optional[float] = None

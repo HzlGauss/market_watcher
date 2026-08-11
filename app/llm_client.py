@@ -231,13 +231,21 @@ def get_llm_client(config: Optional[Config] = None) -> LLMClient:
     global _default_llm_client
 
     if _default_llm_client is None:
-        model = config.llm_model if config else "deepseek-chat"
-        base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
-        verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
+        if config:
+            model = config.llm_model
+            base_url = config.llm_base_url
+            verify_ssl = config.llm_verify_ssl
+            api_key = config.llm_api_key
+        else:
+            model = "deepseek-chat"
+            base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+            verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
+            api_key = None
         _default_llm_client = LLMClient(
             model=model,
             base_url=base_url,
             verify_ssl=verify_ssl,
+            api_key=api_key,
         )
 
     return _default_llm_client
