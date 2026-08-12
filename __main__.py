@@ -587,7 +587,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         print_llm_result, print_tail, save_brief, print_key_levels, Color
     )
     from app.technical import get_technical_summary, TechnicalSummary
-    from app.models import ScanRecord, FundScanStatus, TechSnapshot
+    from app.models import ScanRecord, FundScanStatus, TechSnapshot, Alert
 
     log.info("Scanning market data (from shared pool)...")
 
@@ -780,6 +780,29 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             print(f"  {Color.BOLD}{name}({code}){Color.RESET}  →  {sig_text}")
         print()
 
+    # 涨速排名（与前次扫描对比）
+    _prev_prices = getattr(_run_once_new, '_prev_prices', {})
+    if _prev_prices:
+        velocity_items = []
+        for q in quotes:
+            prev_p = _prev_prices.get(q.code)
+            if prev_p and q.price and prev_p > 0 and q.price != prev_p:
+                vel = (q.price - prev_p) / prev_p * 100
+                if abs(vel) >= 0.3:  # 3分钟涨速超过0.3%才显示
+                    velocity_items.append((q.name, q.code, vel))
+        if velocity_items:
+            velocity_items.sort(key=lambda x: x[2], reverse=True)
+            from app.presenter import Color
+            print(f"{Color.BOLD}{Color.PURPLE}═══ 涨速排名(3min) ═══{Color.RESET}")
+            top = velocity_items[:5]
+            bot = velocity_items[-5:]
+            top_str = "  ".join(f"{Color.RED}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in top)
+            bot_str = "  ".join(f"{Color.GREEN}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in bot)
+            print(f"  ▲ {top_str}")
+            print(f"  ▼ {bot_str}")
+            print()
+    _run_once_new._prev_prices = {q.code: q.price for q in quotes if q.price is not None}
+
     # Sector analysis display
     if sector_boards:
         from app.analyzer import analyze_sector_context
@@ -825,6 +848,21 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # Print sentiment and alerts
     print_sentiment(stats)
     print_alerts(alerts)
+
+    # K线形态检测（追加到告警列表）
+    from app.technical import detect_candlestick_patterns
+    for q in quotes:
+        kls = klines_map.get(q.code)
+        if not kls:
+            continue
+        patterns = detect_candlestick_patterns(kls)
+        if patterns:
+            existing = next((a for a in alerts if a.code == q.code), None)
+            if existing:
+                for p in patterns:
+                    existing.messages.append(p)
+            else:
+                alerts.append(Alert(code=q.code, name=q.name, messages=list(patterns)))
 
     # 发送桌面通知
     if alerts:

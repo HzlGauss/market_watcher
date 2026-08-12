@@ -85,21 +85,27 @@ def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     clusters = sr.volume_clusters or []
     atr = sr.atr or price * 0.005
 
-    # ---- 买入挂单价 ----
+    # ---- 买入挂单价（不高于现价，VWAP 作为上限参考） ----
     buy_refs = [support] + [c for c in clusters if c < price]
     if quote.low:
         buy_refs.append(quote.low)
     nearest_below = max(c for c in buy_refs if c < price) if any(c < price for c in buy_refs) else support
     buy_p = nearest_below + atr / 4
     buy_p = min(buy_p, price)  # 不高于现价
+    # 买入价若高于均价，说明偏贵，下调到均价附近（但不能低于原支撑位）
+    if quote.avg_price and quote.avg_price > 0 and buy_p > quote.avg_price:
+        buy_p = round(max(buy_p * 0.5 + quote.avg_price * 0.5, nearest_below), 3)
 
-    # ---- 卖出挂单价 ----
+    # ---- 卖出挂单价（不低于现价，VWAP 作为下限参考） ----
     sell_refs = [resistance] + [c for c in clusters if c > price]
     if quote.high:
         sell_refs.append(quote.high)
     nearest_above = min(c for c in sell_refs if c > price) if any(c > price for c in sell_refs) else resistance
     sell_p = nearest_above - atr / 4
     sell_p = max(sell_p, price)  # 不低于现价
+    # 卖出价若低于均价，说明偏便宜，上调到均价附近（但不能高于原压力位）
+    if quote.avg_price and quote.avg_price > 0 and sell_p < quote.avg_price:
+        sell_p = round(min(sell_p * 0.5 + quote.avg_price * 0.5, nearest_above), 3)
 
     return {
         "buy_price": round(buy_p, 3),
@@ -266,6 +272,13 @@ class T0MonitorThread(threading.Thread):
         if intrabar is None:
             return None
         if intrabar["amplitude_low"]:
+            return None
+
+        # 窄幅震荡过滤（回测：此状态下胜率45.6%，均收益-0.32%）
+        from app.technical import detect_market_regime
+        tech_temp = get_technical_summary(quote, t0_klines)
+        regime_t0 = detect_market_regime(tech_temp, price, sr.atr)
+        if regime_t0.regime == "窄幅震荡":
             return None
 
         # 计算建议挂单价格
@@ -641,8 +654,15 @@ class T0MonitorThread(threading.Thread):
             elif "上轨" in tech.bb_signal:
                 reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
 
-        # RR过滤
-        min_conditions = 3 if risk_reward < 1.2 and risk_reward > 0 else 2
+        # RR过滤（RR越高越需更多信号，避免高RR假象）
+        if risk_reward >= 2.0:
+            min_conditions = 3
+        elif risk_reward >= 1.5:
+            min_conditions = 4
+        elif risk_reward >= 1.2:
+            min_conditions = 5
+        else:
+            min_conditions = 5  # RR差需强证据
         return reasons if len(reasons) >= min_conditions else []
 
     def _check_sell_conditions(self, quote: Quote, tech: TechnicalSummary,
@@ -769,8 +789,15 @@ class T0MonitorThread(threading.Thread):
             elif "上轨" in tech.bb_signal:
                 reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
 
-        # RR过滤
-        min_conditions = 3 if risk_reward < 1.2 and risk_reward > 0 else 2
+        # RR过滤（RR越高越需更多信号，避免高RR假象）
+        if risk_reward >= 2.0:
+            min_conditions = 3
+        elif risk_reward >= 1.5:
+            min_conditions = 4
+        elif risk_reward >= 1.2:
+            min_conditions = 5
+        else:
+            min_conditions = 5  # RR差需强证据
         return reasons if len(reasons) >= min_conditions else []
 
     def _handle_signals(self, signals: list[T0Signal]):

@@ -96,6 +96,16 @@ def _build_prompt(
             f"- 数据时间: {b.update_time}",
             "",
         ])
+    else:
+        # 兜底：用监控标的数据估算市场状态
+        lines.extend([
+            "## 🏛️ 市场概况（基于监控标的）",
+            f"- 说明: 全市场数据暂不可用，以下为自选标的统计",
+            f"- 涨跌分布: 涨{stats.up} / 跌{stats.down} / 平{stats.flat} (共{stats.total}只)",
+            f"- 情绪评分: {s.score}/100 ({s.label})",
+            f"- 资金结构(超大/大/中/小): {_format_flow_breakdown_for_llm(quotes)}",
+            "",
+        ])
 
     lines.extend([
         f"## 持仓概况",

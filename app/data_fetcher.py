@@ -470,6 +470,12 @@ def fetch_quotes_rich(items: list[WatchItem]) -> list[Quote]:
     except Exception:
         pass
 
+    # 补充主力资金流向（东方财富API，批量获取）
+    try:
+        enrich_quotes_with_flow(quotes)
+    except Exception:
+        pass
+
     return quotes
 
 
@@ -695,12 +701,14 @@ def fetch_market_breadth(force_refresh: bool = False) -> Optional["MarketBreadth
         return breadth
 
     except ImportError:
-        log.debug("AKShare 未安装，跳过全市场广度数据")
-        return None
+        log.info("AKShare 未安装，使用旧缓存或跳过")
     except Exception as e:
-        log.info(f"全市场广度数据获取失败: {e}，使用旧缓存")
+        log.info(f"AKShare 全市场数据获取失败: {e}，使用旧缓存")
+
+    # 旧缓存延长有效期（获取失败时缓存从5分钟延长到2小时，避免AI分析无数据）
+    if _breadth_cache is not None and (now - _breadth_fetch_time) < 7200:
         return _breadth_cache
-        return _breadth_cache  # 返回旧缓存
+    return None
 
 
 # ============================================================
@@ -1280,4 +1288,30 @@ def fetch_major_indices() -> list[Quote]:
         return fetch_quotes_rich(indices)
     except Exception:
         return []
+
+
+# 大盘指数K线缓存
+_index_klines_cache: dict = {"_ts": 0, "_data": {}}
+_INDEX_KLINES_TTL = 600  # 10分钟
+
+
+def fetch_index_klines(codes: list[str]) -> dict[str, list]:
+    """批量获取大盘指数60日K线（带缓存）"""
+    global _index_klines_cache
+    now = time.time()
+    if now - _index_klines_cache["_ts"] < _INDEX_KLINES_TTL and _index_klines_cache["_data"]:
+        return {k: v for k, v in _index_klines_cache["_data"].items() if k in codes}
+
+    from app.technical import fetch_historical_kline
+    result = {}
+    for code in codes:
+        market = "SH" if code.startswith(("0", "5", "6", "9")) else "SZ"
+        try:
+            kls = fetch_historical_kline(code, market, days=60)
+            if kls:
+                result[code] = kls
+        except Exception:
+            pass
+    _index_klines_cache = {"_ts": now, "_data": result}
+    return result
 

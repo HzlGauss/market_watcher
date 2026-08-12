@@ -1913,15 +1913,20 @@ def detect_market_regime(
     return result
 
 
-def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
+def calc_composite_score(tech: TechnicalSummary, price: float, flow_pct: Optional[float] = None) -> dict:
     """多信号共振加权评分（0-100）
 
     权重分配：
     - 趋势（MA 排列）: 25分
     - 动量（RSI + KDJ）: 25分
     - 量价（量比 + OBV）: 20分
-    - 资金（主力流向）: 15分（外部传入）
+    - 资金（主力流向）: 15分
     - 关键位（支撑/压力）: 15分
+
+    Args:
+        tech: 技术指标汇总
+        price: 当前价格
+        flow_pct: 主力净流入占成交额%，None 时资金维度为0
 
     Returns:
         {"score": int, "label": str, "breakdown": dict, "signals": list}
@@ -1930,19 +1935,19 @@ def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
     breakdown: dict[str, int] = {"趋势": 0, "动量": 0, "量价": 0, "资金": 0, "关键位": 0}
     signals: list[str] = []
 
-    # 趋势 25分
+    # 趋势 30分（回测：上升趋势均收益1.1%，权重应最高）
     ma = tech.ma_alignment
     if ma == "多头排列":
-        breakdown["趋势"] = 20
+        breakdown["趋势"] = 25
         signals.append("MA多头")
     elif ma == "多头回调":
-        breakdown["趋势"] = 10
+        breakdown["趋势"] = 12
         signals.append("MA多头回调(回踩)")
     elif ma == "空头反弹":
-        breakdown["趋势"] = -10
+        breakdown["趋势"] = -12
         signals.append("MA空头反弹(反压)")
     elif ma == "空头排列":
-        breakdown["趋势"] = -20
+        breakdown["趋势"] = -25
         signals.append("MA空头")
     # MA20 斜率辅助
     if tech.ma5 and tech.ma20 and tech.ma5 > tech.ma20:
@@ -1976,11 +1981,19 @@ def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
     obv_sig = tech.obv_signal
     bb_sig = tech.bb_signal
     if obv_sig and obv_sig not in ("中性", "数据不足"):
-        if "流入" in obv_sig or "背离" in obv_sig:
+        if "加速流入" in obv_sig or "底背离" in obv_sig:
             breakdown["量价"] += 10
-            signals.append(f"OBV{obv_sig}")
-        elif "流出" in obv_sig:
+        elif "持续流入" in obv_sig or "转向流入" in obv_sig:
+            breakdown["量价"] += 7
+        elif "流入放缓" in obv_sig:
+            breakdown["量价"] += 3
+        elif "加速流出" in obv_sig or "顶背离" in obv_sig:
             breakdown["量价"] -= 10
+        elif "持续流出" in obv_sig or "转向流出" in obv_sig:
+            breakdown["量价"] -= 7
+        elif "流出放缓" in obv_sig:
+            breakdown["量价"] -= 3
+        if breakdown["量价"] != 0:
             signals.append(f"OBV{obv_sig}")
     # BB 位置 + 带宽
     if "下轨" in bb_sig:
@@ -2003,26 +2016,49 @@ def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
             breakdown["趋势"] += 10
             signals.append(f"MA60乖离{dev:.0f}%(底部)")
 
-    # 关键位 15分
+    # 关键位 15分（各信号独立，不互斥）
+    key_score = 0
     if tech.has_support_confirmation:
-        breakdown["关键位"] = 10
+        key_score += 8
         signals.append("支撑确认")
-    elif tech.has_resistance_rejection:
-        breakdown["关键位"] = -10
+    if tech.has_resistance_rejection:
+        key_score -= 8
         signals.append("压力受阻")
     if tech.has_breakout_retest:
-        breakdown["关键位"] += 5
+        key_score += 7
         signals.append("突破回踩")
     if tech.has_support_breakdown:
-        breakdown["关键位"] -= 10
+        key_score -= 8
         signals.append("跌破支撑")
+    breakdown["关键位"] = max(-20, min(15, key_score))
+
+    # 资金 15分（外部传入）
+    if flow_pct is not None:
+        if flow_pct >= 15:
+            breakdown["资金"] = 12
+            signals.append(f"主力大幅流入{flow_pct:.0f}%")
+        elif flow_pct >= 8:
+            breakdown["资金"] = 8
+            signals.append(f"主力流入{flow_pct:.0f}%")
+        elif flow_pct >= 3:
+            breakdown["资金"] = 4
+        elif flow_pct <= -12:
+            breakdown["资金"] = -12
+            signals.append(f"主力大幅流出{abs(flow_pct):.0f}%")
+        elif flow_pct <= -7:
+            breakdown["资金"] = -8
+            signals.append(f"主力流出{abs(flow_pct):.0f}%")
+        elif flow_pct <= -3:
+            breakdown["资金"] = -4
+        # else: 0 = 中性
 
     # 汇总
     for v in breakdown.values():
         score += v
     score = max(0, min(100, score))
 
-    if score >= 70:
+    # 回测优化：极多(≥75)均收益1.06% vs 偏多(55-70)仅0.31%
+    if score >= 75:
         label = "🟢 强烈看多"
     elif score >= 60:
         label = "🟢 偏多"
@@ -2034,3 +2070,75 @@ def calc_composite_score(tech: TechnicalSummary, price: float) -> dict:
         label = "🔴 强烈看空"
 
     return {"score": score, "label": label, "breakdown": breakdown, "signals": signals}
+
+
+# ============================================================
+# K线形态识别（纯 Python，不依赖 TA-Lib）
+# ============================================================
+
+def detect_candlestick_patterns(klines: list[KlineData]) -> list[str]:
+    """检测最近3根K线的经典形态
+
+    Returns:
+        形态信号列表（中文标签）
+    """
+    if len(klines) < 3:
+        return []
+    patterns = []
+    k1 = klines[-1]  # 最新
+    k2 = klines[-2]
+    k3 = klines[-3]
+
+    if not all(k.open and k.close and k.high and k.low
+               for k in [k1, k2, k3]):
+        return []
+
+    body1 = abs(k1.close - k1.open)
+    body2 = abs(k2.close - k2.open)
+    body3 = abs(k3.close - k3.open)
+    upper1 = k1.high - max(k1.open, k1.close)
+    lower1 = min(k1.open, k1.close) - k1.low
+    upper2 = k2.high - max(k2.open, k2.close)
+    lower2 = min(k2.open, k2.close) - k2.low
+
+    is_bullish1 = k1.close > k1.open
+    is_bearish1 = k1.close < k1.open
+    is_bullish2 = k2.close > k2.open
+    is_bearish2 = k2.close < k2.open
+
+    # 1. 锤子线（底部反转）
+    if is_bullish1 and lower1 > body1 * 2 and upper1 < body1 * 0.3 and body1 > 0:
+        # 趋势确认：前两根是阴线
+        if k3.close < k3.open or k2.close < k2.open:
+            patterns.append("🔨 锤子线(底部反转)")
+
+    # 2. 射击之星（顶部反转）
+    if is_bearish1 and upper1 > body1 * 2 and lower1 < body1 * 0.3 and body1 > 0:
+        if k3.close > k3.open or k2.close > k2.open:
+            patterns.append("💫 射击之星(顶部反转)")
+
+    # 3. 看涨吞没
+    if is_bullish1 and is_bearish2 and k1.open < k2.close and k1.close > k2.open:
+        patterns.append("🟢 看涨吞没(底部反转)")
+
+    # 4. 看跌吞没
+    if is_bearish1 and is_bullish2 and k1.open > k2.close and k1.close < k2.open:
+        patterns.append("🔴 看跌吞没(顶部反转)")
+
+    # 5. 十字星（变盘信号）
+    if body1 < (k1.high - k1.low) * 0.15 and (k1.high - k1.low) > 0:
+        direction = "底部" if k3.close < k3.open and k2.close < k2.open else ("顶部" if k3.close > k3.open and k2.close > k2.open else "")
+        if direction:
+            patterns.append(f"✝️ 十字星({direction}变盘)")
+        else:
+            patterns.append("✝️ 十字星(变盘信号)")
+
+    # 6. 三连阳/三连阴
+    if is_bullish1 and is_bullish2 and k3.close > k3.open:
+        if body1 > body2 and body2 > body3:
+            patterns.append("🟢 三连阳(强势)")
+    if is_bearish1 and is_bearish2 and k3.close < k3.open:
+        if body1 > body2 and body2 > body3:
+            patterns.append("🔴 三连阴(弱势)")
+
+    return patterns

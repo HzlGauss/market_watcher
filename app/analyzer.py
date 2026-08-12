@@ -746,26 +746,13 @@ def analyze(
         if q.type != "指数" and tech_summaries and q.code in tech_summaries:
             from app.technical import calc_composite_score, detect_market_regime
             tech = tech_summaries[q.code]
-            score_info = calc_composite_score(tech, q.price or 0)
-            regime = detect_market_regime(tech, q.price or 0, tech.atr)
-            # 资金维度（从主力流数据补充）
-            flow_score = 0
+            flow_pct_val = None
             if q.main_net_inflow and q.amount and q.amount > 0:
                 flow_pct_val = q.main_net_inflow / q.amount * 100
-                if flow_pct_val >= 10:
-                    flow_score = 10
-                    score_info["signals"].append(f"主力流入{flow_pct_val:.0f}%")
-                elif flow_pct_val <= -7:
-                    flow_score = -10
-                    score_info["signals"].append(f"主力流出{abs(flow_pct_val):.0f}%")
-                elif flow_pct_val >= 5:
-                    flow_score = 5
-                elif flow_pct_val <= -5:
-                    flow_score = -5
-            score_info["breakdown"]["资金"] = flow_score
-            final_score = max(0, min(100, score_info["score"] + flow_score))
-            score_info["score"] = final_score
-            score_info["label"] = ("🟢 强烈看多" if final_score >= 70 else
+            score_info = calc_composite_score(tech, q.price or 0, flow_pct=flow_pct_val)
+            regime = detect_market_regime(tech, q.price or 0, tech.atr)
+            final_score = score_info["score"]
+            score_info["label"] = ("🟢 强烈看多" if final_score >= 75 else
                                   "🟢 偏多" if final_score >= 60 else
                                   "⚪ 中性" if final_score >= 45 else
                                   "🟡 偏空" if final_score >= 35 else "🔴 强烈看空")

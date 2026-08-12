@@ -303,7 +303,10 @@ def _get_holdings_tech_analysis(
         # 复合评分 + 市场状态（独立 try，不影响其他数据返回）
         try:
             tech_summary = get_technical_summary(quote, klines)
-            composite = calc_composite_score(tech_summary, quote.price or 0)
+            flow_pct_r = None
+            if quote.main_net_inflow and quote.amount and quote.amount > 0:
+                flow_pct_r = quote.main_net_inflow / quote.amount * 100
+            composite = calc_composite_score(tech_summary, quote.price or 0, flow_pct=flow_pct_r)
             regime = detect_market_regime(tech_summary, quote.price or 0, sr.atr)
         except Exception as exc:
             composite = {"score": 0, "label": "", "signals": [], "breakdown": {}}
@@ -1716,15 +1719,19 @@ def _format_market_sector_section(
     # 大盘指数
     if major_indices:
         md_lines.append("### 大盘指数")
-        md_lines.append("| 指数 | 最新 | 涨跌幅 |")
-        md_lines.append("|------|------|--------|")
+        md_lines.append("| 指数 | 最新 | 涨跌幅 | 量比 |")
+        md_lines.append("|------|------|--------|------|")
         idx_names = []
         for idx in major_indices[:7]:
             price = f"{idx.price:.2f}" if idx.price else "--"
             chg = f"{idx.change_pct:+.2f}%" if idx.change_pct is not None else "--"
-            md_lines.append(f"| {idx.name} | {price} | {chg} |")
+            vr = f"{idx.volume_ratio:.1f}" if idx.volume_ratio and idx.volume_ratio > 0 else "--"
+            md_lines.append(f"| {idx.name} | {price} | {chg} | {vr} |")
             if idx.change_pct is not None:
-                idx_names.append(f"{idx.name}{idx.change_pct:+.1f}%")
+                label = f"{idx.name}{idx.change_pct:+.1f}%"
+                if idx.volume_ratio and idx.volume_ratio > 0:
+                    label += f"(量比{idx.volume_ratio:.1f})"
+                idx_names.append(label)
         md_lines.append("")
         if idx_names:
             llm_parts.append(f"[大盘] {' '.join(idx_names[:5])}")
@@ -1750,6 +1757,39 @@ def _format_market_sector_section(
             f"[板块Bot3] {' '.join(f'{sb.name}{sb.change_pct:+.1f}%' for sb in bot5[:3])}"
         )
 
+    # 大盘指数技术面分析
+    from app.data_fetcher import fetch_index_klines
+    idx_codes = ["000001", "399001", "399006", "000688"]
+    idx_klines_map = fetch_index_klines(idx_codes)
+    idx_name_map = {"000001": "上证", "399001": "深证", "399006": "创业板", "000688": "科创50"}
+    if idx_klines_map:
+        from app.technical import get_technical_summary
+        md_lines.append("### 大盘指数技术面")
+        md_lines.append("| 指数 | 现价 | MA排列 | 距MA20 | RSI | MACD | 强支撑 | 强压力 | 状态 |")
+        md_lines.append("|------|------|--------|--------|-----|------|--------|--------|------|")
+        idx_llm = []
+        for code, kls in idx_klines_map.items():
+            if len(kls) < 20:
+                continue
+            quote = Quote(code=code, price=kls[-1].close)
+            tech = get_technical_summary(quote, kls)
+            name = idx_name_map.get(code, code)
+            price = f"{kls[-1].close:.0f}" if kls[-1].close and kls[-1].close > 100 else f"{kls[-1].close:.2f}" if kls[-1].close else "--"
+            ma = tech.ma_alignment or "--"
+            ma20_dist = f"{(tech.ma5 or 0):.0f}"  # simplified
+            rsi_str = f"{tech.rsi:.0f}" if tech.rsi else "--"
+            macd_str = tech.macd_signal or "--"
+            sup = tech.support or "--"
+            res = tech.resistance or "--"
+            from app.technical import detect_market_regime
+            reg = detect_market_regime(tech, kls[-1].close or 0, tech.atr)
+            status = reg.regime or "--"
+            md_lines.append(f"| {name} | {price} | {ma} | -- | {rsi_str} | {macd_str} | -- | -- | {status} |")
+            idx_llm.append(f"{name}({ma},{rsi_str},{macd_str},{reg.regime})")
+        md_lines.append("")
+        if idx_llm:
+            llm_parts.append(f"[大盘技术] {' '.join(idx_llm)}")
+
     # 持仓板块归位
     holding_industries: dict[str, list[Quote]] = {}
     for q in quotes:
@@ -1760,11 +1800,13 @@ def _format_market_sector_section(
             holding_industries[ind] = []
         holding_industries[ind].append(q)
 
+    # 板块涨跌映射（持仓归位 + 一致性分析共用）
+    sector_chg_map = {sb.name: sb.change_pct for sb in sector_boards} if sector_boards else {}
+
     if holding_industries:
         md_lines.append("### 持仓板块归位")
         md_lines.append("| 板块 | 持仓标的 | 板块涨跌 | 个股涨跌 | 相对强弱 |")
         md_lines.append("|------|---------|---------|---------|---------|")
-        sector_chg_map = {sb.name: sb.change_pct for sb in sector_boards} if sector_boards else {}
         for ind, group in sorted(holding_industries.items(), key=lambda x: len(x[1]), reverse=True):
             sector_chg = sector_chg_map.get(ind)
             for q in group[:3]:  # 每个板块最多显示3只
@@ -1788,6 +1830,78 @@ def _format_market_sector_section(
             f"[持仓板块] {' '.join(f'{ind}({len(group)}只)' for ind, group in
              sorted(holding_industries.items(), key=lambda x: len(x[1]), reverse=True)[:5])}"
         )
+
+    # 板块轮动（日环比）
+    if sector_boards:
+        from datetime import datetime as _dt
+        from pathlib import Path as _Pth
+        import json
+        rot_path = _Pth(__file__).resolve().parent.parent / "state" / "sector_history.json"
+        prev_sectors = {}
+        if rot_path.exists():
+            try:
+                with open(rot_path, "r", encoding="utf-8") as f:
+                    prev_data = json.load(f)
+                today_str = _dt.now().strftime("%Y-%m-%d")
+                if prev_data.get("_date") != today_str:
+                    prev_sectors = {it["name"]: it["change_pct"] for it in prev_data.get("sectors", [])}
+            except Exception:
+                pass
+        # 保存当日数据
+        try:
+            rot_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(rot_path, "w", encoding="utf-8") as f:
+                json.dump({"_date": _dt.now().strftime("%Y-%m-%d"),
+                           "sectors": [{"name": sb.name, "change_pct": sb.change_pct}
+                                      for sb in sector_boards[:30]]}, f, ensure_ascii=False)
+        except Exception:
+            pass
+        # 计算轮动
+        if prev_sectors:
+            rotations = []
+            for sb in sector_boards[:15]:
+                prev_chg = prev_sectors.get(sb.name)
+                if prev_chg is not None and sb.change_pct is not None:
+                    delta = sb.change_pct - prev_chg
+                    if abs(delta) >= 1.0:
+                        direction = "🔥加速" if delta > 0 else "💧减速"
+                        rotations.append((sb.name, delta, direction))
+            if rotations:
+                rotations.sort(key=lambda x: abs(x[1]), reverse=True)
+                md_lines.append("### 板块轮动(日环比)")
+                md_lines.append("| 板块 | 今日 | 昨日 | 变化 | 方向 |")
+                md_lines.append("|------|------|------|------|------|")
+                for name, delta, direction in rotations[:8]:
+                    sb_info = next((s for s in sector_boards if s.name == name), None)
+                    today_str2 = f"{sb_info.change_pct:+.2f}%" if sb_info and sb_info.change_pct is not None else "--"
+                    prev_str = f"{prev_sectors[name]:+.2f}%" if name in prev_sectors else "--"
+                    md_lines.append(f"| {name} | {today_str2} | {prev_str} | {delta:+.1f}% | {direction} |")
+                md_lines.append("")
+                rot_items = [f"{n}({d:+.1f}%)" for n, d, _ in rotations[:5]]
+                llm_parts.append(f"[板块轮动] {' '.join(rot_items)}")
+
+    # 持仓 vs 板块一致性
+    if holding_industries and sector_boards:
+        md_lines.append("### 持仓 vs 板块一致性")
+        md_lines.append("| 持仓 | 个股涨跌 | 所属板块 | 板块涨跌 | 偏离 | 一致性 |")
+        md_lines.append("|------|---------|---------|---------|------|--------|")
+        bench_parts = []
+        for q in quotes:
+            ind = q.industry or q.type or ""
+            if not ind or q.change_pct is None:
+                continue
+            sector_chg = sector_chg_map.get(ind) if sector_boards else None
+            if sector_chg is not None:
+                dev_val = q.change_pct - sector_chg
+                if abs(dev_val) >= 1.0:
+                    same_dir = (q.change_pct > 0) == (sector_chg > 0)
+                    consistency = "✅共振" if same_dir else "⚠️背离"
+                    md_lines.append(f"| {q.name}({q.code}) | {q.change_pct:+.2f}% | {ind} | {sector_chg:+.2f}% | {dev_val:+.1f}% | {consistency} |")
+                    if abs(dev_val) >= 2.0:
+                        bench_parts.append(f"{q.name}({dev_val:+.1f}%{'+共振' if same_dir else '背离'})")
+        if bench_parts:
+            md_lines.append("")
+            llm_parts.append(f"[持仓vs板块] {' '.join(bench_parts[:5])}")
 
     if not md_lines:
         return "", ""
@@ -1994,6 +2108,32 @@ def _compute_entry_suggestions(
         entry_reasons: list[str] = []
         risk_score = 0
         risk_reasons: list[str] = []
+
+        # 主力资金因子
+        ff_entry = quote.fund_flow
+        if ff_entry and ff_entry.is_valid and quote.main_net_inflow and quote.amount and quote.amount > 0:
+            flow_pct_e = quote.main_net_inflow / quote.amount * 100
+            if flow_pct_e >= 10:
+                entry_score += 3
+                entry_reasons.append(f"主力流入{flow_pct_e:.0f}%")
+            elif flow_pct_e >= 5:
+                entry_score += 1
+                entry_reasons.append(f"主力偏多({flow_pct_e:.0f}%)")
+            if ff_entry.is_institution_absorbing:
+                entry_score += 3
+                entry_reasons.append("机构深度吸筹")
+            elif ff_entry.is_institution_driven:
+                entry_score += 2
+                entry_reasons.append("机构主导")
+            if ff_entry.is_distribution:
+                risk_score += 3
+                risk_reasons.append("机构出货")
+            elif ff_entry.is_retail_driven:
+                risk_score += 1
+                risk_reasons.append("散户主导")
+            if flow_pct_e <= -8:
+                risk_score += 2
+                risk_reasons.append(f"主力流出{abs(flow_pct_e):.0f}%")
 
         # 加分项
         if rsi is not None and rsi <= 30:
@@ -2245,6 +2385,23 @@ def _compute_trading_suggestions(
         escape_score = 0
         escape_reasons: list[str] = []
 
+        # 主力资金因子
+        ff_sug = quote.fund_flow
+        if ff_sug and ff_sug.is_valid and quote.main_net_inflow and quote.amount and quote.amount > 0:
+            flow_pct_sug = quote.main_net_inflow / quote.amount * 100
+            if flow_pct_sug <= -15:
+                escape_score += 3
+                escape_reasons.append(f"主力大幅流出({flow_pct_sug:.0f}%)")
+            elif flow_pct_sug <= -8:
+                escape_score += 1
+                escape_reasons.append(f"主力流出({flow_pct_sug:.0f}%)")
+            if ff_sug.is_distribution:
+                escape_score += 2
+                escape_reasons.append("机构出货(散户接盘)")
+            elif ff_sug.is_retail_driven:
+                escape_score += 1
+                escape_reasons.append("散户主导(主力缺位)")
+
         # RSI 超买：RSI >= 70 算超买
         if rsi is not None and rsi >= 70:
             escape_score += 2
@@ -2305,6 +2462,22 @@ def _compute_trading_suggestions(
         dip_score = 0
         dip_reasons: list[str] = []
 
+        # 主力资金因子（抄底侧）
+        if ff_sug and ff_sug.is_valid and quote.main_net_inflow and quote.amount and quote.amount > 0:
+            flow_pct_sug2 = quote.main_net_inflow / quote.amount * 100
+            if flow_pct_sug2 >= 12:
+                dip_score += 3
+                dip_reasons.append(f"主力大幅流入({flow_pct_sug2:.0f}%)")
+            elif flow_pct_sug2 >= 6:
+                dip_score += 1
+                dip_reasons.append(f"主力流入({flow_pct_sug2:.0f}%)")
+            if ff_sug.is_institution_absorbing:
+                dip_score += 3
+                dip_reasons.append("机构深度吸筹(中小资金出逃)")
+            elif ff_sug.is_institution_driven:
+                dip_score += 2
+                dip_reasons.append("机构吸筹(散户卖出)")
+
         # RSI 超卖
         if rsi is not None and rsi <= 30:
             dip_score += 2
@@ -2360,17 +2533,22 @@ def _compute_trading_suggestions(
         # ---- 4. 综合建议标签 ----
         suggestion = "观望"
         priority = 0
-        if dip_score >= 4 and escape_score <= 1:
-            suggestion = "🟢 逢低吸纳"
+        # 窄幅震荡时降级建议（回测：此状态胜率45.6%，均值-0.32%）
+        regime_penalty = ""
+        if tech.get("market_regime") == "窄幅震荡":
+            regime_penalty = "(窄幅震荡，信号可靠性降低)"
+
+        if dip_score >= 5 and escape_score <= 1:
+            suggestion = f"🟢 逢低吸纳{regime_penalty}"
             priority = dip_score
         elif dip_score >= 3:
-            suggestion = "🟡 关注抄底"
+            suggestion = f"🟡 关注抄底{regime_penalty}"
             priority = dip_score
-        elif escape_score >= 3 and dip_score <= 1:
-            suggestion = "🔴 考虑减仓"
+        elif escape_score >= 5 and dip_score <= 1:
+            suggestion = f"🚨 逃顶预警{regime_penalty}"
             priority = escape_score
-        elif escape_score >= 4:
-            suggestion = "🚨 逃顶预警"
+        elif escape_score >= 3:
+            suggestion = f"🔴 考虑减仓{regime_penalty}"
             priority = escape_score
         elif escape_score >= 2 and dip_score >= 2:
             suggestion = "⚪ 多空博弈"
@@ -2427,8 +2605,7 @@ def _compute_trading_suggestions(
             take_profit = round(price * 1.05, 3)
             take_profit_reason = "无有效压力，按现价+5%硬止盈"
 
-        # ---- 5.5 仓位比例计算（ATR波动率仓位法） ----
-        # 必须在止损价计算完成后执行
+        # ---- 5.5 仓位比例计算（ATR波动率 + Kelly公式） ----
         position_pct = 0.0
         position_reason = ""
         if "吸纳" in suggestion or "抄底" in suggestion:
@@ -2449,6 +2626,24 @@ def _compute_trading_suggestions(
                 position_pct = round(position_pct * 0.5, 1)
                 suggestion = f"🟡 关注抄底(试探仓位{position_pct:.0f}%)"
             else:
+                # Kelly公式交叉验证
+                kelly_pct = 0.0
+                score_val = tech.get("composite_score", 0)
+                if score_val >= 75:
+                    prob = 0.56
+                elif score_val >= 60:
+                    prob = 0.52
+                else:
+                    prob = 0.50
+                if take_profit > price and stop_loss > 0 and price > stop_loss:
+                    b_ratio = (take_profit - price) / (price - stop_loss)
+                    if b_ratio > 0:
+                        kelly_raw = (prob * b_ratio - (1 - prob)) / b_ratio
+                        kelly_pct = round(max(0, kelly_raw) * 100, 1)
+                # 取 ATR 和 Kelly 中较保守的值
+                if kelly_pct > 0 and kelly_pct < position_pct:
+                    position_pct = kelly_pct
+                    position_reason += f" (Kelly校准→{kelly_pct:.1f}%)"
                 suggestion = f"🟢 逢低吸纳(建议仓位{position_pct:.0f}%)"
 
         results.append({
@@ -2579,7 +2774,21 @@ def generate_evening_review(config: Config) -> Path | None:
         data_lines.append(f"\n## 三、📈 大盘及行业板块")
         data_lines.append(sector_md)
 
-    data_lines.append(f"\n## 五、市场背景")
+    # 市场背景（全市场广度数据）
+    from app.data_fetcher import fetch_market_breadth
+    breadth = fetch_market_breadth()
+    if breadth and breadth.is_valid:
+        data_lines.append(f"\n## 四、全市场背景")
+        data_lines.append(f"- 涨跌: {breadth.up_count}涨/{breadth.down_count}跌/{breadth.flat_count}平 ({breadth.breadth_label})")
+        data_lines.append(f"- 涨停{breadth.limit_up}只/跌停{breadth.limit_down}只 ({breadth.limit_emotion})")
+        if breadth.total_amount > 0:
+            data_lines.append(f"- 成交额: {breadth.total_amount:.0f}亿 (估算全天{breadth.estimated_full_day_amount:.0f}亿)")
+        if breadth.main_net_inflow != 0:
+            direction = "净流入" if breadth.main_net_inflow > 0 else "净流出"
+            data_lines.append(f"- 全市场主力: {direction}{abs(breadth.main_net_inflow):.1f}亿")
+    else:
+        data_lines.append(f"\n## 四、市场背景")
+        data_lines.append("- 全市场广度数据暂不可用")
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     vol_llm = ""  # 量能分析 LLM 紧凑文本（在 h_results 块中填充）
