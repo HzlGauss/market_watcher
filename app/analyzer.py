@@ -239,31 +239,131 @@ def adjust_thresholds(
 # ============================================================
 
 def calc_sector_deviations(quotes: list[Quote]) -> dict[str, dict]:
-    """按板块类型计算偏离度，用于识别板块内领涨/领跌"""
+    """按板块类型/行业计算偏离度，用于识别板块内领涨/领跌
+
+    优先使用 industry 字段（真实行业分类），
+    回退到 type 字段（ETF 类型标签）。
+    """
     sectors: dict[str, list[float]] = {}
     for q in quotes:
-        if q.type not in sectors:
-            sectors[q.type] = []
+        key = q.industry or q.type
+        if not key:
+            continue
+        if key not in sectors:
+            sectors[key] = []
         if q.change_pct is not None:
-            sectors[q.type].append(q.change_pct)
+            sectors[key].append(q.change_pct)
 
     means = {st: sum(v) / len(v) for st, v in sectors.items() if v}
 
     deviations = {}
     for q in quotes:
-        if q.type in means and q.change_pct is not None:
-            dev = round(q.change_pct - means[q.type], 2)
+        key = q.industry or q.type
+        if key in means and q.change_pct is not None:
+            dev = round(q.change_pct - means[key], 2)
             deviations[q.code] = {
-                "sector": q.type,
-                "sector_mean": round(means[q.type], 2),
+                "sector": key,
+                "sector_mean": round(means[key], 2),
                 "deviation": dev,
             }
     return deviations
 
 
-# ============================================================
-# 异动分析（主入口）
-# ============================================================
+def analyze_sector_context(
+    quotes: list[Quote],
+    sector_boards: Optional[list] = None,
+) -> dict:
+    """综合分析标的与所属行业板块的关系
+
+    Args:
+        quotes: 已填充 industry 字段的行情列表
+        sector_boards: 行业板块数据列表（SectorBoard），可选
+
+    Returns:
+        {
+            "sector_ranks": {板块名: 排名信息},
+            "portfolio_sectors": {板块名: [标的列表]},
+            "per_stock": {code: {sector, sector_chg, relative_strength, label}},
+            "top_sectors": [(板块名, 涨跌幅), ...],
+            "bottom_sectors": [(板块名, 涨跌幅), ...],
+        }
+    """
+    result: dict = {
+        "sector_ranks": {},
+        "portfolio_sectors": {},
+        "per_stock": {},
+        "top_sectors": [],
+        "bottom_sectors": [],
+    }
+
+    # 1. 建立板块涨跌映射
+    sector_chg_map: dict[str, float] = {}
+    if sector_boards:
+        for i, sb in enumerate(sector_boards):
+            if sb.name and sb.change_pct is not None:
+                sector_chg_map[sb.name] = sb.change_pct
+                result["sector_ranks"][sb.name] = {
+                    "rank": i + 1,
+                    "total": len(sector_boards),
+                    "change_pct": sb.change_pct,
+                    "leader": sb.leader_stock,
+                    "main_net": sb.main_net_inflow,
+                }
+
+    # 2. Top/Bottom 板块
+    if sector_boards:
+        sorted_boards = sorted(
+            [sb for sb in sector_boards if sb.change_pct is not None],
+            key=lambda sb: sb.change_pct, reverse=True,
+        )
+        result["top_sectors"] = [(sb.name, sb.change_pct) for sb in sorted_boards[:5]]
+        result["bottom_sectors"] = [(sb.name, sb.change_pct) for sb in sorted_boards[-5:]]
+
+    # 3. 按行业分组持仓
+    industry_groups: dict[str, list[Quote]] = {}
+    for q in quotes:
+        ind = q.industry or q.type or "其他"
+        if ind not in industry_groups:
+            industry_groups[ind] = []
+        industry_groups[ind].append(q)
+
+    for ind, group in industry_groups.items():
+        result["portfolio_sectors"][ind] = [
+            {"name": q.name, "code": q.code, "chg": q.change_pct}
+            for q in group
+        ]
+
+    # 4. 每只标的 vs 板块对比
+    for q in quotes:
+        ind = q.industry or q.type or ""
+        if not ind or q.change_pct is None:
+            continue
+        sector_chg = sector_chg_map.get(ind)
+        info: dict = {
+            "sector": ind,
+            "sector_chg": sector_chg,
+            "relative_strength": None,
+            "label": "",
+        }
+        if sector_chg is not None:
+            rs = round(q.change_pct - sector_chg, 2)
+            info["relative_strength"] = rs
+            if rs > 1.0:
+                info["label"] = f"领先板块{rs:+.1f}%"
+            elif rs < -1.0:
+                info["label"] = f"落后板块{rs:+.1f}%"
+            else:
+                info["label"] = "与板块同步"
+        else:
+            info["label"] = f"板块{ind}(无板块指数)"
+
+        if ind in result["sector_ranks"]:
+            info["sector_rank"] = result["sector_ranks"][ind]["rank"]
+            info["sector_total"] = result["sector_ranks"][ind]["total"]
+
+        result["per_stock"][q.code] = info
+
+    return result
 
 def analyze(
     quotes: list[Quote],
@@ -330,12 +430,39 @@ def analyze(
             elif cp < 0:
                 down_count += 1
 
-        # ---- 量价关系（使用 turnover_rate 估算量比）----
-        # 注意：不能直接用当前成交量除以上一次扫描的成交量，
-        # 因为成交量是当日累计值，会随时间不断增加。
-        # 正确的量比应该用：当前成交量 / 过去 N 日平均成交量
-        # 这个分析已经在技术指标中通过 analyze_volume_price() 完成
-        # 这里只保留 turnover_rate（换手率）作为辅助判断
+        # ---- 成交量分析（量比 + 量价配合） ----
+        vr = q.volume_ratio
+        if vr is not None and cp is not None:
+            # 量比告警
+            if vr >= 2.5:
+                if cp > 0:
+                    items.append(f"📈 大幅放量上涨(量比{vr:.1f}) — 资金积极入场")
+                elif cp < -1:
+                    items.append(f"📉 大幅放量下跌(量比{vr:.1f}) — 恐慌抛售⚠️")
+                else:
+                    items.append(f"📊 大幅放量(量比{vr:.1f}) — 多空分歧加大")
+                alert_count += 1
+            elif vr >= 1.8:
+                if cp > 1:
+                    items.append(f"📈 放量上涨(量比{vr:.1f}) — 量价配合")
+                elif cp < -1:
+                    items.append(f"📉 放量下跌(量比{vr:.1f}) — 资金出逃")
+                else:
+                    items.append(f"📊 放量(量比{vr:.1f})")
+            elif vr <= 0.4:
+                if cp > 0:
+                    items.append(f"📈 缩量上涨(量比{vr:.1f}) — 买盘不强")
+                elif cp < 0:
+                    items.append(f"📉 缩量下跌(量比{vr:.1f}) — 抛压减弱")
+                else:
+                    items.append(f"📊 地量(量比{vr:.1f}) — 交投清淡")
+            elif vr <= 0.6:
+                if cp > 0:
+                    items.append(f"📈 偏缩量上涨(量比{vr:.1f})")
+                elif cp < 0:
+                    items.append(f"📉 偏缩量下跌(量比{vr:.1f})")
+
+        # 换手率告警
         if q.turnover_rate is not None and q.turnover_rate > 5:
             items.append(f"🔥 高换手 {q.turnover_rate:.2f}%")
 
@@ -358,12 +485,283 @@ def analyze(
         if amp is not None and amp >= amp_warn:
             items.append(f"💫 振幅 {amp:.2f}%")
 
+        # ---- 主力资金异动（增强版：自适应阈值 + 趋势 + 强度分析） ----
+        inflow = q.main_net_inflow
+        amount = q.amount
+        ff = q.fund_flow  # 资金流向明细
+        if inflow is not None and amount and amount > 0:
+            inflow_pct = inflow / amount * 100  # 主力净流入占成交额百分比
+
+            # 自适应阈值：ETF 和指数流动性好，阈值降低；个股阈值较高
+            qtype = q.type or ""
+            is_etf = "ETF" in qtype
+            is_index = "指数" in qtype
+            if is_index:
+                buy_threshold, sell_threshold, diverge_threshold = 8, 5, 3
+            elif is_etf:
+                buy_threshold, sell_threshold, diverge_threshold = 10, 7, 4
+            else:
+                buy_threshold, sell_threshold, diverge_threshold = 15, 10, 5
+
+            # 获取历史流强（从 prev_state 读取上轮数据做趋势对比）
+            prev_flow = prev_state.get(q.code, {}).get("main_net_inflow") if isinstance(prev_state.get(q.code, {}), dict) else None
+            prev_flow_pct = prev_state.get(q.code, {}).get("flow_pct") if isinstance(prev_state.get(q.code, {}), dict) else None
+            flow_trend = ""  # 趋势标注
+            flow_intensity = ""  # 强度标注
+            if prev_flow_pct is not None and prev_flow is not None:
+                # 趋势：连续同向且幅度加大 → 加速；幅度减小 → 衰减
+                if inflow > 0 and prev_flow > 0:
+                    if inflow_pct > prev_flow_pct * 1.3:
+                        flow_trend = "↑加速流入"
+                    elif inflow_pct < prev_flow_pct * 0.7:
+                        flow_trend = "↘流入放缓"
+                    else:
+                        flow_trend = "→持续流入"
+                elif inflow < 0 and prev_flow < 0:
+                    if abs(inflow_pct) > abs(prev_flow_pct) * 1.3:
+                        flow_trend = "↓加速流出"
+                    elif abs(inflow_pct) < abs(prev_flow_pct) * 0.7:
+                        flow_trend = "↗流出放缓"
+                    else:
+                        flow_trend = "→持续流出"
+                elif inflow > 0 and prev_flow < 0:
+                    flow_trend = "🔄由出转入"
+                elif inflow < 0 and prev_flow > 0:
+                    flow_trend = "🔄由入转出"
+                # 强度：相对历史均值的偏离
+                if prev_flow_pct != 0:
+                    intensity_ratio = abs(inflow_pct) / max(abs(prev_flow_pct), 0.1)
+                    if intensity_ratio >= 2.0:
+                        flow_intensity = "[异常高强度]"
+                    elif intensity_ratio >= 1.5:
+                        flow_intensity = "[偏强]"
+
+            # 主力大幅买入
+            if inflow > 0 and inflow_pct >= buy_threshold:
+                context = f"(涨{cp:+.1f}%)" if cp and cp > 0 else (f"(跌{cp:+.1f}%)" if cp and cp < 0 else "(平盘)")
+                trend_str = f" {flow_trend}" if flow_trend else ""
+                intense_str = f" {flow_intensity}" if flow_intensity else ""
+                if ff:
+                    struct = ff.flow_structure
+                    if ff.is_institution_absorbing:
+                        items.append(f"🔵🔥 机构深度吸筹{context}{trend_str}{intense_str}(超大单+{ff.super_large_net/1e8:.2f}亿,中单{ff.medium_net/1e8:+.2f}亿,散户{ff.small_net/1e8:+.2f}亿)")
+                    elif ff.is_institution_driven:
+                        items.append(f"🔵 机构吸筹{context}{trend_str}{intense_str}(超大单+{ff.super_large_net/1e8:.2f}亿,散户{ff.small_net/1e8:+.2f}亿)")
+                    elif ff.is_mid_capital_active:
+                        items.append(f"🔵 游资活跃{context}{trend_str}(中单{ff.medium_net/1e8:+.2f}亿,主力{ff.main_net/1e8:+.2f}亿)")
+                    else:
+                        items.append(f"🔵 主力买入{context}{trend_str}(净{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%)")
+                else:
+                    items.append(f"🔵 主力买入{context}{trend_str}(净{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%)")
+                alert_count += 1
+            # 主力大幅卖出
+            elif inflow < 0 and abs(inflow_pct) >= sell_threshold:
+                context = f"(跌{cp:+.1f}%)" if cp and cp < -1 else (f"(涨{cp:+.1f}%)" if cp and cp > 1 else "(平盘)")
+                trend_str = f" {flow_trend}" if flow_trend else ""
+                intense_str = f" {flow_intensity}" if flow_intensity else ""
+                if ff:
+                    if ff.is_distribution:
+                        items.append(f"🔴 机构出货{context}{trend_str}{intense_str}(超大单{ff.super_large_net/1e8:+.2f}亿,散户接盘+{ff.small_net/1e8:.2f}亿)")
+                    elif ff.is_retail_driven:
+                        items.append(f"🔴 主力出逃{context}{trend_str}(主力{ff.main_net/1e8:+.2f}亿,散户接盘+{ff.small_net/1e8:.2f}亿)")
+                    else:
+                        items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
+                else:
+                    items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
+                alert_count += 1
+
+            # 量价背离
+            if cp is not None and cp > 2 and inflow < 0:
+                if ff and ff.super_large_net is not None and ff.super_large_net < 0:
+                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但超大单净流出{abs(ff.super_large_net)/1e8:.2f}亿)")
+                else:
+                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
+                alert_count += 1
+            elif cp is not None and cp < -2 and inflow > 0 and inflow_pct >= diverge_threshold:
+                if ff and ff.is_institution_driven:
+                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但超大单流入+{ff.super_large_net/1e8:.2f}亿)")
+                else:
+                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
+                alert_count += 1
+
+            # 散户主导上涨（追高风险）
+            if ff and ff.is_retail_driven and cp is not None and cp > 3:
+                items.append(f"🟡 散户推涨(小单+{ff.small_net/1e8:.2f}亿,主力{ff.main_net/1e8:+.2f}亿) — 注意追高风险")
+                alert_count += 1
+
+            # 主力减仓散户接盘（下跌中继）
+            if ff and ff.is_distribution and cp is not None and cp < 0:
+                items.append(f"🟠 散户接盘(超大单{ff.super_large_net/1e8:+.2f}亿,散户+{ff.small_net/1e8:.2f}亿)")
+
+        # ---- 拥挤度预警（多指标同时极端 = 反转概率高） ----
+        crowd_signals = 0
+        if cp is not None:
+            if cp > 3:
+                crowd_signals += 1  # 大涨
+            elif cp < -3:
+                crowd_signals += 1  # 大跌
+        if q.volume_ratio and q.volume_ratio >= 2.5:
+            crowd_signals += 1  # 大幅放量
+        if inflow is not None and amount and amount > 0:
+            extreme_flow = abs(inflow) / amount * 100
+            if extreme_flow >= 25:
+                crowd_signals += 2  # 资金极端（权重加倍）
+        if q.turnover_rate and q.turnover_rate >= 10:
+            crowd_signals += 1  # 超高换手
+        if q.avg_price and q.price and q.avg_price > 0:
+            if abs(q.price - q.avg_price) / q.avg_price * 100 > 4:
+                crowd_signals += 1  # 均价偏离大
+        if crowd_signals >= 4:
+            direction = "追涨" if (cp and cp > 0) else "杀跌"
+            items.append(f"🚨 拥挤度极高({crowd_signals}重信号共振) — 注意{direction}风险")
+            alert_count += 1
+        elif crowd_signals >= 3:
+            items.append(f"⚠️ 拥挤度高({crowd_signals}重信号) — 短线反转概率上升")
+
+        # ---- 分时均价（黄线）信号 ----
+        if q.avg_price and q.price and q.avg_price > 0:
+            vwap_dev = (q.price - q.avg_price) / q.avg_price * 100
+            if vwap_dev > 2.0:
+                items.append(f"📊 强势运行(高于均价{vwap_dev:.1f}%，获利盘多)")
+                alert_count += 1
+            elif vwap_dev < -2.0:
+                items.append(f"📉 弱势运行(低于均价{abs(vwap_dev):.1f}%，套牢盘压力)")
+                alert_count += 1
+            elif vwap_dev > 1.0:
+                items.append(f"📊 偏强(高于均价{vwap_dev:.1f}%)")
+            elif vwap_dev < -1.0:
+                items.append(f"📉 偏弱(低于均价{abs(vwap_dev):.1f}%)")
+
+        # ---- 顶底综合检测 ----
+        if tech_summaries and q.code in tech_summaries:
+            tech = tech_summaries[q.code]
+
+            # 1. 均线乖离（MA60 极端偏离 = 中期顶底）
+            if tech.ma60 and q.price and tech.ma60 > 0:
+                ma60_dev = (q.price - tech.ma60) / tech.ma60 * 100
+                if ma60_dev > 30:
+                    items.append(f"📈 均线乖离+{ma60_dev:.0f}%(距MA60极远，中期顶部风险)")
+                    alert_count += 1
+                elif ma60_dev < -25:
+                    items.append(f"📉 均线乖离{ma60_dev:.0f}%(距MA60极远，中期底部区间)")
+                    alert_count += 1
+
+            # 2. 布林带挤压（BB 带宽收窄 = 变盘前兆）
+            if tech.bb_width is not None and tech.bb_width < 5.0:
+                if tech.bb_signal in ("触及上轨",):
+                    items.append(f"⚠️ BB窄幅+触及上轨(带宽{tech.bb_width:.1f}%) — 变盘向下风险")
+                elif tech.bb_signal in ("触及下轨",):
+                    items.append(f"💡 BB窄幅+触及下轨(带宽{tech.bb_width:.1f}%) — 变盘向上机会")
+                else:
+                    items.append(f"⏳ BB挤压(带宽{tech.bb_width:.1f}%) — 即将变盘")
+
+            # 3. 价量背离（与 K 线历史对比）
+            if cp is not None and q.volume_ratio is not None:
+                # 顶部价量背离：价格上涨(>2%)但缩量(量比<0.6)
+                if cp > 2 and q.volume_ratio < 0.6:
+                    items.append(f"⚠️ 价量顶背离(涨{cp:+.1f}%但缩量{q.volume_ratio:.1f}x) — 上涨乏力")
+                    alert_count += 1
+                # 底部价量背离：价格下跌(<-2%)但缩量(量比<0.5)
+                elif cp < -2 and q.volume_ratio < 0.5:
+                    items.append(f"💡 价量底背离(跌{cp:.1f}%但缩量{q.volume_ratio:.1f}x) — 抛压衰竭")
+                    alert_count += 1
+
+            # 4. 成交量极值
+            if q.volume_ratio is not None:
+                if q.volume_ratio >= 4.0:
+                    items.append(f"📊 天量(量比{q.volume_ratio:.1f}) — 注意顶部或趋势加速")
+                    alert_count += 1
+                elif q.volume_ratio <= 0.25:
+                    items.append(f"📊 地量(量比{q.volume_ratio:.1f}) — 底部区域或变盘前兆")
+
+        # ---- 均线位置分析 ----
+        if tech_summaries and q.code in tech_summaries:
+            tech = tech_summaries[q.code]
+            ma_items: list[str] = []
+            if q.price:
+                for ma_name, ma_val, threshold in [
+                    ("MA5", tech.ma5, 1.0), ("MA10", tech.ma10, 1.5),
+                    ("MA20", tech.ma20, 2.0), ("MA60", tech.ma60, 2.5),
+                ]:
+                    if ma_val is None or ma_val <= 0:
+                        continue
+                    dev = (q.price - ma_val) / ma_val * 100
+                    if dev > threshold:
+                        ma_items.append(f"{ma_name}↑{dev:.1f}%")
+                    elif dev < -threshold:
+                        ma_items.append(f"{ma_name}↓{abs(dev):.1f}%")
+                # 均线排列状态
+                if tech.ma_alignment and tech.ma_alignment != "数据不足":
+                    align_labels = {
+                        "多头排列": "🟢 均线多头排列",
+                        "空头排列": "🔴 均线空头排列",
+                        "多头回调": "🟡 多头回调(回踩均线)",
+                        "空头反弹": "🟡 空头反弹(反压均线)",
+                    }
+                    label = align_labels.get(tech.ma_alignment, "")
+                    if label:
+                        ma_items.append(label)
+            if ma_items:
+                items.append(" | ".join(ma_items))
+
         # ---- 技术指标信号 ----
         if tech_summaries and q.code in tech_summaries:
             tech = tech_summaries[q.code]
-            if tech.signals:
-                for sig in tech.signals:
-                    items.append(f"📐 {sig}")
+            # 跳空信号单独处理（醒目 + 计为异动）
+            if tech.has_gap:
+                gap_emoji = "⬆️" if tech.gap_type == "向上跳空" else "⬇️"
+                if abs(tech.gap_pct) >= 2:
+                    items.append(f"{gap_emoji} 大幅跳空({tech.gap_detail})")
+                    alert_count += 1
+                elif tech.gap_filled_pct >= 80 and tech.gap_filled_pct < 100:
+                    items.append(f"{gap_emoji} 跳空近回补({tech.gap_detail})")
+                elif not tech.signals or all("跳空" not in s for s in tech.signals):
+                    items.append(f"{gap_emoji} {tech.gap_detail}")
+            # 突破信号单独处理
+            if tech.breakout_type:
+                items.append(f"🎯 {tech.breakout_detail}")
+                alert_count += 1
+            # 关键位动态行为信号
+            if tech.has_resistance_rejection:
+                items.append(f"🔴 {tech.resistance_rejection_detail}")
+                alert_count += 1
+            if tech.has_support_confirmation:
+                items.append(f"🟢 {tech.support_confirmation_detail}")
+                alert_count += 1
+            if tech.has_support_breakdown:
+                items.append(f"🚨 {tech.support_breakdown_detail}")
+                alert_count += 1
+            if tech.has_breakout_retest:
+                items.append(f"✅ {tech.breakout_retest_detail}")
+                alert_count += 1
+            # 其他指标信号
+            KEY_LEVEL_FILTERS = ("跳空", "突破", "跌破", "受压回落", "支撑确认", "突破回踩确认", "支撑", "压力")
+            for sig in tech.signals:
+                # 跳过已在上面处理过的跳空/突破/关键位信号
+                if any(kw in sig for kw in KEY_LEVEL_FILTERS):
+                    continue
+                items.append(f"📐 {sig}")
+
+        # 多信号共振评分 + 市场状态（非指数标的）
+        if q.type != "指数" and tech_summaries and q.code in tech_summaries:
+            from app.technical import calc_composite_score, detect_market_regime
+            tech = tech_summaries[q.code]
+            flow_pct_val = None
+            if q.main_net_inflow and q.amount and q.amount > 0:
+                flow_pct_val = q.main_net_inflow / q.amount * 100
+            score_info = calc_composite_score(tech, q.price or 0, flow_pct=flow_pct_val)
+            regime = detect_market_regime(tech, q.price or 0, tech.atr)
+            final_score = score_info["score"]
+            score_info["label"] = ("🟢 强烈看多" if final_score >= 75 else
+                                  "🟢 偏多" if final_score >= 60 else
+                                  "⚪ 中性" if final_score >= 45 else
+                                  "🟡 偏空" if final_score >= 35 else "🔴 强烈看空")
+            score_info["regime"] = regime.regime
+            score_info["regime_suggestion"] = regime.suggestion
+            score_info["bb_squeeze"] = regime.bb_squeeze
+            items.insert(0, f"📊 {score_info['label']}(评分{final_score}) [{regime.regime}] — {regime.suggestion}")
+        elif q.type != "指数":
+            items.insert(0, "📊 数据不足，无法评分")
 
         if items:
             alerts.append(Alert(code=q.code, name=q.name, messages=items))

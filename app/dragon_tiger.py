@@ -98,60 +98,7 @@ def _parse_float(val) -> Optional[float]:
         return None
 
 
-def _get_stock_industry_map(codes: list[str]) -> dict[str, str]:
-    """批量获取个股所属行业（带日级缓存）
-
-    首次调用时拉取全市场行业映射并缓存到 state/industry_cache.json，
-    同日后续调用直接读缓存，避免重复拉取 5000+ 条全市场数据。
-
-    Args:
-        codes: 股票代码列表
-
-    Returns:
-        {code: industry} 映射字典
-    """
-    import json
-    from pathlib import Path
-
-    today = datetime.now().strftime("%Y%m%d")
-    cache_dir = Path(__file__).resolve().parent.parent / "state"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / "industry_cache.json"
-
-    # 1. 尝试读缓存
-    full_map: dict[str, str] = {}
-    if cache_path.exists():
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if cached.get("_date") == today:
-                full_map = {k: v for k, v in cached.items() if not k.startswith("_")}
-                log.debug(f"行业分类从缓存加载: {len(full_map)} 只个股")
-        except Exception:
-            pass
-
-    # 2. 缓存未命中，拉取并写入
-    if not full_map:
-        try:
-            import akshare as ak
-            df = ak.stock_zh_a_spot_em()
-            for _, row in df.iterrows():
-                code = str(row.get("代码", ""))
-                industry = str(row.get("行业", ""))
-                if code and industry:
-                    full_map[code] = industry
-            # 写入缓存
-            cache_data = {"_date": today, **full_map}
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, ensure_ascii=False)
-            log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
-        except Exception as e:
-            log.debug(f"行业分类获取失败: {e}")
-            return {}
-
-    # 3. 从缓存/全量中筛选需要的 code
-    code_map = {code: full_map[code] for code in codes if code in full_map}
-    return code_map
+from app.data_fetcher import fetch_stock_industry_map as _get_stock_industry_map
 
 
 # ============================================================

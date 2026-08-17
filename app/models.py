@@ -29,6 +29,7 @@ class WatchItem:
     code: str = ""
     market: Literal["SH", "SZ", "HK"] = "SH"
     type: str = "宽基 ETF"
+    industry: str = ""  # 所属行业板块
 
 
 @dataclass
@@ -48,6 +49,104 @@ class Holding:
     market: Literal["SH", "SZ", "HK"] = "SH"
     amount: int = 0
     cost: float = 0.0
+    industry: str = ""  # 所属行业板块
+
+
+@dataclass
+class FundFlowDetail:
+    """
+    个股资金流向明细（东方财富逐笔分类）
+
+    主力 = 超大单 + 大单，散户 ≈ 小单。
+
+    Attributes:
+        main_net: 主力净流入（元）= super_large_net + large_net
+        main_pct: 主力净流入占成交额比例 (%)
+        super_large_net: 超大单净流入（元），通常代表机构/国家队
+        super_large_pct: 超大单净占比 (%)
+        large_net: 大单净流入（元），通常代表游资/私募
+        large_pct: 大单净占比 (%)
+        medium_net: 中单净流入（元），游资/中型资金
+        medium_pct: 中单净占比 (%)
+        small_net: 小单净流入（元），散户行为
+        small_pct: 小单净占比 (%)
+    """
+    main_net: Optional[float] = None
+    main_pct: Optional[float] = None
+    super_large_net: Optional[float] = None
+    super_large_pct: Optional[float] = None
+    large_net: Optional[float] = None
+    large_pct: Optional[float] = None
+    medium_net: Optional[float] = None
+    medium_pct: Optional[float] = None
+    small_net: Optional[float] = None
+    small_pct: Optional[float] = None
+
+    @property
+    def is_valid(self) -> bool:
+        """数据是否有效（至少有主力净流入数据）"""
+        return self.main_net is not None
+
+    @property
+    def is_institution_driven(self) -> bool:
+        """是否机构主导（超大单净买 + 散户净卖）"""
+        if self.super_large_net is None or self.small_net is None:
+            return False
+        return self.super_large_net > 0 and self.small_net < 0
+
+    @property
+    def is_retail_driven(self) -> bool:
+        """是否散户主导（小单净买为主，主力净卖或中性）"""
+        if self.small_net is None or self.main_net is None:
+            return False
+        return self.small_net > 0 and self.main_net <= 0
+
+    @property
+    def is_distribution(self) -> bool:
+        """是否主力出货散户接盘（跌或平盘时超大单出+散户接）"""
+        if self.super_large_net is None or self.small_net is None:
+            return False
+        return self.super_large_net < 0 and self.small_net > 0
+
+    @property
+    def is_mid_capital_active(self) -> bool:
+        """中单活跃（游资/私募/大户主导，中单净流入占比 > 50%）"""
+        if self.medium_net is None or self.main_net is None:
+            return False
+        total = abs(self.medium_net) + abs(self.main_net)
+        if total == 0:
+            return False
+        return abs(self.medium_net) / total > 0.5
+
+    @property
+    def is_institution_absorbing(self) -> bool:
+        """机构吸筹深化（超大单净流入，且中单+小单都净流出）"""
+        if self.super_large_net is None or self.medium_net is None or self.small_net is None:
+            return False
+        return (self.super_large_net > 0
+                and self.medium_net < 0
+                and self.small_net < 0)
+
+    @property
+    def flow_structure(self) -> str:
+        """资金结构标签"""
+        if not self.is_valid:
+            return "无数据"
+        if self.is_institution_absorbing:
+            return "机构主导(中小资金出逃)"
+        if self.is_institution_driven:
+            return "机构主导"
+        if self.is_distribution:
+            return "机构出货"
+        if self.is_mid_capital_active:
+            return "游资活跃"
+        if self.is_retail_driven:
+            return "散户主导"
+        if self.main_net and self.main_net > 0:
+            return "主力偏多"
+        if self.main_net and self.main_net < 0:
+            return "主力偏空"
+        return "均衡"
 
 
 @dataclass
@@ -74,7 +173,8 @@ class Quote:
         market_cap: 总市值（元）
         turnover_rate: 换手率 (%)
         volume_ratio: 量比
-        main_net_inflow: 主力净流入（元）
+        main_net_inflow: 主力净流入（元），向后兼容，优先使用 fund_flow
+        fund_flow: 资金流向明细（超大/大/中/小单）
         upper_limit: 涨停价
         lower_limit: 跌停价
     """
@@ -91,17 +191,20 @@ class Quote:
     volume: Optional[float] = None
     amount: Optional[float] = None
     amplitude: Optional[float] = None
+    avg_price: Optional[float] = None  # 分时均价 = 成交额/成交量（日内VWAP）
     pe_ratio: Optional[float] = None
     pb_ratio: Optional[float] = None
     market_cap: Optional[float] = None
     turnover_rate: Optional[float] = None
     volume_ratio: Optional[float] = None
     main_net_inflow: Optional[float] = None
+    fund_flow: Optional[FundFlowDetail] = None
     bid_volume: Optional[float] = None  # 外盘（主动买入）
     ask_volume: Optional[float] = None  # 内盘（主动卖出）
     bid_ask_ratio: Optional[float] = None  # 委比
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
+    industry: str = ""  # 所属行业板块（从东方财富行业分类获取）
 
 
 @dataclass
@@ -219,6 +322,64 @@ class NorthFlowData:
 
 
 @dataclass
+class MarginData:
+    """两融数据（融资融券余额，替代已停止披露的北向资金）
+
+    Attributes:
+        financing_balance: 融资余额（亿元）
+        financing_net_buy: 融资净买入（亿元，当日）
+        securities_lending_balance: 融券余额（亿元）
+        total_balance: 两融总余额（亿元）
+        date: 数据日期
+    """
+    financing_balance: float = 0.0
+    financing_net_buy: float = 0.0
+    securities_lending_balance: float = 0.0
+    total_balance: float = 0.0
+    date: str = ""
+
+    @property
+    def financing_change_direction(self) -> str:
+        """融资净买入方向"""
+        if self.financing_net_buy > 0:
+            return "融资加仓"
+        elif self.financing_net_buy < 0:
+            return "融资减仓"
+        return "持平"
+
+
+@dataclass
+class SectorBoard:
+    """行业板块实时数据
+
+    Attributes:
+        code: 板块代码（如 BK0477）
+        name: 板块名称（如 "半导体"）
+        change_pct: 板块涨跌幅 (%)
+        amount: 成交额（元）
+        leader_stock: 领涨股名称
+        leader_change_pct: 领涨股涨跌幅
+        main_net_inflow: 板块主力净流入（元）
+        stock_count: 板块成分股数量
+    """
+    code: str = ""
+    name: str = ""
+    change_pct: Optional[float] = None
+    amount: Optional[float] = None
+    leader_stock: str = ""
+    leader_change_pct: Optional[float] = None
+    main_net_inflow: Optional[float] = None
+    stock_count: int = 0
+
+    @property
+    def change_direction(self) -> str:
+        """涨跌方向"""
+        if self.change_pct is None:
+            return "平"
+        return "涨" if self.change_pct > 0 else ("跌" if self.change_pct < 0 else "平")
+
+
+@dataclass
 class MarketBreadth:
     """全市场广度数据
 
@@ -325,7 +486,7 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
     盘中累计值是当日的，直接给 LLM 会导致每轮都判断"量能不足"。
     按已流逝交易时间比例外推到全天，收盘后直接返回实际值。
 
-    A股交易时段: 9:30-11:30 (120min) + 13:00-15:00 (120min) = 240min
+    A股交易时段: 9:30-11:30 (120min) + 13:00-15:00 (120min) + 盘后15:00-15:30 (30min) = 270min
     """
     if cumulative_amount <= 0:
         return 0.0
@@ -334,8 +495,8 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
         from datetime import datetime
         now = datetime.now()
 
-    # 收盘后 → 实际值
-    if now.hour >= 15:
+    # 收盘后（15:30 盘后结束）→ 实际值
+    if now.hour >= 16 or (now.hour == 15 and now.minute >= 30):
         return cumulative_amount
 
     # 计算已流逝的交易分钟数
@@ -344,7 +505,7 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
         return cumulative_amount  # 开盘前不推算
 
     # 线性外推
-    ratio = 240 / elapsed
+    ratio = 270 / elapsed
     estimated = round(cumulative_amount * ratio, 1)
     return max(estimated, cumulative_amount)  # 不低于累计值
 
@@ -357,12 +518,12 @@ def _trading_minutes_elapsed(t: "datetime.datetime") -> int:
     current = h * 60 + m
     morning_end = 11 * 60 + 30
     afternoon_start = 13 * 60
-    close = 15 * 60
+    close = 15 * 60 + 30  # 盘后交易到 15:30
 
     if current >= close:
-        return 240
+        return 270
     if current >= afternoon_start:
-        return 120 + min(current - afternoon_start, 120)
+        return 120 + min(current - afternoon_start, 150)
     if current >= morning_end:
         return 120
     return max(current - (9 * 60 + 30), 1)
@@ -410,12 +571,32 @@ class TechnicalSummary:
     bb_width: Optional[float] = None
     bb_signal: str = ""
     obv: Optional[float] = None
+    obv_signal: str = ""  # OBV 信号
     ma5: Optional[float] = None
     ma10: Optional[float] = None
     ma20: Optional[float] = None
     ma60: Optional[float] = None
     ma_alignment: str = ""  # 多头排列 / 空头排列 / 缠绕 / 多头回调 / 空头反弹 / 数据不足
     ma_alignment_detail: str = ""
+    has_gap: bool = False
+    gap_type: str = ""      # "向上跳空" / "向下跳空" / ""
+    gap_pct: float = 0.0
+    gap_detail: str = ""
+    gap_filled_pct: float = 0.0
+    breakout_type: str = ""  # "突破近期高点" / "跌破近期低点" / ""
+    breakout_detail: str = ""
+    # 关键位动态行为分析
+    has_resistance_rejection: bool = False
+    resistance_rejection_detail: str = ""
+    has_support_confirmation: bool = False
+    support_confirmation_detail: str = ""
+    has_support_breakdown: bool = False
+    support_breakdown_detail: str = ""
+    has_breakout_retest: bool = False
+    breakout_retest_detail: str = ""
+    support_strength: str = ""       # "强" / "中" / "弱"
+    resistance_strength: str = ""    # "强" / "中" / "弱"
+    strength_summary: str = ""
     signals: list[str] = field(default_factory=list)
 
 

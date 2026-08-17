@@ -3,6 +3,7 @@
 """
 
 from __future__ import annotations
+import json
 import os
 from typing import Optional, Dict, Any, List
 from enum import Enum
@@ -16,6 +17,25 @@ class LLMModel(Enum):
     """支持的LLM模型"""
     DEEPSEEK_CHAT = "deepseek-chat"
     DEEPSEEK_CODER = "deepseek-coder"
+
+
+class ToolCall:
+    """LLM 返回的工具调用"""
+    def __init__(self, call_id: str, name: str, arguments: dict):
+        self.id = call_id
+        self.name = name
+        self.arguments = arguments
+
+
+class ChatResponse:
+    """LLM 对话返回"""
+    def __init__(self, content: str = "", tool_calls: list[ToolCall] | None = None):
+        self.content = content
+        self.tool_calls = tool_calls or []
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return len(self.tool_calls) > 0
 
 
 class LLMClient:
@@ -71,11 +91,96 @@ class LLMClient:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
+        return self._call_api(messages, max_tokens, temperature, stop, timeout)
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int = 1500,
+        temperature: float = 0.3,
+        timeout: int = 120,
+        tool_choice: str = "auto",
+    ) -> ChatResponse:
+        """调用 LLM 进行带工具的对话（支持 function calling）
+
+        Args:
+            messages: 完整对话历史 [{"role": "system/user/assistant/tool", "content": ...}]
+            tools: OpenAI 兼容的 tools 定义列表
+            max_tokens: 最大生成 token 数
+            temperature: 温度系数
+            timeout: 请求超时时间（秒）
+            tool_choice: "auto" / "none" / "required"
+
+        Returns:
+            ChatResponse (content + tool_calls)
+        """
+        if not self._enabled:
+            log.warning("LLM未启用（缺少API Key）")
+            return ChatResponse(content="LLM 未启用")
+
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        payload: Dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+
+        try:
+            resp = http_client.post(
+                "/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+                verify=self._verify_ssl,
+            )
+            if resp and resp.status_code == 200:
+                result = resp.json()
+                choice = result["choices"][0]
+                msg = choice.get("message", {})
+
+                content = (msg.get("content") or "").strip()
+                tool_calls_raw = msg.get("tool_calls", [])
+
+                tool_calls: list[ToolCall] = []
+                for tc in tool_calls_raw:
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                    except (json.JSONDecodeError, KeyError):
+                        args = {}
+                    tool_calls.append(ToolCall(
+                        call_id=tc.get("id", ""),
+                        name=tc["function"]["name"],
+                        arguments=args,
+                    ))
+
+                if tool_calls:
+                    names = [tc.name for tc in tool_calls]
+                    log.info(f"LLM tool_calls: {names}")
+
+                return ChatResponse(content=content, tool_calls=tool_calls)
+            else:
+                status = resp.status_code if resp else "None"
+                log.warning(f"LLM tool_call 请求失败 (HTTP {status})")
+                return ChatResponse(content=f"API 请求失败: HTTP {status}")
+        except Exception as e:
+            log.warning(f"LLM tool_call 异常: {e}")
+            return ChatResponse(content=f"调用异常: {e}")
+
+    def _call_api(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 500,
+        temperature: float = 0.3,
+        stop: Optional[List[str]] = None,
+        timeout: int = 60,
+    ) -> Optional[str]:
+        """底层 API 调用"""
         # 打印请求提示词以便调试
         log.info(f"--- LLM请求 [model={self._model}, max_tokens={max_tokens}, temp={temperature}] ---")
-        if system_prompt:
-            log.info(f"System: {system_prompt}")
-        log.info(f"User: {prompt}")
         log.info("--- LLM请求结束 ---")
 
         headers = {"Authorization": f"Bearer {self._api_key}"}
@@ -126,13 +231,21 @@ def get_llm_client(config: Optional[Config] = None) -> LLMClient:
     global _default_llm_client
 
     if _default_llm_client is None:
-        model = config.llm_model if config else "deepseek-chat"
-        base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
-        verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
+        if config:
+            model = config.llm_model
+            base_url = config.llm_base_url
+            verify_ssl = config.llm_verify_ssl
+            api_key = config.llm_api_key
+        else:
+            model = "deepseek-chat"
+            base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+            verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
+            api_key = None
         _default_llm_client = LLMClient(
             model=model,
             base_url=base_url,
             verify_ssl=verify_ssl,
+            api_key=api_key,
         )
 
     return _default_llm_client

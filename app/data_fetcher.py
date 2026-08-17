@@ -8,7 +8,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth
+from datetime import datetime
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, SectorBoard, MarginData
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -111,6 +112,13 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
 
             name = fields[0].strip() if fields[0] else ""
 
+            # 计算分时均价（黄线）= 成交额 / 成交量
+            vol_val = _parse_float(fields[8])
+            amt_val = _parse_float(fields[9])
+            avg_price: Optional[float] = None
+            if vol_val and amt_val and vol_val > 0:
+                avg_price = round(amt_val / vol_val, 3)
+
             # 量比在 fields[35]，换手率在 fields[37]
             results.append(Quote(
                 code=item.code,
@@ -123,9 +131,10 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                 open=_parse_float(fields[1]),
                 high=high,
                 low=low,
-                volume=_parse_float(fields[8]),
-                amount=_parse_float(fields[9]),
+                volume=vol_val,
+                amount=amt_val,
                 amplitude=amplitude,
+                avg_price=avg_price,
                 # 新浪API不提供量比和换手率，稍后从腾讯API补充
                 turnover_rate=None,
                 volume_ratio=None,
@@ -265,10 +274,11 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         主力净流入金额（元），失败返回 None（静默失败，不记录日志）
     """
     secid = _get_secid(code, market)
+    # lmt=1 只取最新一条数据，klt=1 为1分钟粒度
     url = (f"{STOCK_FLOW_API}?secid={secid}"
-           f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
+           f"&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+           f"&lmt=1&klt=1")
 
-    # 使用无重试的session，避免产生大量WARNING日志
     import requests
     try:
         resp = requests.get(url, timeout=3, headers={
@@ -278,23 +288,93 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        if data.get("data") is None or not data["data"].get("f52"):
+        if data.get("data") is None:
             return None
-        return _parse_float(data["data"]["f52"])
+        # 数据在 klines 数组中，取最后一条的 f52（主力净流入）
+        klines = data["data"].get("klines")
+        if klines and len(klines) > 0:
+            last = klines[-1].split(",")
+            if len(last) > 1:
+                return _parse_float(last[1])
+        # 兼容旧格式：直接取顶层 f52
+        return _parse_float(data["data"].get("f52"))
+    except Exception:
+        return None  # 静默失败
+
+
+def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
+    """获取个股实时资金流向明细（超大单/大单/中单/小单）
+
+    使用东方财富 fflow/kline/get 接口，lmt=1 取最新一条数据。
+    返回 klines 数组，每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单)
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+
+    Returns:
+        FundFlowDetail 或 None（静默失败）
+    """
+    secid = _get_secid(code, market)
+    import requests
+    try:
+        resp = requests.get(
+            f"{STOCK_FLOW_API}?secid={secid}"
+            f"&fields1=f1,f2,f3"
+            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+            f"&lmt=1&klt=1",
+            timeout=5,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://data.eastmoney.com/",
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json().get("data")
+        if not data:
+            return None
+
+        klines = data.get("klines")
+        if not klines or len(klines) == 0:
+            return None
+
+        # 解析最后一条 kline: 日期,f52,f53,f54,f55,f56,...
+        parts = klines[-1].split(",")
+        if len(parts) < 6:
+            return None
+
+        flow = FundFlowDetail(
+            main_net=_parse_float(parts[1]) if len(parts) > 1 else None,           # f52 主力净流入
+            small_net=_parse_float(parts[2]) if len(parts) > 2 else None,          # f53 小单（散户）
+            medium_net=_parse_float(parts[3]) if len(parts) > 3 else None,         # f54 中单
+            large_net=_parse_float(parts[4]) if len(parts) > 4 else None,          # f55 大单
+            super_large_net=_parse_float(parts[5]) if len(parts) > 5 else None,    # f56 超大单
+            # 占比字段在 f57-f61，当前 kline 可能不包含，暂设为 None
+            main_pct=None,
+            super_large_pct=None,
+            large_pct=None,
+            medium_pct=None,
+            small_pct=None,
+        )
+        if flow.main_net is None and flow.super_large_net is None:
+            return None
+        return flow
     except Exception:
         return None  # 静默失败
 
 
 def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
-    """为 Quote 列表批量补充主力净流入（原地修改）
+    """为 Quote 列表批量补充资金流向明细（原地修改）
 
     使用线程池并发请求，每只股票独立请求东方财富资金流接口。
+    同时填充 main_net_inflow（向后兼容）和 fund_flow（资金明细）两个字段。
     """
     if not quotes:
         return
 
-    def _fetch_one(q: Quote) -> tuple[str, Optional[float]]:
-        flow = fetch_main_net_inflow(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
+    def _fetch_one(q: Quote) -> tuple[str, Optional[FundFlowDetail]]:
+        flow = fetch_fund_flow_detail(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
         return (q.code, flow)
 
     try:
@@ -305,7 +385,10 @@ def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
                     code, flow = fut.result(timeout=5)
                     for q in quotes:
                         if q.code == code:
-                            q.main_net_inflow = flow
+                            q.fund_flow = flow
+                            # 向后兼容：同时填充 main_net_inflow
+                            if flow is not None and flow.main_net is not None:
+                                q.main_net_inflow = flow.main_net
                             break
                 except Exception:
                     pass
@@ -332,6 +415,9 @@ def _fetch_quotes_akshare(items: list[WatchItem]) -> list[Quote]:
             continue
 
         item = item_map[code]
+        vol_val = _parse_float(row.get("成交量"))
+        amt_val = _parse_float(row.get("成交额"))
+        avg_p = round(amt_val / vol_val, 3) if vol_val and amt_val and vol_val > 0 else None
         results.append(Quote(
             code=code,
             name=str(row.get("名称", "")),
@@ -343,8 +429,9 @@ def _fetch_quotes_akshare(items: list[WatchItem]) -> list[Quote]:
             open=_parse_float(row.get("今开")),
             high=_parse_float(row.get("最高")),
             low=_parse_float(row.get("最低")),
-            volume=_parse_float(row.get("成交量")),
-            amount=_parse_float(row.get("成交额")),
+            volume=vol_val,
+            amount=amt_val,
+            avg_price=avg_p,
             amplitude=_parse_float(row.get("振幅")),
             pe_ratio=_parse_float(row.get("市盈率(动态)")),
             pb_ratio=_parse_float(row.get("市净率")),
@@ -380,6 +467,12 @@ def fetch_quotes_rich(items: list[WatchItem]) -> list[Quote]:
 
     try:
         _enrich_from_akshare(quotes)
+    except Exception:
+        pass
+
+    # 补充主力资金流向（东方财富API，批量获取）
+    try:
+        enrich_quotes_with_flow(quotes)
     except Exception:
         pass
 
@@ -516,10 +609,25 @@ def fetch_market_breadth(force_refresh: bool = False) -> Optional["MarketBreadth
 
     try:
         import akshare as ak
-        df = ak.stock_zh_a_spot_em()
 
+        # 重试机制：盘中 API 可能因负载高而断连，最多重试 2 次
+        df = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                df = ak.stock_zh_a_spot_em()
+                if df is not None and not df.empty:
+                    break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
         if df is None or df.empty:
-            log.warning("全市场数据为空")
+            if last_error:
+                log.info(f"全市场数据获取失败(已重试): {last_error}，使用旧缓存")
+            else:
+                log.info("全市场数据为空，使用旧缓存")
             return _breadth_cache  # 返回旧缓存
 
         # 聚合计算广度数据
@@ -593,11 +701,14 @@ def fetch_market_breadth(force_refresh: bool = False) -> Optional["MarketBreadth
         return breadth
 
     except ImportError:
-        log.debug("AKShare 未安装，跳过全市场广度数据")
-        return None
+        log.info("AKShare 未安装，使用旧缓存或跳过")
     except Exception as e:
-        log.warning(f"获取全市场广度数据失败: {e}")
-        return _breadth_cache  # 返回旧缓存
+        log.info(f"AKShare 全市场数据获取失败: {e}，使用旧缓存")
+
+    # 旧缓存延长有效期（获取失败时缓存从5分钟延长到2小时，避免AI分析无数据）
+    if _breadth_cache is not None and (now - _breadth_fetch_time) < 7200:
+        return _breadth_cache
+    return None
 
 
 # ============================================================
@@ -739,6 +850,8 @@ def fetch_global_markets() -> dict[str, str]:
 def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> list[MarketNews]:
     """获取指定时间窗口内的市场快讯
 
+    数据源：新浪财经滚动新闻（新浪 API 比东方财富更稳定）
+
     Args:
         start_hour: 开始小时 (0-23)
         end_hour:   结束小时 (0-23)
@@ -749,28 +862,55 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
     """
     from datetime import datetime
 
-    url = "https://www.eastmoney.com/commweb/api/newsFlow"
-    params = {"client": "web", "channel": "65", "pageSize": str(max_count * 2)}
+    # 新浪财经滚动新闻 API（lid=2510 = 财经要闻，比 2512 更纯净）
+    url = "https://feed.mix.sina.com.cn/api/roll/get"
+    params = {
+        "pageid": "153",
+        "lid": "2510",
+        "num": str(max_count * 3),
+        "versionNumber": "1.2.4",
+    }
 
     try:
-        resp = eastmoney_client.get(url, params=params)
+        import requests as _req
+        resp = _req.get(url, params=params, timeout=10,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
     except Exception as e:
         log.debug(f"快讯获取失败: {e}")
         return []
 
-    if resp is None:
+    if resp is None or resp.status_code != 200:
         return []
 
     try:
         data = resp.json()
-        items = (data or {}).get("data", []) or []
+        items = (data.get("result", {}) or {}).get("data", []) or []
     except Exception as e:
         log.warning(f"快讯解析失败: {e}")
         return []
 
+    # 非财经内容黑名单
+    NEWS_BLACKLIST = [
+        # 彩票
+        "双色球", "大乐透", "福彩", "体彩", "排列", "七星彩",
+        "彩票", "竞彩", "足彩", "开奖", "预测奖号",
+        # 体育
+        "国乒", "乒乓", "女排", "男排", "篮球", "足球", "NBA",
+        "CBA", "中超", "欧冠", "英超", "F1", "斯巴达", "勇士赛",
+        "拳击", "散打", "格斗", "武", "拜师", "夺冠", "冠军",
+        # 娱乐
+        "订婚", "钻戒", "新娘", "婚礼",
+        # 非财经广告
+        "专家招募", "APP",
+    ]
+
     news_list: list[MarketNews] = []
     for item in items:
-        if not item.get("title"):
+        title = item.get("title", "")
+        if not title:
+            continue
+        # 过滤非财经内容
+        if any(kw in title for kw in NEWS_BLACKLIST):
             continue
 
         ctime = item.get("ctime", "")
@@ -778,17 +918,20 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
             continue
 
         try:
-            news_time = datetime.strptime(ctime, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            news_time = datetime.now()
+            news_time = datetime.fromtimestamp(int(ctime))
+        except (ValueError, TypeError):
+            try:
+                news_time = datetime.strptime(str(ctime), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                news_time = datetime.now()
 
         hour = news_time.hour
         if start_hour <= hour < end_hour:
             news_list.append(MarketNews(
                 time=f"{news_time.hour:02d}:{news_time.minute:02d}",
-                title=item["title"],
-                category=item.get("category", ""),
-                content=(item.get("content", "") or "")[:200],
+                title=title,
+                category=item.get("media_name", "") or "",
+                content=(item.get("intro", "") or "")[:200],
                 url=item.get("url", ""),
             ))
 
@@ -822,8 +965,8 @@ class BackgroundDataCache:
         self._refresh_interval = refresh_interval
         self._lock = threading.Lock()
 
-        # 缓存数据: {code: {volume_ratio: x, turnover_rate: y, main_net_inflow: z}}
-        self._cache: Dict[str, Dict[str, Optional[float]]] = {}
+        # 缓存数据: {code: {volume_ratio: x, turnover_rate: y, main_net_inflow: z, fund_flow: FundFlowDetail}}
+        self._cache: Dict[str, Dict[str, Optional[float | FundFlowDetail]]] = {}
         self._last_update: float = 0.0
 
         # 控制线程
@@ -843,8 +986,12 @@ class BackgroundDataCache:
         self._tencent_thread.start()
         self._flow_thread = threading.Thread(target=self._run_flow, daemon=True)
         self._flow_thread.start()
-        # 立即获取一次量比和换手率
+        # 立即获取一次量比和换手率 + 主力资金流向
         self._refresh_tencent()
+        try:
+            self._refresh_flow()
+        except Exception:
+            pass  # 首次获取失败不影响，后续线程会重试
 
     def stop(self) -> None:
         """停止后台刷新线程"""
@@ -883,8 +1030,8 @@ class BackgroundDataCache:
 
     def _run_flow(self) -> None:
         """后台刷新循环：主力净流入（东方财富）"""
-        # 首次等待10秒再开始，避免启动时请求过多
-        for _ in range(10):
+        # 首次等待5秒再开始（start()中已做一次即时获取）
+        for _ in range(5):
             if self._stop_event.is_set():
                 return
             time.sleep(1)
@@ -917,7 +1064,7 @@ class BackgroundDataCache:
         with self._lock:
             for code, data in tencent_data.items():
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
                 if data.get("volume_ratio") is not None:
                     self._cache[code]["volume_ratio"] = data["volume_ratio"]
                 if data.get("turnover_rate") is not None:
@@ -931,7 +1078,7 @@ class BackgroundDataCache:
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
-        """刷新主力净流入（东方财富，静默失败）"""
+        """刷新资金流向明细（东方财富，静默失败）"""
         if not self._items:
             return
 
@@ -939,12 +1086,325 @@ class BackgroundDataCache:
             if self._stop_event.is_set():
                 return
             code = item.code
-            # 每只股票单独请求，加延迟避免限流
-            flow = fetch_main_net_inflow(code, item.market)
+            # 获取完整资金流向明细
+            detail = fetch_fund_flow_detail(code, item.market)
             with self._lock:
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None}
-                if flow is not None:
-                    self._cache[code]["main_net_inflow"] = flow
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
+                if detail is not None:
+                    self._cache[code]["fund_flow"] = detail
+                    # 向后兼容：同时存 main_net_inflow
+                    if detail.main_net is not None:
+                        self._cache[code]["main_net_inflow"] = detail.main_net
             time.sleep(0.5)  # 请求间隔
+
+
+# ============================================================
+# 行业板块数据获取
+# ============================================================
+
+# 板块数据缓存（避免每次扫描都拉取全量板块数据）
+_sector_cache: dict = {"_ts": 0.0, "_data": []}
+_SECTOR_CACHE_TTL = 300  # 板块数据缓存 5 分钟
+
+
+def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
+    """批量获取个股所属行业（带日级缓存）
+
+    首次调用时拉取全市场行业映射并缓存到 state/industry_cache.json，
+    同日后续调用直接读缓存，避免重复拉取 5000+ 条全市场数据。
+
+    Args:
+        codes: 股票代码列表
+
+    Returns:
+        {code: industry} 映射字典
+    """
+    import json
+    from pathlib import Path
+
+    today = datetime.now().strftime("%Y%m%d")
+    cache_dir = Path(__file__).resolve().parent.parent / "state"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "industry_cache.json"
+
+    full_map: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("_date") == today:
+                full_map = {k: v for k, v in cached.items() if not k.startswith("_")}
+        except Exception:
+            pass
+
+    if not full_map:
+        try:
+            import akshare as ak
+            df = ak.stock_zh_a_spot_em()
+            for _, row in df.iterrows():
+                code = str(row.get("代码", ""))
+                industry = str(row.get("行业", ""))
+                if code and industry:
+                    full_map[code] = industry
+            cache_data = {"_date": today, **full_map}
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False)
+            log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
+        except Exception as e:
+            log.debug(f"行业分类获取失败: {e}")
+            return {}
+
+    return {code: full_map[code] for code in codes if code in full_map}
+
+
+def _etf_name_to_industry(name: str) -> str:
+    """从 ETF 名称推断所属行业板块"""
+    mapping = {
+        "银行": "银行", "金融": "银行",
+        "芯片": "半导体", "半导体": "半导体",
+        "证券": "券商", "券商": "券商",
+        "军工": "军工", "国防": "军工",
+        "医药": "医药", "医疗": "医药", "生物医药": "医药",
+        "白酒": "酿酒", "酒": "酿酒",
+        "新能源": "新能源", "光伏": "新能源", "锂电": "新能源",
+        "人工智能": "人工智能", "AI": "人工智能",
+        "通信": "通信", "5G": "通信",
+        "消费": "消费", "食品饮料": "食品饮料", "食品": "食品饮料",
+        "汽车": "汽车", "智能汽车": "汽车", "新能源车": "汽车",
+        "养殖": "农牧", "农业": "农牧",
+        "房地产": "房地产", "地产": "房地产",
+        "煤炭": "煤炭", "有色": "有色", "钢铁": "钢铁", "稀土": "有色",
+        "化工": "化工",
+        "传媒": "传媒", "游戏": "传媒",
+        "计算机": "计算机", "软件": "计算机", "信创": "计算机",
+        "电力": "电力", "绿色电力": "电力",
+        "恒生科技": "港股科技", "港股科技": "港股科技",
+        "恒生互联": "港股互联网", "港股互联网": "港股互联网",
+        "恒生中国": "港股", "H股": "港股",
+        "恒生": "港股", "中概": "中概互联",
+        "科技": "科技", "科创": "科创",
+        "消费电子": "消费电子", "消电": "消费电子",
+        "红利": "红利", "中证红利": "红利",
+        "创业": "创业板", "创成长": "创业板",
+        "沪深300": "沪深300", "上证50": "上证50", "中证500": "中证500", "中证1000": "中证1000",
+        "红利低波": "红利",
+        "兴全趋势": "混合基金",
+        "华夏翔阳": "混合基金",
+    }
+    for keyword, sector in mapping.items():
+        if keyword in name:
+            return sector
+    return ""
+
+
+def enrich_quotes_with_industry(quotes: list[Quote]) -> None:
+    """为 Quote 列表补充行业分类（原地修改）
+
+    优先用 ETF 名称推断，个股回退到东方财富行业映射。
+    """
+    from app.models import Quote
+    etf_codes: list[str] = []
+    stock_codes: list[str] = []
+    for q in quotes:
+        if q.industry:
+            continue
+        # ETF 用名称推断
+        inferred = _etf_name_to_industry(q.name)
+        if inferred:
+            q.industry = inferred
+        else:
+            stock_codes.append(q.code)
+
+    if stock_codes:
+        industry_map = fetch_stock_industry_map(stock_codes)
+        for q in quotes:
+            if not q.industry and q.code in industry_map:
+                q.industry = industry_map[q.code]
+
+
+def fetch_sector_boards() -> list[SectorBoard]:
+    """获取东方财富行业板块实时数据（带内存缓存 5 分钟）
+
+    Returns:
+        SectorBoard 列表，按涨跌幅降序排列
+    """
+    global _sector_cache
+    now = time.time()
+    if now - _sector_cache["_ts"] < _SECTOR_CACHE_TTL and _sector_cache["_data"]:
+        return _sector_cache["_data"]
+
+    boards: list[SectorBoard] = []
+    try:
+        import akshare as ak
+        df = ak.stock_board_industry_index_em()
+        for _, row in df.iterrows():
+            boards.append(SectorBoard(
+                code=str(row.get("板块代码", "")),
+                name=str(row.get("板块名称", "")),
+                change_pct=_safe_float(row.get("最新价")),
+                amount=_safe_float(row.get("成交额")),
+                leader_stock=str(row.get("领涨股", "")),
+                leader_change_pct=_safe_float(row.get("领涨股-涨跌幅")),
+                main_net_inflow=_safe_float(row.get("主力净流入")),
+                stock_count=int(row.get("公司家数", 0)) if row.get("公司家数") else 0,
+            ))
+    except Exception as e:
+        log.debug(f"行业板块数据获取失败: {e}")
+        return _sector_cache["_data"]  # 返回旧缓存
+
+    boards.sort(key=lambda b: b.change_pct or 0, reverse=True)
+    _sector_cache = {"_ts": now, "_data": boards}
+    log.debug(f"行业板块数据已更新: {len(boards)} 个板块")
+    return boards
+
+
+def _safe_float(val) -> Optional[float]:
+    """安全转换为 float"""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_major_indices() -> list[Quote]:
+    """批量获取核心大盘指数
+
+    Returns:
+        Quote 列表（上证、深证、创业板、科创50、沪深300、中证500、中证1000）
+    """
+    indices = [
+        WatchItem(name="上证指数", code="000001", market="SH", type="指数"),
+        WatchItem(name="深证成指", code="399001", market="SZ", type="指数"),
+        WatchItem(name="创业板指", code="399006", market="SZ", type="指数"),
+        WatchItem(name="科创50", code="000688", market="SH", type="指数"),
+        WatchItem(name="沪深300", code="000300", market="SH", type="指数"),
+        WatchItem(name="中证500", code="000905", market="SH", type="指数"),
+        WatchItem(name="中证1000", code="000852", market="SH", type="指数"),
+    ]
+    try:
+        return fetch_quotes_rich(indices)
+    except Exception:
+        return []
+
+
+# 大盘指数K线缓存
+_index_klines_cache: dict = {"_ts": 0, "_data": {}}
+_INDEX_KLINES_TTL = 600  # 10分钟
+
+
+def fetch_index_klines(codes: list[str]) -> dict[str, list]:
+    """批量获取大盘指数60日K线（带缓存）"""
+    global _index_klines_cache
+    now = time.time()
+    if now - _index_klines_cache["_ts"] < _INDEX_KLINES_TTL and _index_klines_cache["_data"]:
+        return {k: v for k, v in _index_klines_cache["_data"].items() if k in codes}
+
+    from app.technical import fetch_historical_kline
+    result = {}
+    for code in codes:
+        market = "SH" if code.startswith(("0", "5", "6", "9")) else "SZ"
+        try:
+            kls = fetch_historical_kline(code, market, days=60)
+            if kls:
+                result[code] = kls
+        except Exception:
+            pass
+    _index_klines_cache = {"_ts": now, "_data": result}
+    return result
+
+
+# 两融数据缓存
+_margin_cache: dict = {"_ts": 0.0, "_data": None}
+_MARGIN_CACHE_TTL = 1800  # 30分钟（两融是日频数据）
+
+
+def fetch_margin_data(force_refresh: bool = False) -> Optional["MarginData"]:
+    """获取全市场两融数据（融资融券余额，替代已停披露的北向资金）
+
+    数据来源：上交所 + 深交所融资融券余额（AKShare）
+    日频数据，带30分钟缓存。
+
+    Returns:
+        MarginData 或 None（获取失败）
+    """
+    global _margin_cache
+    now = time.time()
+    if (not force_refresh and _margin_cache["_data"] is not None
+            and now - _margin_cache["_ts"] < _MARGIN_CACHE_TTL):
+        return _margin_cache["_data"]
+
+    try:
+        import akshare as ak
+        from datetime import datetime as _dt, timedelta
+
+        # 上交所 + 深交所两融数据（两接口签名不同）
+        end = _dt.now()
+        start = end - timedelta(days=30)
+        sh_df = ak.stock_margin_sse(start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
+        # 深交所接口只接受单日 date，回溯找最近有数据的一天
+        sz_df = None
+        for back in range(0, 10):
+            d = (end - timedelta(days=back)).strftime("%Y%m%d")
+            try:
+                sz_df = ak.stock_margin_szse(date=d)
+                if sz_df is not None and not sz_df.empty:
+                    break
+            except Exception:
+                continue
+        if sz_df is None:
+            sz_df = ak.stock_margin_szse()  # 默认日期兜底
+
+        # 取最新一条（两市日期可能不同，用最新的一天）
+        if sh_df.empty and sz_df.empty:
+            return _margin_cache["_data"]
+
+        # 上交所：数值单位是「元」，需除以 1e8 转亿
+        sh_latest = sh_df.iloc[-1] if not sh_df.empty else None
+        sh_prev = sh_df.iloc[-2] if len(sh_df) >= 2 else None
+        # 深交所：数值单位已是「亿元」
+        sz_latest = sz_df.iloc[-1] if (sz_df is not None and not sz_df.empty) else None
+
+        fin_bal_yi = 0.0    # 融资余额（亿）
+        prev_fin_bal_yi = 0.0
+        sec_bal_yi = 0.0    # 融券余额（亿）
+        date = ""
+
+        # 上交所（元 → 亿）
+        if sh_latest is not None:
+            fin_bal_yi += float(sh_latest.get("融资余额", 0) or 0) / 1e8
+            sec_bal_yi += float(sh_latest.get("融券余量金额", 0) or 0) / 1e8
+            if sh_prev is not None:
+                prev_fin_bal_yi += float(sh_prev.get("融资余额", 0) or 0) / 1e8
+            date = str(sh_latest.get("信用交易日期", "")) or date
+
+        # 深交所（已是亿元）
+        if sz_latest is not None:
+            fin_bal_yi += float(sz_latest.get("融资余额", 0) or 0)
+            sec_bal_yi += float(sz_latest.get("融券余额", 0) or 0)
+
+        # 融资净买入 = 上交所今日融资余额 - 昨日融资余额（深交所无历史，只取单日）
+        sh_fin_today = 0.0
+        sh_fin_prev = 0.0
+        if sh_latest is not None:
+            sh_fin_today = float(sh_latest.get("融资余额", 0) or 0) / 1e8
+        if sh_prev is not None:
+            sh_fin_prev = float(sh_prev.get("融资余额", 0) or 0) / 1e8
+        net_buy = sh_fin_today - sh_fin_prev if sh_fin_prev > 0 else 0.0
+        total = fin_bal_yi + sec_bal_yi
+
+        data = MarginData(
+            financing_balance=round(fin_bal_yi, 1),
+            financing_net_buy=round(net_buy, 1),
+            securities_lending_balance=round(sec_bal_yi, 1),
+            total_balance=round(total, 1),
+            date=date,
+        )
+        _margin_cache = {"_ts": now, "_data": data}
+        return data
+    except Exception as e:
+        log.debug(f"两融数据获取失败: {e}")
+        return _margin_cache["_data"]
 

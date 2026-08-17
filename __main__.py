@@ -9,6 +9,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+# LLM 调用冷却（模块级，跨 scan 持久）
+_last_llm_call_time: float = 0.0
+LLM_COOLDOWN: int = 1800  # 30 分钟最小间隔
+
 from app.config import Config
 from app.data_fetcher import NorthFlowFetcher
 from app.reporter import generate_morning_brief, generate_midday_review, generate_evening_review
@@ -76,15 +80,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}8{Color.RESET}. ETF Bottom Reversal Screen (ETF底部反转)")
     print(f"  {Color.CYAN}9{Color.RESET}. Stock Bottom Reversal Screen (A股底部反转)")
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
+    print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D"):
+            choice = input(f" Enter option [0-9/D/M]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9 or D{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D or M{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -344,7 +349,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         log.warning("No quote data received")
         return
 
-    # 从后台缓存获取量比、换手率、主力净流入（不阻塞主循环）
+    # 从后台缓存获取量比、换手率、资金流向明细（不阻塞主循环）
     if hasattr(_run_once, '_bg_cache') and _run_once._bg_cache.is_fresh():
         for q in quotes:
             cached = _run_once._bg_cache.get_data(q.code)
@@ -355,6 +360,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     q.turnover_rate = cached["turnover_rate"]
                 if cached.get("main_net_inflow") is not None:
                     q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("fund_flow") is not None:
+                    q.fund_flow = cached["fund_flow"]
                 if cached.get("bid_volume") is not None:
                     q.bid_volume = cached["bid_volume"]
                 if cached.get("ask_volume") is not None:
@@ -443,9 +450,17 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     )
     print_sentiment(stats)
 
-    # 保存当前成交量，供下一周期量价分析
+    # 保存当前成交量和资金流，供下一周期对比
     try:
-        cur_state = {q.code: {"volume": q.volume} for q in quotes if q.volume is not None}
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         log.warning(f"保存状态文件失败: {e}")
@@ -542,6 +557,21 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
     scan_history.append(scan_record)
     _save_scan_history(scan_history)
 
+    # 保存当前成交量和资金流状态，供下一轮对比（趋势检测用）
+    try:
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry: dict = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
+        STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
 
@@ -549,6 +579,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                   call_llm: bool = False, scan_count: int = 0) -> None:
     """Run one scan cycle using shared data pool"""
+    global _last_llm_call_time
     from app.analyzer import analyze, _load_scan_history, _save_scan_history
     from app.ai_analyzer import analyze as analyze_with_llm
     from app.notifier import push_alert, send_desktop_notification
@@ -557,7 +588,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         print_llm_result, print_tail, save_brief, print_key_levels, Color
     )
     from app.technical import get_technical_summary, TechnicalSummary
-    from app.models import ScanRecord, FundScanStatus, TechSnapshot
+    from app.models import ScanRecord, FundScanStatus, TechSnapshot, Alert
 
     log.info("Scanning market data (from shared pool)...")
 
@@ -566,6 +597,27 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     if not quotes:
         log.warning("No quote data available in data pool")
         return
+
+    # Apply background cache data (fund flow, volume ratio, turnover rate)
+    bg = getattr(_run_once_new, '_bg_cache', None)
+    if bg and bg.is_fresh():
+        for q in quotes:
+            cached = bg.get_data(q.code)
+            if cached:
+                if cached.get("volume_ratio") is not None:
+                    q.volume_ratio = cached["volume_ratio"]
+                if cached.get("turnover_rate") is not None:
+                    q.turnover_rate = cached["turnover_rate"]
+                if cached.get("main_net_inflow") is not None:
+                    q.main_net_inflow = cached["main_net_inflow"]
+                if cached.get("fund_flow") is not None:
+                    q.fund_flow = cached["fund_flow"]
+                if cached.get("bid_volume") is not None:
+                    q.bid_volume = cached["bid_volume"]
+                if cached.get("ask_volume") is not None:
+                    q.ask_volume = cached["ask_volume"]
+                if cached.get("bid_ask_ratio") is not None:
+                    q.bid_ask_ratio = cached["bid_ask_ratio"]
 
     # Get K-line data from shared pool
     klines_map = {}
@@ -576,6 +628,11 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     # Build holdings code set for dragon tiger check
     holding_codes = {h.code for h in config.holdings}
+
+    # Enrich quotes with industry classification
+    from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards
+    enrich_quotes_with_industry(quotes)
+    sector_boards = fetch_sector_boards()  # 5分钟缓存
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -724,23 +781,93 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             print(f"  {Color.BOLD}{name}({code}){Color.RESET}  →  {sig_text}")
         print()
 
+    # 涨速排名（与前次扫描对比）
+    _prev_prices = getattr(_run_once_new, '_prev_prices', {})
+    if _prev_prices:
+        velocity_items = []
+        for q in quotes:
+            prev_p = _prev_prices.get(q.code)
+            if prev_p and q.price and prev_p > 0 and q.price != prev_p:
+                vel = (q.price - prev_p) / prev_p * 100
+                if abs(vel) >= 0.3:  # 3分钟涨速超过0.3%才显示
+                    velocity_items.append((q.name, q.code, vel))
+        if velocity_items:
+            velocity_items.sort(key=lambda x: x[2], reverse=True)
+            from app.presenter import Color
+            print(f"{Color.BOLD}{Color.PURPLE}═══ 涨速排名(3min) ═══{Color.RESET}")
+            top = velocity_items[:5]
+            bot = velocity_items[-5:]
+            top_str = "  ".join(f"{Color.RED}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in top)
+            bot_str = "  ".join(f"{Color.GREEN}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in bot)
+            print(f"  ▲ {top_str}")
+            print(f"  ▼ {bot_str}")
+            print()
+    _run_once_new._prev_prices = {q.code: q.price for q in quotes if q.price is not None}
+
+    # Sector analysis display
+    if sector_boards:
+        from app.analyzer import analyze_sector_context
+        sector_ctx = analyze_sector_context(quotes, sector_boards)
+        from app.presenter import Color
+        print(f"{Color.BOLD}{Color.CYAN}═══ 行业板块 ═══{Color.RESET}")
+        # Top 3 / Bottom 3
+        top3 = sector_ctx["top_sectors"][:3]
+        bot3 = sector_ctx["bottom_sectors"][:3]
+        print(f"  {Color.GREEN}▲{Color.RESET} ", end="")
+        for name, chg in top3:
+            print(f"{name}{chg:+.1f}%  ", end="")
+        print(f"\n  {Color.RED}▼{Color.RESET} ", end="")
+        for name, chg in bot3:
+            print(f"{name}{chg:+.1f}%  ", end="")
+        print()
+        # Per-stock sector context (only show deviating ones)
+        deviating = [(q.code, info) for q in quotes
+                     if (info := sector_ctx["per_stock"].get(q.code)) and info["label"]
+                     and "同步" not in info["label"]]
+        if deviating:
+            for code, info in deviating[:5]:
+                q = next((x for x in quotes if x.code == code), None)
+                if q:
+                    emoji = "🔥" if info.get("relative_strength", 0) > 0 else "❄️"
+                    print(f"  {emoji} {q.name}({q.code}): {info['label']} [{info.get('sector', '')}]")
+        print()
+
     # Fetch market breadth data (cached, 5-min TTL)
     from app.data_fetcher import fetch_market_breadth
     breadth = fetch_market_breadth()
 
     # Analyze market (all quotes including watchlist for full coverage)
+    north_data = north_fetcher.fetch()
     alerts, stats = analyze(quotes, prev_state, config, tech_summaries,
-                            north_data=north_fetcher.fetch(),
+                            north_data=north_data,
                             market_breadth=breadth)
 
-    # Merge strategy alerts into analyzer alerts pipeline
-    if strategy_alerts:
-        alerts.extend(strategy_alerts)
-        stats.alert_count += len(strategy_alerts)
+    # 落盘北向资金轨迹（仅当有有效日期，即API成功返回）
+    if north_data is not None and getattr(north_data, "date", ""):
+        _append_north_flow(north_data)
 
-    # Print sentiment and alerts
+    # 策略信号已在"组合策略信号"章节单独展示，不再合并进"异动提醒详情"
+    # 但告警计数仍计入策略信号，供统计使用
+    stats.alert_count += len(strategy_alerts)
+
+    # Print sentiment and alerts（只展示行情/资金/技术异动，不含策略信号）
     print_sentiment(stats)
     print_alerts(alerts)
+
+    # K线形态检测（追加到告警列表）
+    from app.technical import detect_candlestick_patterns
+    for q in quotes:
+        kls = klines_map.get(q.code)
+        if not kls:
+            continue
+        patterns = detect_candlestick_patterns(kls)
+        if patterns:
+            existing = next((a for a in alerts if a.code == q.code), None)
+            if existing:
+                for p in patterns:
+                    existing.messages.append(p)
+            else:
+                alerts.append(Alert(code=q.code, name=q.name, messages=list(patterns)))
 
     # 发送桌面通知
     if alerts:
@@ -753,15 +880,20 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         )
 
     # LLM analysis (with full alerts + tech data)
-    # 有异动时强制调 LLM（即使奇数轮），无异动时维持隔轮调用
+    # 有异动时强制调 LLM（即使奇数轮），但受冷却时间限制
     llm_result = ""
     should_call_llm = call_llm
     if not should_call_llm and config.llm_enabled and alerts and config.llm_trigger == "仅异动时":
-        should_call_llm = True  # override: alerts present → analyze now
+        should_call_llm = True
+    # 冷却检查：距上次 LLM 调用不足 30 分钟时跳过
+    if should_call_llm and time.time() - _last_llm_call_time < LLM_COOLDOWN:
+        log.info(f"LLM 冷却中（距上次调用 {(time.time() - _last_llm_call_time) / 60:.0f} 分钟），跳过本轮")
+        should_call_llm = False
     if should_call_llm and config.llm_enabled:
         try:
             llm_result = analyze_with_llm(quotes, alerts, stats, config, tech_summaries)
             print_llm_result(llm_result)
+            _last_llm_call_time = time.time()  # 记录调用时间，启动冷却
         except Exception as e:
             log.error(f"LLM analysis failed: {e}")
 
@@ -794,7 +926,18 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         )
 
     scan_record = ScanRecord(
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        scan_id=scan_count,
+        time=datetime.now().strftime("%H:%M"),
+        timestamp=int(time.time()),
+        market_sentiment={
+            "score": stats.sentiment.score if stats.sentiment else 50,
+            "label": stats.sentiment.label if stats.sentiment else "未知"
+        },
+        alerts_summary={
+            "total_alerts": len(alerts),
+            "critical_alerts": stats.alert_count,
+            "funds_with_alerts": [a.code for a in alerts]
+        },
         funds_status=funds_status,
         llm_analysis=llm_result
     )
@@ -802,8 +945,89 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     scan_history.append(scan_record)
     _save_scan_history(scan_history)
 
+    # 保存当前成交量和资金流状态，供下一轮对比（趋势检测用）
+    try:
+        cur_state = {}
+        for q in quotes:
+            if q.volume is not None:
+                entry: dict = {"volume": q.volume}
+                if q.main_net_inflow is not None:
+                    entry["main_net_inflow"] = q.main_net_inflow
+                    if q.amount and q.amount > 0:
+                        entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                cur_state[q.code] = entry
+        STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+    # 落盘日内时间序列（供午/晚报复盘分时特征）
+    try:
+        _append_intraday_series(quotes)
+    except Exception:
+        pass
+
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
+
+
+def _append_intraday_series(quotes) -> None:
+    """把每次扫描的价格/资金流/量比追加到日内序列文件"""
+    series_path = STATE_DIR / "intraday_series.json"
+    now_str = datetime.now().strftime("%H:%M")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    series: dict = {"date": today_str, "stocks": {}}
+    if series_path.exists():
+        try:
+            series = json.loads(series_path.read_text(encoding="utf-8"))
+        except Exception:
+            series = {"date": today_str, "stocks": {}}
+    if series.get("date") != today_str:
+        series = {"date": today_str, "stocks": {}}
+
+    stocks = series.setdefault("stocks", {})
+    for q in quotes:
+        if q.price is None:
+            continue
+        code = q.code
+        if code not in stocks:
+            stocks[code] = {"name": q.name, "timeline": []}
+        point = {"time": now_str, "price": q.price, "change_pct": q.change_pct}
+        if q.main_net_inflow is not None:
+            point["fund_flow"] = round(q.main_net_inflow / 1e4, 1)  # 万元
+        if q.volume_ratio is not None:
+            point["volume_ratio"] = round(q.volume_ratio, 2)
+        stocks[code]["timeline"].append(point)
+
+    series_path.write_text(json.dumps(series, ensure_ascii=False), encoding="utf-8")
+
+
+def _append_north_flow(north_data) -> None:
+    """落盘北向资金轨迹"""
+    north_path = STATE_DIR / "north_flow_series.json"
+    now_str = datetime.now().strftime("%H:%M")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    data: dict = {"date": today_str, "timeline": []}
+    if north_path.exists():
+        try:
+            data = json.loads(north_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"date": today_str, "timeline": []}
+    if data.get("date") != today_str:
+        data = {"date": today_str, "timeline": []}
+
+    timeline = data.setdefault("timeline", [])
+    # 避免同一分钟重复记录
+    if timeline and timeline[-1].get("time") == now_str:
+        return
+    timeline.append({
+        "time": now_str,
+        "total_net": getattr(north_data, "total_net", 0),
+        "hk2sh_net": getattr(north_data, "hk2sh_net", 0),
+        "hk2sz_net": getattr(north_data, "hk2sz_net", 0),
+    })
+    north_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> None:
@@ -833,8 +1057,15 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
     if hasattr(config, 't0_enabled') and config.t0_enabled:
         t0_interval = getattr(config, 't0_interval', 30)
         t0_thread = T0MonitorThread(monitor_items, data_pool, interval=t0_interval,
-                                    enable_sound=True, enable_push=False)
+                                    enable_sound=True, enable_push=False,
+                                    sessions=config.sessions)
         t0_thread.start()
+
+    # Start background cache for fund flow / volume ratio / turnover rate
+    from app.data_fetcher import BackgroundDataCache
+    bg_cache = BackgroundDataCache(monitor_items, refresh_interval=60)
+    bg_cache.start()
+    _run_once_new._bg_cache = bg_cache  # attach to function for access in _run_once_new
 
     # Wait for initial data to be ready (up to 10 seconds)
     log.info("Initializing data pool...")
@@ -855,7 +1086,8 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         while True:
             if is_trading_time(datetime.now(), config.sessions)[0]:
                 scan_count += 1
-                call_llm = (scan_count % 2 == 0)
+                call_llm = (scan_count % 10 == 0)
+                # 冷却已在 _run_once_new 内部处理
                 _run_once_new(config, north_fetcher, data_pool, call_llm=call_llm, scan_count=scan_count)
             else:
                 now = datetime.now()
@@ -873,6 +1105,8 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         if t0_thread:
             t0_thread.stop()
         fetcher_thread.stop()
+        if bg_cache:
+            bg_cache.stop()
         log.info("All threads stopped")
 
 
@@ -1098,6 +1332,25 @@ def main() -> None:
                         log.warning(f"LLM 龙虎榜分析异常: {e}")
                         print(f"  {Color.YELLOW}⚠️ AI 解读异常: {e}{Color.RESET}")
 
+                # 4.6. Agent 深度挖掘（LLM 自主调用工具，多轮推理）
+                if config.dragon_tiger_llm_enabled and config.deepseek_key:
+                    print(f"\n  {Color.DIM}🔍 Agent 正在深度挖掘龙虎榜数据...{Color.RESET}")
+                    try:
+                        agent_result = _run_dragon_tiger_agent(
+                            summary=summary,
+                            seat_analyses=analyses if analyses else [],
+                            config=config,
+                        )
+                        if agent_result:
+                            report_lines.append("\n---\n")
+                            report_lines.append(agent_result)
+                            print(f"  {Color.GREEN}✅ Agent 挖掘完成{Color.RESET}")
+                        else:
+                            print(f"  {Color.YELLOW}⚠️ Agent 挖掘跳过{Color.RESET}")
+                    except Exception as e:
+                        log.warning(f"Agent 挖掘异常: {e}")
+                        print(f"  {Color.YELLOW}⚠️ Agent 挖掘异常: {e}{Color.RESET}")
+
                 # 5. 写入报告
                 full_report = "\n".join(report_lines)
                 from pathlib import Path
@@ -1113,6 +1366,361 @@ def main() -> None:
             except Exception as e:
                 log.error(f"龙虎榜分析失败: {e}")
                 print(f"{Color.RED}❌ 龙虎榜分析失败: {e}{Color.RESET}")
+
+        elif choice == "M":
+            _run_miaoxiang_menu(config)
+
+
+def _run_miaoxiang_menu(config: Config) -> None:
+    """东方财富妙想 Skills 功能菜单（循环停留在子菜单）"""
+    from app.miaoxiang import get_mx_client
+
+    if not config.mx_apikey:
+        print(f"\n{Color.YELLOW}⚠️ 未配置 MX_APIKEY{Color.RESET}")
+        print(f"  {Color.DIM}请在 .env 文件中设置: MX_APIKEY=你的妙想API_Key{Color.RESET}")
+        print(f"  {Color.DIM}获取地址: https://dl.dfcfs.com/m/itc4{Color.RESET}")
+        return
+
+    mx = get_mx_client(config)
+
+    while True:
+        print(f"\n{Color.BOLD}{Color.CYAN}🧠 东方财富妙想 Skills{Color.RESET}")
+        print(f"  {Color.CYAN}1{Color.RESET}. 金融数据查询 (行情/财务/资金流)")
+        print(f"  {Color.CYAN}2{Color.RESET}. 智能选股 (自然语言条件)")
+        print(f"  {Color.CYAN}3{Color.RESET}. 财经资讯搜索")
+        print(f"  {Color.CYAN}4{Color.RESET}. 自选股管理 (查询/添加/删除)")
+        print(f"  {Color.CYAN}0{Color.RESET}. 返回主菜单")
+
+        try:
+            sub = input(f" Enter option [0-4]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if sub == "0":
+            return
+        elif sub == "1":
+            _run_mx_query(mx)
+        elif sub == "2":
+            _run_mx_screen(mx)
+        elif sub == "3":
+            _run_mx_search(mx)
+        elif sub == "4":
+            _run_mx_selfselect(mx)
+        else:
+            print(f"{Color.YELLOW} 无效选项{Color.RESET}")
+
+
+def _run_mx_query(mx) -> None:
+    """妙想金融数据查询（连续查询，0 或空行返回上级菜单）"""
+    print(f"\n{Color.BOLD}{Color.CYAN}📊 金融数据查询{Color.RESET}")
+    print(f"{Color.DIM}示例: 贵州茅台最新价 / 宁德时代主力资金流向 / 沪深300市盈率{Color.RESET}")
+    print(f"{Color.DIM}输入 0 或空行返回上级菜单{Color.RESET}")
+    while True:
+        try:
+            query = input("\n请输入查询内容: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not query or query == "0":
+            return
+        print(f"{Color.DIM}查询中...{Color.RESET}")
+        result = mx.query_as_text(query)
+        print(result if result else f"{Color.YELLOW}⚠️ 查询失败或未返回数据{Color.RESET}")
+
+
+def _run_mx_screen(mx) -> None:
+    """妙想智能选股（连续选股，0 或空行返回上级菜单）"""
+    print(f"\n{Color.BOLD}{Color.CYAN}🔍 智能选股{Color.RESET}")
+    print(f"{Color.DIM}示例: 今日涨幅超过3%的半导体股票 / 低估值高股息蓝筹{Color.RESET}")
+    print(f"{Color.DIM}输入 0 或空行返回上级菜单{Color.RESET}")
+    while True:
+        try:
+            keyword = input("\n请输入选股条件: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not keyword or keyword == "0":
+            return
+        print(f"{Color.DIM}筛选中...{Color.RESET}")
+        result = mx.stock_screen_as_text(keyword)
+        print(result if result else f"{Color.YELLOW}⚠️ 筛选失败或未返回数据{Color.RESET}")
+
+
+def _run_mx_search(mx) -> None:
+    """妙想财经资讯搜索（连续搜索，0 或空行返回上级菜单）"""
+    print(f"\n{Color.BOLD}{Color.CYAN}📰 财经资讯搜索{Color.RESET}")
+    print(f"{Color.DIM}示例: 人工智能最新消息 / 半导体行业研报{Color.RESET}")
+    print(f"{Color.DIM}输入 0 或空行返回上级菜单{Color.RESET}")
+    while True:
+        try:
+            keyword = input("\n请输入搜索关键词: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not keyword or keyword == "0":
+            return
+        print(f"{Color.DIM}搜索中...{Color.RESET}")
+        result = mx.fin_search_as_text(keyword)
+        print(result if result else f"{Color.YELLOW}⚠️ 搜索失败或未返回数据{Color.RESET}")
+
+
+def _run_mx_selfselect(mx) -> None:
+    """妙想自选股管理（查询/添加/删除，0 或空行返回上级菜单）"""
+    print(f"\n{Color.BOLD}{Color.CYAN}⭐ 自选股管理{Color.RESET}")
+    print(f"  {Color.CYAN}1{Color.RESET}. 查询我的自选股")
+    print(f"  {Color.CYAN}2{Color.RESET}. 添加自选股 (如: 添加贵州茅台)")
+    print(f"  {Color.CYAN}3{Color.RESET}. 删除自选股 (如: 删除贵州茅台)")
+    print(f"  {Color.CYAN}0{Color.RESET}. 返回上级菜单")
+
+    while True:
+        try:
+            choice = input("\n请输入操作 [1/2/3/0]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if choice == "0" or choice == "":
+            return
+        elif choice == "1":
+            print(f"{Color.DIM}查询中...{Color.RESET}")
+            result = mx.self_select_get_as_text()
+            print(result if result else f"{Color.YELLOW}⚠️ 查询失败或未返回数据{Color.RESET}")
+        elif choice == "2":
+            try:
+                instr = input("请输入要添加的股票(名称或代码): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not instr:
+                continue
+            print(f"{Color.DIM}添加中...{Color.RESET}")
+            result = mx.self_select_manage_as_text(f"把{instr}加入自选")
+            print(result if result else f"{Color.YELLOW}⚠️ 添加失败{Color.RESET}")
+        elif choice == "3":
+            try:
+                instr = input("请输入要删除的股票(名称或代码): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not instr:
+                continue
+            print(f"{Color.DIM}删除中...{Color.RESET}")
+            result = mx.self_select_manage_as_text(f"把{instr}从自选删除")
+            print(result if result else f"{Color.YELLOW}⚠️ 删除失败{Color.RESET}")
+        else:
+            print(f"{Color.YELLOW} 无效选项{Color.RESET}")
+
+
+def _run_dragon_tiger_agent(
+    summary,
+    seat_analyses: list,
+    config,
+) -> str | None:
+    """运行 Agent 深度挖掘龙虎榜数据
+
+    LLM 可主动调用工具函数查询：
+    - 具体个股的席位明细
+    - 连续上榜历史
+    - 行业分类
+    - 技术指标
+    - 主力资金流向
+    """
+    try:
+        from app.llm_agent import LLMAgent, AgentTool
+        from app.dragon_tiger import format_dragon_tiger_report, build_llm_context
+        from app.dragon_seat import generate_seat_report, fetch_seat_details
+        from app.dragon_seat import detect_consecutive_listings
+
+        # ---- 构建工具列表 ----
+
+        # 预建索引用于工具函数
+        all_records = summary.records or []
+        record_map = {r.code: r for r in all_records}
+        seat_map: dict[str, list] = {}
+        if seat_analyses:
+            for sa in seat_analyses:
+                seat_map[sa.code] = [
+                    {
+                        "seat_name": s.seat_name,
+                        "seat_type": s.seat_type,
+                        "buy_amount": s.buy_amount,
+                        "sell_amount": s.sell_amount,
+                        "net_amount": s.net_amount,
+                        "buy_rank": s.buy_rank,
+                        "sell_rank": s.sell_rank,
+                    }
+                    for s in (sa.seats or [])
+                ]
+
+        def tool_query_seat_details(codes: list[str]) -> dict:
+            """查询指定股票的席位买卖明细"""
+            result = {}
+            for code in codes:
+                if code in seat_map:
+                    result[code] = seat_map[code]
+                else:
+                    result[code] = []
+            return result
+
+        def tool_query_industry(codes: list[str]) -> dict:
+            """查询股票的所属行业"""
+            result = {}
+            for code in codes:
+                record = record_map.get(code)
+                industry = getattr(record, "industry", "") if record else ""
+                result[code] = industry or "未知"
+            return result
+
+        def tool_query_record_detail(codes: list[str]) -> dict:
+            """查询龙虎榜上榜记录详情（净买额/涨跌幅/上榜原因/买卖比）"""
+            result = {}
+            for code in codes:
+                record = record_map.get(code)
+                if record:
+                    result[code] = {
+                        "name": record.name,
+                        "net_buy": f"{record.net_buy/1e8:.2f}亿",
+                        "change_pct": f"{record.change_pct:+.1f}%" if record.change_pct else "--",
+                        "buy_sell_ratio": f"{record.buy_sell_ratio:.2f}" if record.buy_sell_ratio else "--",
+                        "turnover_rate": f"{record.turnover_rate:.1f}%" if record.turnover_rate else "--",
+                        "reason": getattr(record, "reason", ""),
+                    }
+                else:
+                    result[code] = None
+            return result
+
+        def tool_query_abnormal_patterns(codes: list[str]) -> dict:
+            """查询指定股票的异常形态（涨停板出货/跌停接筹/对倒等）"""
+            result = {}
+            patterns = summary.abnormal_patterns or []
+            for code in codes:
+                matched = [p for p in patterns if p.get("code") == code]
+                if matched:
+                    result[code] = [
+                        {
+                            "形态": p.get("pattern_label", ""),
+                            "详情": p.get("detail", ""),
+                        }
+                        for p in matched
+                    ]
+                else:
+                    result[code] = []
+            return result
+
+        # ---- 定义工具 ----
+        tools = [
+            AgentTool(
+                name="query_seat_details",
+                description="查询指定股票的龙虎榜席位买卖明细。返回每个席位的名称、类型（机构/游资/量化/散户）、买入额、卖出额、净额、排名。",
+                func=tool_query_seat_details,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，如 ['000977', '300017']，最多5只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_record_detail",
+                description="查询股票的龙虎榜上榜详情：净买额、涨跌幅、买卖比、换手率、上榜原因。",
+                func=tool_query_record_detail,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_abnormal_patterns",
+                description="查询指定股票的异常交易形态：涨停板出货、跌停接筹、封板缩量、放量烂板、机构对倒等。",
+                func=tool_query_abnormal_patterns,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+            AgentTool(
+                name="query_industry",
+                description="查询股票所属行业分类。",
+                func=tool_query_industry,
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "codes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "股票代码列表，最多10只",
+                        },
+                    },
+                    "required": ["codes"],
+                },
+            ),
+        ]
+
+        # ---- 构建初始 prompt ----
+        init_prompt_parts = [
+            f"请对今日({summary.date})龙虎榜数据进行深度挖掘分析。",
+            f"上榜个股共 {summary.total_count} 只。",
+            "",
+            "以下是已预计算的汇总数据，请先仔细阅读，然后使用工具函数进一步查询你感兴趣的股票：",
+            "",
+        ]
+
+        # 加入汇总数据
+        report_md = format_dragon_tiger_report(summary)
+        init_prompt_parts.append(report_md)
+
+        if seat_analyses:
+            seat_md = generate_seat_report(seat_analyses)
+            init_prompt_parts.append("\n---\n")
+            init_prompt_parts.append(seat_md)
+
+        init_prompt_parts.append("\n---\n")
+        init_prompt_parts.append("""
+**分析要求**：
+1. 从汇总数据中找出 2-4 只资金博弈最激烈的股票。
+2. 使用工具函数查询这些股票的席位明细、异常形态等深度数据。
+3. 结合查询结果，给出每只股票的资金博弈解读和次日走势预判。
+4. 最终按 Agent 深度挖掘的格式输出完整分析。
+
+**可用的工具**：
+- `query_seat_details`: 查询席位买卖明细（机构/游资/量化/散户的买卖金额和排名）
+- `query_record_detail`: 查询上榜详情（净买额/涨跌幅/买卖比/上榜原因）
+- `query_abnormal_patterns`: 查询异常形态（涨停板出货/跌停接筹/对倒等）
+- `query_industry`: 查询行业分类
+
+开始分析吧。""")
+
+        initial_prompt = "\n".join(init_prompt_parts)
+
+        # ---- 运行 Agent ----
+        agent = LLMAgent(config, tools=tools)
+        log.info("Agent: 开始龙虎榜深度挖掘...")
+        result = agent.run(initial_prompt)
+
+        if result and "Agent 未启用" not in result:
+            log.info("Agent: 挖掘完成")
+            return result
+        return None
+
+    except ImportError as e:
+        log.debug(f"Agent 依赖缺失: {e}")
+        return None
+    except Exception as e:
+        log.error(f"Agent 挖掘失败: {e}")
+        return None
 
 
 if __name__ == "__main__":

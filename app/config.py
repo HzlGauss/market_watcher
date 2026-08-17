@@ -224,7 +224,7 @@ class Config:
         """A股交易时段配置"""
         return self._raw.get("盯盘设置", {}).get("A股交易时段", {
             "上午": ["09:30", "11:30"],
-            "下午": ["13:00", "15:00"]
+            "下午": ["13:00", "15:30"]
         })
 
     # ---- 动态阈值 ----
@@ -307,6 +307,28 @@ class Config:
     def llm_model(self) -> str:
         """大模型模型名称"""
         return self._raw.get("大模型分析", {}).get("模型", self.DEFAULT_LLM_MODEL)
+
+    @property
+    def llm_base_url(self) -> str:
+        """大模型请求地址（支持本地部署）"""
+        return self._raw.get("大模型分析", {}).get(
+            "请求地址",
+            os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
+        )
+
+    @property
+    def llm_api_key(self) -> str:
+        """大模型 API Key（优先从配置读取，回退到环境变量）"""
+        return self._raw.get("大模型分析", {}).get(
+            "API密钥",
+            os.environ.get("DEEPSEEK_API_KEY", "")
+        )
+
+    @property
+    def llm_verify_ssl(self) -> bool:
+        """是否验证 SSL 证书（本地部署通常关闭）"""
+        env_val = os.environ.get("LLM_VERIFY_SSL", "true").lower()
+        return self._raw.get("大模型分析", {}).get("验证SSL", env_val != "false")
 
     @property
     def dragon_tiger_llm_enabled(self) -> bool:
@@ -405,8 +427,8 @@ class Config:
 
     @property
     def deepseek_key(self) -> Optional[str]:
-        """DeepSeek API Key"""
-        return self._env("DEEPSEEK_API_KEY")
+        """DeepSeek API Key（兼容旧接口，优先用 llm_api_key）"""
+        return self.llm_api_key or self._env("DEEPSEEK_API_KEY")
 
     @property
     def sct_sendkey(self) -> Optional[str]:

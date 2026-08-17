@@ -18,6 +18,7 @@ class Color:
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
     CYAN = "\033[96m"
+    PURPLE = "\033[95m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
     RESET = "\033[0m"
@@ -35,6 +36,53 @@ def print_header() -> None:
     print(f"{'=' * 70}")
 
 
+def _format_flow_signal(q: Quote) -> str:
+    """生成资金信号标签（紧凑，用于控制台表格）"""
+    ff = q.fund_flow
+    if ff and ff.is_valid and ff.main_net is not None:
+        # 有资金明细时精准判断
+        if ff.is_institution_driven:
+            return f"{Color.CYAN}机构吸筹{Color.RESET}"
+        elif ff.is_distribution:
+            return f"{Color.PURPLE}机构出货{Color.RESET}"
+        elif ff.is_retail_driven:
+            return f"{Color.YELLOW}散户推升{Color.RESET}"
+        elif ff.main_net > 0 and q.amount and q.amount > 0 and ff.main_net / q.amount >= 0.05:
+            return f"{Color.RED}主力流入{Color.RESET}"
+        elif ff.main_net < 0 and q.amount and q.amount > 0 and abs(ff.main_net) / q.amount >= 0.05:
+            return f"{Color.GREEN}主力流出{Color.RESET}"
+        else:
+            return "  ·中性  "
+    # 没资金明细时用 main_net_inflow
+    if q.main_net_inflow is not None and q.amount and q.amount > 0:
+        pct = q.main_net_inflow / q.amount
+        if pct >= 0.1:
+            return f"{Color.RED}主力流入{Color.RESET}"
+        elif pct <= -0.1:
+            return f"{Color.GREEN}主力流出{Color.RESET}"
+        elif pct >= 0.05:
+            return "  偏多  "
+        elif pct <= -0.05:
+            return "  偏空  "
+    return f"{Color.DIM}  ----  {Color.RESET}"
+
+
+def _format_compact_flow(value: Optional[float]) -> str:
+    """紧凑格式化金额（控制台表格用）"""
+    if value is None:
+        return f"{Color.DIM}  ---  {Color.RESET}"
+    abs_v = abs(value)
+    sign = "+" if value >= 0 else "-"
+    if abs_v >= 1e8:
+        return f"{sign}{abs_v/1e8:.2f}亿"
+    elif abs_v >= 1e6:
+        return f"{sign}{abs_v/1e6:.0f}万"
+    elif abs_v >= 1e4:
+        return f"{sign}{abs_v/1e4:.1f}万"
+    else:
+        return f"{sign}{abs_v:.0f}元"
+
+
 def print_quotes_table(quotes: list[Quote]) -> None:
     """打印实时行情表格"""
     if not quotes:
@@ -42,12 +90,12 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         return
 
     header = (
-        f"{'代码':>8} {'名称':<12} {'最新价':>8} "
-        f"{'涨跌幅':>8} {'外盘':>10} {'内盘':>10} "
-        f"{'委比':>6} {'量比':>6} {'成交量':>10} {'换手率':>8} {'振幅':>7}"
+        f"{'代码':>8} {'名称':<12} {'最新价':>8} {'均价':>8} "
+        f"{'涨跌幅':>8} {'主力净流入':>10} {'资金信号':<8} "
+        f"{'委比':>6} {'量比':>6} {'换手率':>8} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 95}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 100}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -82,11 +130,24 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         else:
             vr_str = f"{Color.DIM}--{Color.RESET}"
 
-        # 外盘（主动买入）
-        bid_vol_str = format_volume(q.bid_volume) if q.bid_volume else f"{Color.DIM}--{Color.RESET}"
+        # 主力净流入（优先用 fund_flow.main_net，回退到 main_net_inflow）
+        flow_val: Optional[float] = None
+        if q.fund_flow is not None and q.fund_flow.main_net is not None:
+            flow_val = q.fund_flow.main_net
+        elif q.main_net_inflow is not None:
+            flow_val = q.main_net_inflow
 
-        # 内盘（主动卖出）
-        ask_vol_str = format_volume(q.ask_volume) if q.ask_volume else f"{Color.DIM}--{Color.RESET}"
+        if flow_val is not None:
+            flow_str = _format_compact_flow(flow_val)
+            if flow_val > 0:
+                flow_str = f"{Color.RED}{flow_str}{Color.RESET}"
+            elif flow_val < 0:
+                flow_str = f"{Color.GREEN}{flow_str}{Color.RESET}"
+        else:
+            flow_str = f"{Color.DIM}  ---  {Color.RESET}"
+
+        # 资金信号
+        sig_str = _format_flow_signal(q)
 
         # 委比
         if q.bid_ask_ratio is not None:
@@ -106,10 +167,20 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         else:
             tr_str = f"{Color.DIM}--{Color.RESET}"
 
+        # 均价（黄线）：现价与均价对比着色
+        if q.avg_price is not None and q.avg_price > 0:
+            avg_str = f"{q.avg_price:.3f}"
+            if q.price and q.price > q.avg_price * 1.01:
+                avg_str = f"{Color.RED}{avg_str}{Color.RESET}"  # 现价高于均价=偏强
+            elif q.price and q.price < q.avg_price * 0.99:
+                avg_str = f"{Color.GREEN}{avg_str}{Color.RESET}"  # 现价低于均价=偏弱
+        else:
+            avg_str = f"{Color.DIM}--{Color.RESET}"
+
         line = (
-            f"{q.code:>8} {q.name:<12} {price:>8} {cp:>8} "
-            f"{bid_vol_str:>10} {ask_vol_str:>10} "
-            f"{bar_str:>6} {vr_str:>6} {vol_str:>10} {tr_str:>8} {amp_str:>7}"
+            f"{q.code:>8} {q.name:<12} {price:>8} {avg_str:>8} {cp:>8} "
+            f"{flow_str:>10} {sig_str:<8} "
+            f"{bar_str:>6} {vr_str:>6} {tr_str:>8} {amp_str:>7}"
         )
         print(f"  {line}")
 
