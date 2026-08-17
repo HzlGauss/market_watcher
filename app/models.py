@@ -322,6 +322,33 @@ class NorthFlowData:
 
 
 @dataclass
+class MarginData:
+    """两融数据（融资融券余额，替代已停止披露的北向资金）
+
+    Attributes:
+        financing_balance: 融资余额（亿元）
+        financing_net_buy: 融资净买入（亿元，当日）
+        securities_lending_balance: 融券余额（亿元）
+        total_balance: 两融总余额（亿元）
+        date: 数据日期
+    """
+    financing_balance: float = 0.0
+    financing_net_buy: float = 0.0
+    securities_lending_balance: float = 0.0
+    total_balance: float = 0.0
+    date: str = ""
+
+    @property
+    def financing_change_direction(self) -> str:
+        """融资净买入方向"""
+        if self.financing_net_buy > 0:
+            return "融资加仓"
+        elif self.financing_net_buy < 0:
+            return "融资减仓"
+        return "持平"
+
+
+@dataclass
 class SectorBoard:
     """行业板块实时数据
 
@@ -459,7 +486,7 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
     盘中累计值是当日的，直接给 LLM 会导致每轮都判断"量能不足"。
     按已流逝交易时间比例外推到全天，收盘后直接返回实际值。
 
-    A股交易时段: 9:30-11:30 (120min) + 13:00-15:00 (120min) = 240min
+    A股交易时段: 9:30-11:30 (120min) + 13:00-15:00 (120min) + 盘后15:00-15:30 (30min) = 270min
     """
     if cumulative_amount <= 0:
         return 0.0
@@ -468,8 +495,8 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
         from datetime import datetime
         now = datetime.now()
 
-    # 收盘后 → 实际值
-    if now.hour >= 15:
+    # 收盘后（15:30 盘后结束）→ 实际值
+    if now.hour >= 16 or (now.hour == 15 and now.minute >= 30):
         return cumulative_amount
 
     # 计算已流逝的交易分钟数
@@ -478,7 +505,7 @@ def _estimate_full_day_amount(cumulative_amount: float, now: "datetime.datetime 
         return cumulative_amount  # 开盘前不推算
 
     # 线性外推
-    ratio = 240 / elapsed
+    ratio = 270 / elapsed
     estimated = round(cumulative_amount * ratio, 1)
     return max(estimated, cumulative_amount)  # 不低于累计值
 
@@ -491,12 +518,12 @@ def _trading_minutes_elapsed(t: "datetime.datetime") -> int:
     current = h * 60 + m
     morning_end = 11 * 60 + 30
     afternoon_start = 13 * 60
-    close = 15 * 60
+    close = 15 * 60 + 30  # 盘后交易到 15:30
 
     if current >= close:
-        return 240
+        return 270
     if current >= afternoon_start:
-        return 120 + min(current - afternoon_start, 120)
+        return 120 + min(current - afternoon_start, 150)
     if current >= morning_end:
         return 120
     return max(current - (9 * 60 + 30), 1)

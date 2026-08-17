@@ -128,7 +128,8 @@ class T0MonitorThread(threading.Thread):
                  data_pool: SharedDataPool,
                  interval: int = 30,
                  enable_sound: bool = True,
-                 enable_push: bool = False):
+                 enable_push: bool = False,
+                 sessions: Optional[dict] = None):
         """
         初始化做T监控线程
 
@@ -138,6 +139,7 @@ class T0MonitorThread(threading.Thread):
             interval: 扫描间隔（秒），默认30秒
             enable_sound: 是否启用声音提示
             enable_push: 是否启用微信推送
+            sessions: 交易时段配置（用于收盘后停止扫描）
         """
         super().__init__(daemon=True, name="T0Monitor")
         self._watch_items = watch_items
@@ -145,6 +147,7 @@ class T0MonitorThread(threading.Thread):
         self._interval = interval
         self._enable_sound = enable_sound
         self._enable_push = enable_push
+        self._sessions = sessions
         self._running = False
         self._last_signals: Dict[str, T0Signal] = {}
         self._last_signal_time: Dict[str, float] = {}   # 信号冷却计时
@@ -208,6 +211,15 @@ class T0MonitorThread(threading.Thread):
 
     def _scan(self):
         """扫描所有标的，识别做T信号，一轮只发一次通知"""
+        # 交易时段检查：收盘后停止扫描，避免用停更数据重复发信号
+        if self._sessions:
+            from app.helpers import is_trading_time
+            from datetime import datetime as _dt
+            in_trading, reason = is_trading_time(_dt.now(), self._sessions)
+            if not in_trading:
+                log.debug(f"T0 非交易时段({reason})，跳过扫描")
+                return
+
         if not self._data_pool.is_fresh(max_age=120):
             log.debug("数据池数据过期，跳过扫描")
             return

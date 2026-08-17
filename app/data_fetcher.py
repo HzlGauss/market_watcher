@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from datetime import datetime
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, SectorBoard
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, SectorBoard, MarginData
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -1314,4 +1314,97 @@ def fetch_index_klines(codes: list[str]) -> dict[str, list]:
             pass
     _index_klines_cache = {"_ts": now, "_data": result}
     return result
+
+
+# 两融数据缓存
+_margin_cache: dict = {"_ts": 0.0, "_data": None}
+_MARGIN_CACHE_TTL = 1800  # 30分钟（两融是日频数据）
+
+
+def fetch_margin_data(force_refresh: bool = False) -> Optional["MarginData"]:
+    """获取全市场两融数据（融资融券余额，替代已停披露的北向资金）
+
+    数据来源：上交所 + 深交所融资融券余额（AKShare）
+    日频数据，带30分钟缓存。
+
+    Returns:
+        MarginData 或 None（获取失败）
+    """
+    global _margin_cache
+    now = time.time()
+    if (not force_refresh and _margin_cache["_data"] is not None
+            and now - _margin_cache["_ts"] < _MARGIN_CACHE_TTL):
+        return _margin_cache["_data"]
+
+    try:
+        import akshare as ak
+        from datetime import datetime as _dt, timedelta
+
+        # 上交所 + 深交所两融数据（两接口签名不同）
+        end = _dt.now()
+        start = end - timedelta(days=30)
+        sh_df = ak.stock_margin_sse(start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"))
+        # 深交所接口只接受单日 date，回溯找最近有数据的一天
+        sz_df = None
+        for back in range(0, 10):
+            d = (end - timedelta(days=back)).strftime("%Y%m%d")
+            try:
+                sz_df = ak.stock_margin_szse(date=d)
+                if sz_df is not None and not sz_df.empty:
+                    break
+            except Exception:
+                continue
+        if sz_df is None:
+            sz_df = ak.stock_margin_szse()  # 默认日期兜底
+
+        # 取最新一条（两市日期可能不同，用最新的一天）
+        if sh_df.empty and sz_df.empty:
+            return _margin_cache["_data"]
+
+        # 上交所：数值单位是「元」，需除以 1e8 转亿
+        sh_latest = sh_df.iloc[-1] if not sh_df.empty else None
+        sh_prev = sh_df.iloc[-2] if len(sh_df) >= 2 else None
+        # 深交所：数值单位已是「亿元」
+        sz_latest = sz_df.iloc[-1] if (sz_df is not None and not sz_df.empty) else None
+
+        fin_bal_yi = 0.0    # 融资余额（亿）
+        prev_fin_bal_yi = 0.0
+        sec_bal_yi = 0.0    # 融券余额（亿）
+        date = ""
+
+        # 上交所（元 → 亿）
+        if sh_latest is not None:
+            fin_bal_yi += float(sh_latest.get("融资余额", 0) or 0) / 1e8
+            sec_bal_yi += float(sh_latest.get("融券余量金额", 0) or 0) / 1e8
+            if sh_prev is not None:
+                prev_fin_bal_yi += float(sh_prev.get("融资余额", 0) or 0) / 1e8
+            date = str(sh_latest.get("信用交易日期", "")) or date
+
+        # 深交所（已是亿元）
+        if sz_latest is not None:
+            fin_bal_yi += float(sz_latest.get("融资余额", 0) or 0)
+            sec_bal_yi += float(sz_latest.get("融券余额", 0) or 0)
+
+        # 融资净买入 = 上交所今日融资余额 - 昨日融资余额（深交所无历史，只取单日）
+        sh_fin_today = 0.0
+        sh_fin_prev = 0.0
+        if sh_latest is not None:
+            sh_fin_today = float(sh_latest.get("融资余额", 0) or 0) / 1e8
+        if sh_prev is not None:
+            sh_fin_prev = float(sh_prev.get("融资余额", 0) or 0) / 1e8
+        net_buy = sh_fin_today - sh_fin_prev if sh_fin_prev > 0 else 0.0
+        total = fin_bal_yi + sec_bal_yi
+
+        data = MarginData(
+            financing_balance=round(fin_bal_yi, 1),
+            financing_net_buy=round(net_buy, 1),
+            securities_lending_balance=round(sec_bal_yi, 1),
+            total_balance=round(total, 1),
+            date=date,
+        )
+        _margin_cache = {"_ts": now, "_data": data}
+        return data
+    except Exception as e:
+        log.debug(f"两融数据获取失败: {e}")
+        return _margin_cache["_data"]
 

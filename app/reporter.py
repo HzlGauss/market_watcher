@@ -239,6 +239,7 @@ def _get_holdings_tech_analysis(
         calc_kdj,
         calc_obv,
         calc_ma_alignment,
+        calc_bollinger,
         get_technical_summary,
         calc_composite_score,
         detect_market_regime,
@@ -299,6 +300,7 @@ def _get_holdings_tech_analysis(
         kdj = calc_kdj(highs, lows, closes)
         obv = calc_obv(klines)
         ma = calc_ma_alignment(klines)
+        bb = calc_bollinger(closes)
 
         # 复合评分 + 市场状态（独立 try，不影响其他数据返回）
         try:
@@ -366,6 +368,11 @@ def _get_holdings_tech_analysis(
             "obv_signal": obv.signal,
             "ma_alignment": ma.alignment,
             "ma_alignment_detail": ma.detail,
+            "bb_upper": bb.upper,
+            "bb_middle": bb.middle,
+            "bb_lower": bb.lower,
+            "bb_width": bb.width,
+            "bb_signal": bb.signal,
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
             "volume_ratio": quote.volume_ratio,
@@ -450,6 +457,16 @@ def _push_report(title: str, content: str, config: Config) -> bool:
     """Push report to WeChat via ServerChan"""
     if not config.push_enabled or not config.sct_sendkey:
         return False
+
+    # Server酱 desp 内容长度限制（约32KB），晚报最长，需截断避免推送失败
+    MAX_BYTES = 28000  # 留出余量
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_BYTES:
+        log.warning(f"报告内容过长({len(content_bytes)}字节)，截断到{MAX_BYTES}字节后推送")
+        # 优先保留开头（数据区）和结尾（AI分析摘要），截掉中间
+        head = content_bytes[: MAX_BYTES // 2].decode("utf-8", errors="ignore")
+        tail = content_bytes[-MAX_BYTES // 2:].decode("utf-8", errors="ignore")
+        content = head + "\n\n...[中间内容已截断]...\n\n" + tail
 
     try:
         url = f"/{config.sct_sendkey}.send"
@@ -537,6 +554,13 @@ def generate_morning_brief(config: Config) -> Path | None:
         for n in morning_news:
             cat = f" [{n.category}]" if n.category else ""
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
+
+    # 妙想增强：早间要闻补充
+    from app.miaoxiang import fetch_news_for_report
+    mx_morning_news = fetch_news_for_report(config, "今日A股早间要闻 政策 利好 风险")
+    if mx_morning_news:
+        data_lines.append(f"\n## 二·五、📰 妙想要闻")
+        data_lines.append(mx_morning_news)
 
     if quotes:
         # 使用全部标的（持仓+自选）计算情绪评分
@@ -800,6 +824,13 @@ def generate_midday_review(config: Config) -> Path | None:
             cat = f" [{n.category}]" if n.category else ""
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
 
+    # 妙想增强：上午盘面要闻
+    from app.miaoxiang import fetch_news_for_report
+    mx_midday_news = fetch_news_for_report(config, "上午A股盘面 热点板块 异动 原因")
+    if mx_midday_news:
+        data_lines.append(f"\n## 一·五、📰 妙想上午要闻")
+        data_lines.append(mx_midday_news)
+
     data_lines.append(f"\n## 二、行情概览")
     data_lines.append(f"- 情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
     data_lines.append(f"- 涨/跌/平: {stats.up} / {stats.down} / {stats.flat}")
@@ -855,8 +886,8 @@ def generate_midday_review(config: Config) -> Path | None:
     if tech_data:
         data_lines.append("\n## 六、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
-        data_lines.append("|------|------|------|--------|------|------|-----|------|-----|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | 布林(上/中/下) | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|------|--------|------|------|--------------|-----|------|-----|-----|--------|--------|")
         for t in tech_data:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             avg_p_val = t.get('avg_price')
@@ -875,7 +906,12 @@ def generate_midday_review(config: Config) -> Path | None:
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
             vr_val = t.get('volume_ratio')
             vr_str = f"{vr_val:.1f}" if vr_val is not None and vr_val > 0 else "--"
-            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
+            # 布林三轨
+            bb_u = t.get('bb_upper')
+            bb_m = t.get('bb_middle')
+            bb_l = t.get('bb_lower')
+            bb_str = f"{bb_u:.3f}/{bb_m:.3f}/{bb_l:.3f}" if bb_u and bb_m and bb_l else "--"
+            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {bb_str} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals:
         data_lines.append(f"\n## 七、⭐ 组合策略信号（多指标共振，下午操作参考）")
@@ -906,6 +942,12 @@ def generate_midday_review(config: Config) -> Path | None:
     if key_level_mid_md:
         data_lines.append(f"\n## 十一、🎯 关键位动态行为")
         data_lines.append(key_level_mid_md)
+
+    # 盘中复盘（上午半日）
+    intraday_mid_md, intraday_mid_llm = _format_intraday_evolution(holdings)
+    if intraday_mid_md:
+        data_lines.append(f"\n## 十二、📈 盘中复盘（上午）")
+        data_lines.append(intraday_mid_md)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -993,6 +1035,9 @@ def generate_midday_review(config: Config) -> Path | None:
 
     if vol_mid_llm:
         llm_lines.append(f"\n{vol_mid_llm}")
+
+    if intraday_mid_llm:
+        llm_lines.append(f"\n[盘中复盘] {intraday_mid_llm}")
 
     if sector_llm_mid:
         llm_lines.append("\n[📈 大盘及行业板块（午间实时）]")
@@ -1194,6 +1239,137 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     llm_parts.append(f"流出前3: {top_out_str}")
 
     return md, "\n".join(llm_parts)
+
+
+def _format_intraday_evolution(holdings: list[Holding]) -> tuple[str, str]:
+    """从盯盘落盘的日内序列生成盘中复盘，返回 (Markdown, LLM紧凑文本)
+
+    数据源：
+    - state/intraday_series.json: 每标的的价格/资金流/量比时间序列
+    - state/scan_history.json: 市场情绪演变
+    """
+    import json
+    from pathlib import Path as _P
+
+    state_dir = _P(__file__).resolve().parent.parent / "state"
+    series_path = state_dir / "intraday_series.json"
+    history_path = state_dir / "scan_history.json"
+
+    md_lines = []
+    llm_parts = []
+
+    # 1. 市场情绪演变
+    if history_path.exists():
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                hist = json.load(f)
+            if hist:
+                md_lines.append("### 盘中情绪演变")
+                md_lines.append("| 时间 | 情绪评分 | 涨/跌/平 | 告警数 |")
+                md_lines.append("|------|---------|---------|--------|")
+                for h in hist[-8:]:
+                    sent = h.get("market_sentiment", {})
+                    score = sent.get("score", "--")
+                    label = sent.get("label", "")
+                    alerts_sum = h.get("alerts_summary", {})
+                    if isinstance(alerts_sum, dict):
+                        alert_n = alerts_sum.get("total_alerts", alerts_sum.get("critical_alerts", 0))
+                    else:
+                        alert_n = 0
+                    t = h.get("time") or "--"
+                    if t == "--":
+                        # 时间字段空时从 timestamp 提取
+                        ts = h.get("timestamp", "")
+                        if isinstance(ts, (int, float)):
+                            from datetime import datetime as _dt2
+                            t = _dt2.fromtimestamp(ts).strftime("%H:%M")
+                        elif isinstance(ts, str) and len(ts) >= 16:
+                            t = ts[11:16]
+                    md_lines.append(f"| {t} | {score}({label}) | -- | {alert_n} |")
+                md_lines.append("")
+                if hist:
+                    first_score = hist[0].get("market_sentiment", {}).get("score", 50)
+                    last_score = hist[-1].get("market_sentiment", {}).get("score", 50)
+                    trend = "走强" if last_score > first_score else ("走弱" if last_score < first_score else "平稳")
+                    llm_parts.append(f"[情绪演变] {first_score}→{last_score} ({trend})")
+        except Exception:
+            pass
+
+    # 1.5 两融数据（替代已停止披露的北向资金）
+    from app.data_fetcher import fetch_margin_data
+    margin_data = fetch_margin_data()
+    if margin_data and margin_data.financing_balance > 0:
+        md_lines.append("### 两融数据（替代北向资金）")
+        md_lines.append("| 指标 | 数值 |")
+        md_lines.append("|------|------|")
+        md_lines.append(f"| 融资余额 | {margin_data.financing_balance:.1f}亿 |")
+        md_lines.append(f"| 融资净买入 | {margin_data.financing_net_buy:+.1f}亿 ({margin_data.financing_change_direction}) |")
+        md_lines.append(f"| 融券余额 | {margin_data.securities_lending_balance:.1f}亿 |")
+        md_lines.append(f"| 两融总余额 | {margin_data.total_balance:.1f}亿 |")
+        md_lines.append(f"| 数据日期 | {margin_data.date} |")
+        md_lines.append("")
+        llm_parts.append(
+            f"[两融] 融资余额{margin_data.financing_balance:.0f}亿,"
+            f"净买入{margin_data.financing_net_buy:+.1f}亿({margin_data.financing_change_direction})"
+        )
+
+    # 2. 持仓分时特征（价格/资金流轨迹）
+    if series_path.exists():
+        try:
+            with open(series_path, "r", encoding="utf-8") as f:
+                series = json.load(f)
+            stocks = series.get("stocks", {})
+            holding_codes = {h.code for h in holdings}
+            md_lines.append("### 持仓分时特征")
+            md_lines.append("| 标的 | 首价 | 最高 | 最低 | 尾价 | 资金流(万) | 分时形态 |")
+            md_lines.append("|------|------|------|------|------|-----------|---------|")
+            intraday_llm = []
+            for code, data in stocks.items():
+                if code not in holding_codes:
+                    continue
+                tl = data.get("timeline", [])
+                if len(tl) < 2:
+                    continue
+                prices = [p.get("price") for p in tl if p.get("price")]
+                flows = [p.get("fund_flow", 0) for p in tl if p.get("fund_flow") is not None]
+                if not prices:
+                    continue
+                first_p, last_p = prices[0], prices[-1]
+                high_p, low_p = max(prices), min(prices)
+                flow_sum = sum(flows) if flows else 0
+                # 分时形态判断（涨幅 + 收盘在日内振幅中的位置）
+                change_pct = (last_p - first_p) / first_p * 100 if first_p > 0 else 0
+                if high_p > low_p:
+                    close_pos = (last_p - low_p) / (high_p - low_p) * 100  # 0=最低,100=最高
+                else:
+                    close_pos = 50
+
+                if abs(change_pct) < 0.3:  # 涨跌幅太小，本质是窄幅震荡
+                    shape = "窄幅震荡"
+                elif change_pct > 0 and close_pos >= 75:  # 明显上涨且收盘在高位
+                    shape = "单边上涨"
+                elif change_pct < 0 and close_pos <= 25:  # 明显下跌且收盘在低位
+                    shape = "单边下跌"
+                elif change_pct > 0 and close_pos < 50:  # 涨了但收盘在中低位（冲高回落）
+                    shape = "冲高回落"
+                elif change_pct < 0 and close_pos > 50:  # 跌了但收盘在中高位（探底回升）
+                    shape = "探底回升"
+                else:
+                    shape = "震荡"
+                md_lines.append(
+                    f"| {data.get('name', code)}({code}) | {first_p:.3f} | {high_p:.3f} | {low_p:.3f} "
+                    f"| {last_p:.3f} | {flow_sum:+.0f} | {shape} |"
+                )
+                intraday_llm.append(f"{data.get('name', code)}({shape},资金{flow_sum:+.0f}万)")
+            md_lines.append("")
+            if intraday_llm:
+                llm_parts.append(f"[分时特征] {'; '.join(intraday_llm[:6])}")
+        except Exception:
+            pass
+
+    if not md_lines:
+        return "", ""
+    return "\n".join(md_lines) + "\n", "\n".join(llm_parts)
 
 
 def _format_composite_scoring(tech_data: list[dict]) -> tuple[str, str]:
@@ -1454,6 +1630,9 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
     vol_ratio = None
     if prev_volume and prev_volume > 0 and volume > 0:
         vol_ratio = volume / prev_volume
+    # 回退：使用腾讯 API 的量比（今日量 vs 近5日均量）
+    if vol_ratio is None and quote.volume_ratio and quote.volume_ratio > 0:
+        vol_ratio = quote.volume_ratio
 
     VOL_EXPANSION_THRESHOLD = 1.5
     VOL_SHRINK_THRESHOLD = 0.6
@@ -1483,13 +1662,13 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
         amp_high = 1.0 if is_index else (1.5 if is_etf else 4.0)
         amp_low = 0.3 if is_index else (0.6 if is_etf else 1.5)
         if change_pct > pct_high and amplitude > amp_high:
-            signals.append("振幅较大上涨，疑似放量（无历史数据）")
+            signals.append("振幅较大上涨，疑似放量")
         elif change_pct > pct_high * 0.7 and amplitude < amp_low:
-            signals.append("振幅较小上涨，疑似缩量（无历史数据）")
+            signals.append("振幅较小上涨，疑似缩量")
         elif change_pct < -pct_high and amplitude > amp_high:
-            signals.append("振幅较大下跌，疑似放量（无历史数据）")
+            signals.append("振幅较大下跌，疑似放量")
         elif change_pct < -pct_high * 0.7 and amplitude < amp_low:
-            signals.append("振幅较小下跌，疑似缩量（无历史数据）")
+            signals.append("振幅较小下跌，疑似缩量")
 
     if position > 80 and change_pct > pct_high * 0.7:
         if signals and "放量" in signals[0]:
@@ -1759,9 +1938,10 @@ def _format_market_sector_section(
 
     # 大盘指数技术面分析
     from app.data_fetcher import fetch_index_klines
-    idx_codes = ["000001", "399001", "399006", "000688"]
+    idx_codes = ["000001", "399001", "399006", "000688", "000300", "000905", "000852"]
     idx_klines_map = fetch_index_klines(idx_codes)
-    idx_name_map = {"000001": "上证", "399001": "深证", "399006": "创业板", "000688": "科创50"}
+    idx_name_map = {"000001": "上证", "399001": "深证", "399006": "创业板", "000688": "科创50",
+                    "000300": "沪深300", "000905": "中证500", "000852": "中证1000"}
     if idx_klines_map:
         from app.technical import get_technical_summary
         md_lines.append("### 大盘指数技术面")
@@ -1776,16 +1956,21 @@ def _format_market_sector_section(
             name = idx_name_map.get(code, code)
             price = f"{kls[-1].close:.0f}" if kls[-1].close and kls[-1].close > 100 else f"{kls[-1].close:.2f}" if kls[-1].close else "--"
             ma = tech.ma_alignment or "--"
-            ma20_dist = f"{(tech.ma5 or 0):.0f}"  # simplified
+            # 距MA20
+            ma20_str = "--"
+            if tech.ma20 and kls[-1].close:
+                dist = (kls[-1].close - tech.ma20) / tech.ma20 * 100
+                ma20_str = f"{dist:+.1f}%"
             rsi_str = f"{tech.rsi:.0f}" if tech.rsi else "--"
             macd_str = tech.macd_signal or "--"
-            sup = tech.support or "--"
-            res = tech.resistance or "--"
+            # 强支撑/强压力（取主支撑/主压力，或摆动点）
+            sup_str = f"{tech.support:.0f}" if tech.support and tech.support > 100 else (f"{tech.support:.2f}" if tech.support else "--")
+            res_str = f"{tech.resistance:.0f}" if tech.resistance and tech.resistance > 100 else (f"{tech.resistance:.2f}" if tech.resistance else "--")
             from app.technical import detect_market_regime
             reg = detect_market_regime(tech, kls[-1].close or 0, tech.atr)
             status = reg.regime or "--"
-            md_lines.append(f"| {name} | {price} | {ma} | -- | {rsi_str} | {macd_str} | -- | -- | {status} |")
-            idx_llm.append(f"{name}({ma},{rsi_str},{macd_str},{reg.regime})")
+            md_lines.append(f"| {name} | {price} | {ma} | {ma20_str} | {rsi_str} | {macd_str} | {sup_str} | {res_str} | {status} |")
+            idx_llm.append(f"{name}({ma},{ma20_str},{rsi_str},{macd_str},{sup_str}/{res_str})")
         md_lines.append("")
         if idx_llm:
             llm_parts.append(f"[大盘技术] {' '.join(idx_llm)}")
@@ -1800,8 +1985,22 @@ def _format_market_sector_section(
             holding_industries[ind] = []
         holding_industries[ind].append(q)
 
-    # 板块涨跌映射（持仓归位 + 一致性分析共用）
-    sector_chg_map = {sb.name: sb.change_pct for sb in sector_boards} if sector_boards else {}
+    # 板块涨跌映射（支持模糊匹配：ETF行业名 vs 东方财富板块名）
+    sector_chg_map: dict[str, Optional[float]] = {}
+    if sector_boards:
+        board_names = {sb.name: sb.change_pct for sb in sector_boards}
+        for ind in set(q.industry for q in quotes if q.industry):
+            if not ind:
+                continue
+            # 精确匹配
+            if ind in board_names:
+                sector_chg_map[ind] = board_names[ind]
+                continue
+            # 模糊匹配：板块名包含行业名 或 行业名包含板块名
+            for bname, bchg in board_names.items():
+                if ind in bname or bname in ind:
+                    sector_chg_map[ind] = bchg
+                    break
 
     if holding_industries:
         md_lines.append("### 持仓板块归位")
@@ -2792,6 +2991,7 @@ def generate_evening_review(config: Config) -> Path | None:
 
     h_results, total_pnl, total_cost = _holdings_summary(holdings, quotes)
     vol_llm = ""  # 量能分析 LLM 紧凑文本（在 h_results 块中填充）
+    intraday_llm = ""  # 盘中复盘 LLM 紧凑文本
     if h_results:
         holdings_with_analysis = []
         for h in h_results:
@@ -2885,6 +3085,12 @@ def generate_evening_review(config: Config) -> Path | None:
             data_lines.append(f"\n### 3.4 量能分析")
             data_lines.append(vol_md)
 
+        # 盘中复盘（盯盘落盘的日内序列）
+        intraday_md, intraday_llm = _format_intraday_evolution(holdings)
+        if intraday_md:
+            data_lines.append(f"\n### 3.5 盘中复盘")
+            data_lines.append(intraday_md)
+
     # Technical analysis for holdings
     tech_data_evening = _get_holdings_tech_analysis(holdings, quotes)
     strategy_signals_evening = _get_holdings_strategy_signals(holdings, quotes)
@@ -2898,8 +3104,8 @@ def generate_evening_review(config: Config) -> Path | None:
     if tech_data_evening:
         data_lines.append("\n## 七、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
-        data_lines.append("|------|------|------|--------|------|------|-----|------|-----|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | 布林(上/中/下) | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
+        data_lines.append("|------|------|------|--------|------|------|--------------|-----|------|-----|-----|--------|--------|")
         for t in tech_data_evening:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             avg_p_val = t.get('avg_price')
@@ -2918,7 +3124,11 @@ def generate_evening_review(config: Config) -> Path | None:
             tr = f"{t['turnover']:.2f}%" if t.get('turnover') else "--"
             vr_val = t.get('volume_ratio')
             vr_str = f"{vr_val:.1f}" if vr_val is not None and vr_val > 0 else "--"
-            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
+            bb_u = t.get('bb_upper')
+            bb_m = t.get('bb_middle')
+            bb_l = t.get('bb_lower')
+            bb_str = f"{bb_u:.3f}/{bb_m:.3f}/{bb_l:.3f}" if bb_u and bb_m and bb_l else "--"
+            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {bb_str} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
 
     if strategy_signals_evening:
         data_lines.append(f"\n## 八、⭐ 组合策略信号（多指标共振，明日操作参考）")
@@ -3067,6 +3277,24 @@ def generate_evening_review(config: Config) -> Path | None:
                 )
             data_lines.append("")
 
+    # 妙想增强：今日市场消息面 + 持仓逐个消息 + 智能选股
+    from app.miaoxiang import fetch_news_for_report, fetch_stock_screen_for_report, fetch_holdings_news
+
+    mx_news = fetch_news_for_report(config, "今日A股收盘 大盘走势 异动原因 重要政策")
+    if mx_news:
+        data_lines.append(f"\n## 十五、📰 今日市场消息面（妙想）")
+        data_lines.append(mx_news)
+
+    mx_holdings_news = fetch_holdings_news(config, holdings, quotes)
+    if mx_holdings_news:
+        data_lines.append(f"\n## 十六、📌 持仓消息面（妙想逐个检索）")
+        data_lines.append(mx_holdings_news)
+
+    mx_screen = fetch_stock_screen_for_report(config, "今日涨幅超过3%且主力资金净流入的股票")
+    if mx_screen:
+        data_lines.append(f"\n## 十七、🧠 妙想智能选股（建仓参考）")
+        data_lines.append(mx_screen)
+
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
     # 3. Build LLM prompt (compact)
@@ -3074,6 +3302,17 @@ def generate_evening_review(config: Config) -> Path | None:
         f"今日收盘。时间是 {datetime.now().strftime('%Y-%m-%d %H:%M')}，"
         f"请生成一份围绕个人持仓的晚报。"
     ]
+
+    # 妙想消息面注入 LLM
+    if mx_news:
+        llm_lines.append("\n[妙想今日消息面]")
+        llm_lines.append(mx_news[:1500])
+    if mx_holdings_news:
+        llm_lines.append("\n[持仓消息面（妙想）]")
+        llm_lines.append(mx_holdings_news[:2500])
+    if mx_screen:
+        llm_lines.append("\n[妙想智能选股]")
+        llm_lines.append(mx_screen[:1000])
 
     if day_news:
         llm_lines.append("\n[盘中快讯]")
@@ -3139,6 +3378,9 @@ def generate_evening_review(config: Config) -> Path | None:
 
     if vol_llm:
         llm_lines.append(f"\n{vol_llm}")
+
+    if intraday_llm:
+        llm_lines.append(f"\n[盘中复盘] {intraday_llm}")
 
     if gap_bo_llm:
         llm_lines.append(f"\n{gap_bo_llm}")
