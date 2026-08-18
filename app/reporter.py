@@ -524,6 +524,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     # 1. Fetch data
     from app.data_fetcher import fetch_global_markets, fetch_market_news
     global_data = fetch_global_markets()
+    # 妙想优先获取早间要闻，新浪兜底
+    from app.miaoxiang import fetch_news_for_report
+    mx_morning_news = fetch_news_for_report(config, "今日A股早间要闻 政策 利好 风险")
     morning_news = fetch_market_news(start_hour=0, end_hour=9, max_count=15)
     all_items = _get_unique_items(config)
     quotes = fetch_quotes_rich(all_items)
@@ -549,18 +552,14 @@ def generate_morning_brief(config: Config) -> Path | None:
         for k, v in global_data.items():
             data_lines.append(f"- {k}: {v}")
 
-    if morning_news:
+    if mx_morning_news:
+        data_lines.append("\n## 二、早间要闻（妙想）")
+        data_lines.append(mx_morning_news)
+    elif morning_news:
         data_lines.append("\n## 二、早间要闻（供参考）")
         for n in morning_news:
             cat = f" [{n.category}]" if n.category else ""
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
-
-    # 妙想增强：早间要闻补充
-    from app.miaoxiang import fetch_news_for_report
-    mx_morning_news = fetch_news_for_report(config, "今日A股早间要闻 政策 利好 风险")
-    if mx_morning_news:
-        data_lines.append(f"\n## 二·五、📰 妙想要闻")
-        data_lines.append(mx_morning_news)
 
     if quotes:
         # 使用全部标的（持仓+自选）计算情绪评分
@@ -647,7 +646,10 @@ def generate_morning_brief(config: Config) -> Path | None:
         for k, v in global_data.items():
             llm_lines.append(f"  {k}: {v}")
 
-    if morning_news:
+    if mx_morning_news:
+        llm_lines.append("\n[早间要闻（妙想）]")
+        llm_lines.append(mx_morning_news[:1500])
+    elif morning_news:
         llm_lines.append("\n[早间要闻]")
         for n in morning_news:
             llm_lines.append(f"  [{n.time}] {n.title}")
@@ -813,23 +815,22 @@ def generate_midday_review(config: Config) -> Path | None:
     from app.data_fetcher import fetch_market_breadth
     _, stats = analyze(all_quotes, {}, config, market_breadth=fetch_market_breadth())
     from app.data_fetcher import fetch_market_news
+    # 妙想优先获取上午快讯，新浪兜底
+    from app.miaoxiang import fetch_news_for_report
+    mx_midday_news = fetch_news_for_report(config, "上午A股盘面 热点板块 异动 原因")
     morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
 
     # 2. Build data section
     data_lines = []
 
-    if morning_news:
+    if mx_midday_news:
+        data_lines.append("## 一、上午快讯（妙想）")
+        data_lines.append(mx_midday_news)
+    elif morning_news:
         data_lines.append("## 一、上午快讯（供参考）")
         for n in morning_news:
             cat = f" [{n.category}]" if n.category else ""
             data_lines.append(f"- [{n.time}]{cat} {n.title}")
-
-    # 妙想增强：上午盘面要闻
-    from app.miaoxiang import fetch_news_for_report
-    mx_midday_news = fetch_news_for_report(config, "上午A股盘面 热点板块 异动 原因")
-    if mx_midday_news:
-        data_lines.append(f"\n## 一·五、📰 妙想上午要闻")
-        data_lines.append(mx_midday_news)
 
     data_lines.append(f"\n## 二、行情概览")
     data_lines.append(f"- 情绪评分: {stats.sentiment.score}/100 ({stats.sentiment.label})")
@@ -957,7 +958,10 @@ def generate_midday_review(config: Config) -> Path | None:
         f"请生成一份A股午评报告。"
     ]
 
-    if morning_news:
+    if mx_midday_news:
+        llm_lines.append("\n[上午快讯（妙想）]")
+        llm_lines.append(mx_midday_news[:1500])
+    elif morning_news:
         llm_lines.append("\n[上午快讯]")
         for n in morning_news:
             llm_lines.append(f"  [{n.time}] {n.title}")
@@ -1167,6 +1171,11 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                     "均衡": "⚪ 均衡",
                 }
                 sig = sig_map.get(sig, sig)
+                # 附加拆单信号
+                from app.analyzer import detect_split_order
+                split = detect_split_order(ff, q.amount or 0, q.change_pct)
+                if split:
+                    sig = f"{sig} {split}"
             else:
                 sl_str = lg_str = md_str = sm_str = "--"
                 sig = "⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出")
@@ -2934,6 +2943,9 @@ def generate_evening_review(config: Config) -> Path | None:
         pass
 
     from app.data_fetcher import fetch_market_news
+    # 妙想优先获取盘中快讯，新浪兜底
+    from app.miaoxiang import fetch_news_for_report
+    mx_day_news = fetch_news_for_report(config, "今日A股收盘 重要新闻 政策 影响")
     day_news = fetch_market_news(start_hour=9, end_hour=16, max_count=10)
 
     # 获取龙虎榜数据
@@ -2953,7 +2965,10 @@ def generate_evening_review(config: Config) -> Path | None:
     # 2. Build data section
     data_lines = []
 
-    if day_news:
+    if mx_day_news:
+        data_lines.append("## 一、盘中快讯（妙想）")
+        data_lines.append(mx_day_news)
+    elif day_news:
         data_lines.append("## 一、盘中快讯（供参考）")
         for n in day_news:
             cat = f" [{n.category}]" if n.category else ""
@@ -3277,22 +3292,17 @@ def generate_evening_review(config: Config) -> Path | None:
                 )
             data_lines.append("")
 
-    # 妙想增强：今日市场消息面 + 持仓逐个消息 + 智能选股
-    from app.miaoxiang import fetch_news_for_report, fetch_stock_screen_for_report, fetch_holdings_news
-
-    mx_news = fetch_news_for_report(config, "今日A股收盘 大盘走势 异动原因 重要政策")
-    if mx_news:
-        data_lines.append(f"\n## 十五、📰 今日市场消息面（妙想）")
-        data_lines.append(mx_news)
+    # 妙想增强：持仓逐个消息 + 智能选股（盘中快讯已在"一"用妙想）
+    from app.miaoxiang import fetch_stock_screen_for_report, fetch_holdings_news
 
     mx_holdings_news = fetch_holdings_news(config, holdings, quotes)
     if mx_holdings_news:
-        data_lines.append(f"\n## 十六、📌 持仓消息面（妙想逐个检索）")
+        data_lines.append(f"\n## 十五、📌 持仓消息面（妙想逐个检索）")
         data_lines.append(mx_holdings_news)
 
     mx_screen = fetch_stock_screen_for_report(config, "今日涨幅超过3%且主力资金净流入的股票")
     if mx_screen:
-        data_lines.append(f"\n## 十七、🧠 妙想智能选股（建仓参考）")
+        data_lines.append(f"\n## 十六、🧠 妙想智能选股（建仓参考）")
         data_lines.append(mx_screen)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
@@ -3304,9 +3314,6 @@ def generate_evening_review(config: Config) -> Path | None:
     ]
 
     # 妙想消息面注入 LLM
-    if mx_news:
-        llm_lines.append("\n[妙想今日消息面]")
-        llm_lines.append(mx_news[:1500])
     if mx_holdings_news:
         llm_lines.append("\n[持仓消息面（妙想）]")
         llm_lines.append(mx_holdings_news[:2500])
@@ -3314,7 +3321,10 @@ def generate_evening_review(config: Config) -> Path | None:
         llm_lines.append("\n[妙想智能选股]")
         llm_lines.append(mx_screen[:1000])
 
-    if day_news:
+    if mx_day_news:
+        llm_lines.append("\n[盘中快讯（妙想）]")
+        llm_lines.append(mx_day_news[:1500])
+    elif day_news:
         llm_lines.append("\n[盘中快讯]")
         for n in day_news:
             llm_lines.append(f"  [{n.time}] {n.title}")

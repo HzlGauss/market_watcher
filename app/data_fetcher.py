@@ -299,7 +299,11 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
         # 兼容旧格式：直接取顶层 f52
         return _parse_float(data["data"].get("f52"))
     except Exception:
-        return None  # 静默失败
+        pass  # 静默失败，走新浪兜底
+
+    # 东方财富断连，回退到新浪
+    sina_flow = _fetch_fund_flow_sina(code, market)
+    return sina_flow.main_net if sina_flow else None
 
 
 def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
@@ -360,6 +364,52 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
         if flow.main_net is None and flow.super_large_net is None:
             return None
         return flow
+    except Exception:
+        pass  # 静默失败，走新浪兜底
+
+    # 东方财富断连，回退到新浪资金流
+    return _fetch_fund_flow_sina(code, market)
+
+
+def _fetch_fund_flow_sina(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
+    """新浪资金流兜底（东方财富 fflow 断连时使用）
+
+    新浪接口提供：netamount(主力净流入)、r0_net(超大单净流入)。
+    不提供大单/中单/小单分类，故这些字段为 None（拆单检测无法用新浪兜底）。
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+
+    Returns:
+        FundFlowDetail 或 None（静默失败）
+    """
+    prefix = {"SH": "sh", "SZ": "sz"}.get(market, "sh")
+    sina_code = f"{prefix}{code}"
+    url = (
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"MoneyFlow.ssl_qsfx_zjlrqs?daima={sina_code}"
+    )
+    try:
+        import requests
+        resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not data or not isinstance(data, list) or not data:
+            return None
+        item = data[0]
+        main_net = _parse_float(item.get("netamount"))
+        super_large_net = _parse_float(item.get("r0_net"))
+        if main_net is None and super_large_net is None:
+            return None
+        return FundFlowDetail(
+            main_net=main_net,
+            super_large_net=super_large_net,
+            large_net=None,
+            medium_net=None,
+            small_net=None,
+        )
     except Exception:
         return None  # 静默失败
 

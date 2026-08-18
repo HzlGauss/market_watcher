@@ -87,21 +87,42 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
     # 新浪数据为空或解析失败，尝试 AKShare 兜底
     try:
         import akshare as ak
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq", start_date="", end_date="")
-        if df is not None and not df.empty:
-            df = df.tail(days).reset_index(drop=True)
-            results = []
-            for _, row in df.iterrows():
-                results.append(KlineData(
-                    date=str(row.get("日期", "")),
-                    open=_sf(row.get("开盘")),
-                    high=_sf(row.get("最高")),
-                    low=_sf(row.get("最低")),
-                    close=_sf(row.get("收盘")),
-                    volume=_sf(row.get("成交量")),
-                ))
-            if results:
-                return results
+        if scale < 240:
+            # 分钟级兜底（5分钟/15分钟等）
+            period_map = {5: "5", 15: "15", 30: "30", 60: "60"}
+            period = period_map.get(scale, "5")
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period=period)
+            if df is not None and not df.empty:
+                df = df.tail(120).reset_index(drop=True)
+                results = []
+                for _, row in df.iterrows():
+                    results.append(KlineData(
+                        date=str(row.get("时间", "")),
+                        open=_sf(row.get("开盘")),
+                        high=_sf(row.get("最高")),
+                        low=_sf(row.get("最低")),
+                        close=_sf(row.get("收盘")),
+                        volume=_sf(row.get("成交量")),
+                    ))
+                if results:
+                    return results
+        else:
+            # 日线兜底
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq", start_date="", end_date="")
+            if df is not None and not df.empty:
+                df = df.tail(days).reset_index(drop=True)
+                results = []
+                for _, row in df.iterrows():
+                    results.append(KlineData(
+                        date=str(row.get("日期", "")),
+                        open=_sf(row.get("开盘")),
+                        high=_sf(row.get("最高")),
+                        low=_sf(row.get("最低")),
+                        close=_sf(row.get("收盘")),
+                        volume=_sf(row.get("成交量")),
+                    ))
+                if results:
+                    return results
     except ImportError:
         pass
     except Exception as e:

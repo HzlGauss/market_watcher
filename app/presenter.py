@@ -40,6 +40,14 @@ def _format_flow_signal(q: Quote) -> str:
     """生成资金信号标签（紧凑，用于控制台表格）"""
     ff = q.fund_flow
     if ff and ff.is_valid and ff.main_net is not None:
+        # 优先检测拆单（更隐蔽、更有价值的信号），显示小单占比
+        from app.analyzer import detect_split_order
+        split = detect_split_order(ff, q.amount or 0, q.change_pct)
+        if split:
+            small_pct = (ff.small_net / q.amount * 100) if (ff.small_net is not None and q.amount) else 0.0
+            if "吸筹" in split:
+                return f"{Color.YELLOW}拆单吸筹{abs(small_pct):.0f}%{Color.RESET}"
+            return f"{Color.GREEN}拆单出货{abs(small_pct):.0f}%{Color.RESET}"
         # 有资金明细时精准判断
         if ff.is_institution_driven:
             return f"{Color.CYAN}机构吸筹{Color.RESET}"
@@ -91,8 +99,8 @@ def print_quotes_table(quotes: list[Quote]) -> None:
 
     header = (
         f"{'代码':>8} {'名称':<12} {'最新价':>8} {'均价':>8} "
-        f"{'涨跌幅':>8} {'主力净流入':>10} {'资金信号':<8} "
-        f"{'委比':>6} {'量比':>6} {'换手率':>8} {'振幅':>7}"
+        f"{'涨跌幅':>8} {'主力净流入':>10} {'资金信号':<14} "
+        f"{'量比':>6} {'换手率':>8} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
     print(f"{Color.DIM}{'-' * 100}{Color.RESET}")
@@ -179,8 +187,8 @@ def print_quotes_table(quotes: list[Quote]) -> None:
 
         line = (
             f"{q.code:>8} {q.name:<12} {price:>8} {avg_str:>8} {cp:>8} "
-            f"{flow_str:>10} {sig_str:<8} "
-            f"{bar_str:>6} {vr_str:>6} {tr_str:>8} {amp_str:>7}"
+            f"{flow_str:>10} {sig_str:<14} "
+            f"{vr_str:>6} {tr_str:>8} {amp_str:>7}"
         )
         print(f"  {line}")
 

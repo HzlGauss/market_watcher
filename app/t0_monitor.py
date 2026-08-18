@@ -196,6 +196,7 @@ class T0MonitorThread(threading.Thread):
 
         try:
             # 5分钟K线，取 80 根覆盖约 1.7 个交易日
+            time.sleep(0.3)  # 降低请求频率，避免 Sina 456 限频
             klines = fetch_historical_kline(item.code, item.market, days=2, scale=5)
             if klines:
                 self._klines_cache[item.code] = (klines, now)
