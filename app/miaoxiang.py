@@ -264,8 +264,51 @@ class MXClient:
             lines.append("⚠️ 未搜索到相关资讯")
             return "\n".join(lines)
 
-        lines.append(f"**资讯结果: {len(items)} 条**\n")
-        for item in items[:15]:
+        # 日期过滤：只保留最近 7 天的资讯
+        from datetime import datetime as _dt, timedelta
+        import re as _re
+
+        def _parse_date(date_str) -> Optional["_dt"]:
+            m = _re.search(r"(\d{4}-\d{2}-\d{2})", str(date_str or ""))
+            if m:
+                try:
+                    return _dt.strptime(m.group(1), "%Y-%m-%d")
+                except ValueError:
+                    pass
+            return None
+
+        cutoff = _dt.now() - timedelta(days=7)
+        recent_items = []
+        for item in items:
+            d = _parse_date(item.get("date", "") if isinstance(item, dict) else "")
+            if d is None or d >= cutoff:
+                recent_items.append(item)
+        # 无最近资讯时回退到全部（避免空结果）
+        if recent_items:
+            items = recent_items
+        # 按日期降序排列
+        items.sort(key=lambda x: _parse_date(x.get("date", "") if isinstance(x, dict) else "") or _dt.now(), reverse=True)
+
+        # 标题去重：同一事件多来源转载只保留一条
+        seen_titles = set()
+        deduped = []
+        for item in items:
+            if not isinstance(item, dict):
+                deduped.append(item)
+                continue
+            title = item.get("title") or "?"
+            if " - " in title:
+                title = title.rsplit(" - ", 1)[0]
+            # 归一化标题（去空格标点）用于相似判断
+            norm = _re.sub(r"[\s\W]", "", title)[:40]
+            if norm and norm in seen_titles:
+                continue  # 重复，跳过
+            if norm:
+                seen_titles.add(norm)
+            deduped.append(item)
+
+        lines.append(f"**资讯结果: {len(deduped)} 条（最近7天，已去重）**\n")
+        for item in deduped[:15]:
             if not isinstance(item, dict):
                 lines.append(f"  - {item}")
                 continue
@@ -405,6 +448,153 @@ def fetch_stock_screen_for_report(config, keyword: str) -> str:
         return text or ""
     except Exception as e:
         log.debug(f"妙想选股失败: {e}")
+        return ""
+
+
+def fetch_alert_news_batch(config, movers: list, max_alerts: int = 3) -> list:
+    """盯盘用：并发搜索异动标的的新闻（P0 异动消息面）
+
+    Args:
+        config: 配置对象
+        movers: [(name, code, change_pct), ...] 异动标的列表
+        max_alerts: 最多搜索的标的数
+
+    Returns:
+        [(name, code, news_text), ...] 有新闻的异动标的列表
+    """
+    if not config.mx_apikey or not movers:
+        return []
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = get_mx_client(config)
+
+    def _search(mover):
+        name, code, chg = mover
+        try:
+            text = client.fin_search_as_text(f"{name} 异动原因")
+            if text and "错误" not in text[:20]:
+                # 提取前几行
+                lines = [l for l in text.split("\n") if l.strip()][:5]
+                return (name, code, chg, "\n".join(lines))
+        except Exception as e:
+            log.debug(f"异动消息搜索失败 {name}: {e}")
+        return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_search, m) for m in movers[:max_alerts]]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=15)
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+    return results
+
+
+# 非行业板块的名称（宽基指数/ETF类别，查询返回的是日线而非实时）
+_NON_SECTOR_NAMES = {
+    "创业板", "沪深300", "中证500", "中证1000", "科创", "红利",
+    "科技", "港股", "港股科技", "港股互联网", "中概互联", "消费",
+}
+
+
+def fetch_sector_flow_scan(config, sectors: list = None) -> str:
+    """盯盘用：查询持仓所属板块涨跌幅（妙想兜底，单板块逐个查询）
+
+    Args:
+        config: 配置对象
+        sectors: 板块名列表（如 ['半导体', '银行', '证券']），空则查默认热门板块
+
+    Returns:
+        格式化的板块涨跌幅摘要，失败或无数据返回空串
+    """
+    if not config.mx_apikey:
+        return ""
+
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime as _dt
+
+    client = get_mx_client(config)
+
+    if sectors:
+        # 过滤掉宽基指数类"板块"（查询返回的是日线，非实时）
+        sectors = list(dict.fromkeys(
+            s for s in sectors if s and s not in _NON_SECTOR_NAMES
+        ))[:8]
+    if not sectors:
+        # 默认热门行业板块
+        sectors = ["半导体", "银行", "证券", "新能源", "医药", "军工", "人工智能"]
+
+    today_str = _dt.now().strftime("%Y-%m-%d")
+
+    def _query_one(sector):
+        try:
+            time.sleep(0.4)  # 降低请求频率
+            result = client.query(f"{sector}板块涨跌幅")
+            if not result:
+                return None
+            data = result.get("data") or {}
+            inner = data.get("data") or {}
+            search = inner.get("searchDataResultDTO") or {}
+            dto_list = search.get("dataTableDTOList") or []
+            if not dto_list:
+                return None
+            # 第一个 dto 通常是当前涨跌幅
+            dto = dto_list[0]
+            table = dto.get("table") or {}
+            head = table.get("headName") or []
+            # 校验数据时效：headName 必须是今天的（实时数据），否则是昨天的日线
+            if head and not str(head[0]).startswith(today_str):
+                log.debug(f"板块数据过期 {sector}: {head[0]}")
+                return None
+            for key, values in table.items():
+                if key == "headName" or not isinstance(values, list) or not values:
+                    continue
+                val = str(values[0]).replace("%", "").replace("+", "").strip()
+                try:
+                    return (sector, float(val))
+                except ValueError:
+                    continue
+            return None
+        except Exception as e:
+            log.debug(f"板块查询失败 {sector}: {e}")
+            return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_query_one, s) for s in sectors]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=20)
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    if not results:
+        return ""
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    lines = ["**持仓所属板块涨跌幅（妙想兜底）**"]
+    for sector, chg in results:
+        arrow = "涨" if chg > 0 else ("跌" if chg < 0 else "平")
+        lines.append(f"  [{arrow}] {sector}: {chg:+.2f}%")
+    return "\n".join(lines)
+
+
+def fetch_opportunity_screen(config) -> str:
+    """盯盘用：定期智能选股（P3 发现新机会）"""
+    if not config.mx_apikey:
+        return ""
+    try:
+        client = get_mx_client(config)
+        text = client.stock_screen_as_text("今日放量上涨且主力资金净流入的股票")
+        return text or ""
+    except Exception as e:
+        log.debug(f"妙想选股扫描失败: {e}")
         return ""
 
 

@@ -365,6 +365,35 @@ def analyze_sector_context(
 
     return result
 
+
+def detect_split_order(ff, amount: float, change_pct: Optional[float]) -> Optional[str]:
+    """检测疑似主力拆单行为（把小单伪装成散户，隐藏真实意图）
+
+    核心逻辑：小单持续单边流入/流出 + 大单/超大单几乎无动作 = 资金在刻意隐藏。
+
+    Args:
+        ff: FundFlowDetail 资金流明细
+        amount: 成交额（元）
+        change_pct: 涨跌幅（%）
+
+    Returns:
+        拆单信号字符串，无拆单迹象时返回 None
+    """
+    if not ff or not amount or amount <= 0:
+        return None
+
+    small_pct = (ff.small_net / amount * 100) if ff.small_net is not None else 0.0
+    big_pct = ((abs(ff.super_large_net or 0) + abs(ff.large_net or 0)) / amount * 100)
+
+    # 拆单吸筹：小单显著流入 + 大单无动作 + 温和上涨（非暴涨）
+    if small_pct >= 8 and big_pct <= 3 and change_pct is not None and 0 < change_pct < 3:
+        return f"🔍 疑似拆单吸筹(小单流入占{small_pct:.0f}%但大单仅{big_pct:.0f}%，价格温和涨{change_pct:+.1f}%)"
+    # 拆单出货：小单显著流出 + 大单无动作 + 温和下跌（非暴跌）
+    if small_pct <= -8 and big_pct <= 3 and change_pct is not None and -3 < change_pct < 0:
+        return f"🔍 疑似拆单出货(小单流出占{abs(small_pct):.0f}%但大单仅{big_pct:.0f}%，价格温和跌{change_pct:+.1f}%)"
+    return None
+
+
 def analyze(
     quotes: list[Quote],
     prev_state: dict,
@@ -592,6 +621,12 @@ def analyze(
             # 主力减仓散户接盘（下跌中继）
             if ff and ff.is_distribution and cp is not None and cp < 0:
                 items.append(f"🟠 散户接盘(超大单{ff.super_large_net/1e8:+.2f}亿,散户+{ff.small_net/1e8:.2f}亿)")
+
+            # 疑似主力拆单（把小单伪装成散户，隐藏真实意图）
+            split_signal = detect_split_order(ff, q.amount or 0, cp)
+            if split_signal:
+                items.append(split_signal)
+                alert_count += 1
 
         # ---- 拥挤度预警（多指标同时极端 = 反转概率高） ----
         crowd_signals = 0

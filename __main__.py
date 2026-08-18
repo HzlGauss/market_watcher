@@ -633,6 +633,14 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards
     enrich_quotes_with_industry(quotes)
     sector_boards = fetch_sector_boards()  # 5分钟缓存
+    # P1 数据兜底：板块数据为空时用妙想查询持仓所属板块
+    mx_sector_fallback = ""
+    if not sector_boards:
+        from app.miaoxiang import fetch_sector_flow_scan
+        sector_names = [q.industry for q in quotes if q.industry]
+        mx_sector_fallback = fetch_sector_flow_scan(config, sector_names)
+        if mx_sector_fallback:
+            log.info("板块数据源失败，已用妙想兜底")
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -831,6 +839,12 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                     emoji = "🔥" if info.get("relative_strength", 0) > 0 else "❄️"
                     print(f"  {emoji} {q.name}({q.code}): {info['label']} [{info.get('sector', '')}]")
         print()
+    elif mx_sector_fallback:
+        # 妙想兜底的板块数据展示
+        from app.presenter import Color
+        print(f"{Color.BOLD}{Color.CYAN}═══ 行业板块（妙想兜底）═══{Color.RESET}")
+        print(mx_sector_fallback)
+        print()
 
     # Fetch market breadth data (cached, 5-min TTL)
     from app.data_fetcher import fetch_market_breadth
@@ -853,6 +867,34 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # Print sentiment and alerts（只展示行情/资金/技术异动，不含策略信号）
     print_sentiment(stats)
     print_alerts(alerts)
+
+    # P0 异动消息面：大涨大跌标的实时搜妙想新闻（带冷却，避免重复）
+    _last_news_fetch = getattr(_run_once_new, '_last_news_fetch', {})
+    if alerts:
+        movers = []
+        for q in quotes:
+            if q.change_pct is not None and abs(q.change_pct) >= 2.0:
+                movers.append((q.name, q.code, q.change_pct))
+        movers.sort(key=lambda x: abs(x[2]), reverse=True)
+        # 冷却过滤：同一标的 30 分钟内不重复搜（避免反复返回同样的7天新闻）
+        movers_to_search = []
+        for name, code, chg in movers:
+            last = _last_news_fetch.get(code, 0.0)
+            if time.time() - last < 1800:
+                continue
+            movers_to_search.append((name, code, chg))
+        if movers_to_search:
+            from app.miaoxiang import fetch_alert_news_batch
+            from app.presenter import Color
+            alert_news = fetch_alert_news_batch(config, movers_to_search, max_alerts=3)
+            if alert_news:
+                print(f"{Color.BOLD}{Color.MAGENTA if hasattr(Color, 'MAGENTA') else Color.PURPLE}═══ 异动消息面（妙想） ═══{Color.RESET}")
+                for name, code, chg, news_text in alert_news:
+                    print(f"  {Color.BOLD}{name}({code}){Color.RESET} {chg:+.2f}%")
+                    print(f"  {news_text}")
+                    _last_news_fetch[code] = time.time()  # 记录搜过的时间
+                print()
+    _run_once_new._last_news_fetch = _last_news_fetch
 
     # K线形态检测（追加到告警列表）
     from app.technical import detect_candlestick_patterns
@@ -965,6 +1007,32 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         _append_intraday_series(quotes)
     except Exception:
         pass
+
+    # P2 定期市场扫描（每30分钟）+ P3 智能选股（每60分钟）
+    _last_mx_scan = getattr(_run_once_new, '_last_mx_scan', 0.0)
+    now_ts = time.time()
+    if now_ts - _last_mx_scan >= 1800:  # 30分钟
+        from app.miaoxiang import fetch_sector_flow_scan, fetch_opportunity_screen
+        from app.presenter import Color
+
+        # P2 市场扫描
+        if not sector_boards:  # 板块数据已有则不重复查
+            sector_names_p2 = [q.industry for q in quotes if q.industry]
+            sector_scan = fetch_sector_flow_scan(config, sector_names_p2)
+            if sector_scan:
+                print(f"{Color.BOLD}{Color.CYAN}═══ 板块涨跌扫描（妙想/30min） ═══{Color.RESET}")
+                print(sector_scan)
+                print()
+
+        # P3 智能选股（每60分钟）
+        if now_ts - _last_mx_scan >= 3600:
+            opp_screen = fetch_opportunity_screen(config)
+            if opp_screen:
+                print(f"{Color.BOLD}{Color.PURPLE}═══ 机会扫描（妙想选股/60min） ═══{Color.RESET}")
+                print(opp_screen)
+                print()
+
+        _run_once_new._last_mx_scan = now_ts
 
     save_brief(quotes, alerts, stats, BRIEF_DIR)
     print_tail(config.scan_interval)
