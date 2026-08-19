@@ -440,6 +440,17 @@ class Config:
         """东方财富妙想 API Key（基金深度数据用）"""
         return self._env("MX_APIKEY")
 
+    @property
+    def mx_apikey_2(self) -> Optional[str]:
+        """东方财富妙想 API Key 2（备用，与主 key 轮询使用）"""
+        return self._env("MX_APIKEY_2")
+
+    @property
+    def mx_apikeys(self) -> list[str]:
+        """所有妙想 API Key 列表（主 key + 备用 key，去重去空）"""
+        keys = [self.mx_apikey, self.mx_apikey_2]
+        return [k for k in keys if k]
+
     @staticmethod
     def _env(key: str) -> Optional[str]:
         """获取环境变量"""

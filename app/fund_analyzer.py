@@ -630,9 +630,9 @@ def _calc_benchmark_metrics(fund_returns: list[float], bench_returns: list[float
 # ============================================================
 
 def _mx_query(query: str, config: Config) -> str | None:
-    """调用 mx-data 查询东方财富深度数据"""
-    api_key = config.mx_apikey
-    if not api_key:
+    """调用 mx-data 查询东方财富深度数据（多 key 依次尝试）"""
+    api_keys = config.mx_apikeys
+    if not api_keys:
         return None
 
     import subprocess, tempfile
@@ -642,19 +642,22 @@ def _mx_query(query: str, config: Config) -> str | None:
         log.warning("mx-data 脚本未安装 (~/.workbuddy/skills/mx-data/)")
         return None
 
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            env = os.environ.copy()
-            env["MX_APIKEY"] = api_key
-            result = subprocess.run(
-                ["python", str(mx_script), query, tmp],
-                capture_output=True, text=True, timeout=30, env=env,
-            )
-            output = result.stdout + result.stderr
-            return output if "错误" not in output[:50] else None
-    except Exception as e:
-        log.warning(f"mx-data调用异常: {e}")
-        return None
+    for api_key in api_keys:
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env = os.environ.copy()
+                env["MX_APIKEY"] = api_key
+                result = subprocess.run(
+                    ["python", str(mx_script), query, tmp],
+                    capture_output=True, text=True, timeout=30, env=env,
+                )
+                output = result.stdout + result.stderr
+                if "错误" not in output[:50]:
+                    return output
+                log.warning("mx-data 返回错误，尝试下一个 key")
+        except Exception as e:
+            log.warning(f"mx-data调用异常: {e}")
+    return None
 
 
 def _fetch_mx_fund_data(funds: list[dict], config: Config) -> str:
@@ -824,7 +827,7 @@ def analyze_funds(config: Config) -> Path | None:
 
     # 4. 调用 mx-data 获取深度数据（有API Key时）
     mx_data = ""
-    if config.mx_apikey:
+    if config.mx_apikeys:
         log.info("  📡 查询东方财富深度数据（评级+持仓）...")
         mx_data = _fetch_mx_fund_data(valid_funds, config)
         if mx_data:

@@ -1443,7 +1443,7 @@ def _run_miaoxiang_menu(config: Config) -> None:
     """东方财富妙想 Skills 功能菜单（循环停留在子菜单）"""
     from app.miaoxiang import get_mx_client
 
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         print(f"\n{Color.YELLOW}⚠️ 未配置 MX_APIKEY{Color.RESET}")
         print(f"  {Color.DIM}请在 .env 文件中设置: MX_APIKEY=你的妙想API_Key{Color.RESET}")
         print(f"  {Color.DIM}获取地址: https://dl.dfcfs.com/m/itc4{Color.RESET}")

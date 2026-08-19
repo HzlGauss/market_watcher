@@ -19,28 +19,55 @@ from app.utils import log
 
 
 class MXClient:
-    """妙想 Skills 客户端"""
+    """妙想 Skills 客户端（支持多 key 轮询 + 失效自动切换）"""
 
     BASE_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw"
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self._available = bool(api_key)
+    def __init__(self, api_key=None):
+        # 兼容：接受单个字符串或列表
+        if api_key is None:
+            keys = []
+        elif isinstance(api_key, str):
+            keys = [api_key] if api_key else []
+        else:
+            keys = [k for k in api_key if k]
+        self._api_keys = keys
+        self._key_index = 0
+        self._disabled_keys = set()  # 失效/额度用尽的 key
+        self.api_key = keys[0] if keys else None  # 兼容旧代码
+        self._available = bool(keys)
 
     @property
     def available(self) -> bool:
         return self._available
 
+    def _active_keys(self) -> list:
+        """当前可用的 key 列表（排除已失效的）"""
+        return [k for k in self._api_keys if k not in self._disabled_keys]
+
+    def _next_key(self) -> Optional[str]:
+        """轮询获取下一个可用的 key"""
+        active = self._active_keys()
+        if not active:
+            return None
+        key = active[self._key_index % len(active)]
+        self._key_index += 1
+        return key
+
     def _post(self, endpoint: str, payload: dict, timeout: int = 30, retries: int = 3) -> Optional[dict]:
-        """统一 POST 请求（带频率限制重试 + 退避）"""
+        """统一 POST 请求（多 key 轮询 + 频率限制重试 + 失效切换）"""
         if not self._available:
             return None
         url = f"{self.BASE_URL}/{endpoint}"
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": self.api_key,
-        }
+
         for attempt in range(retries):
+            key = self._next_key()
+            if key is None:
+                return None
+            headers = {
+                "Content-Type": "application/json",
+                "apikey": key,
+            }
             try:
                 resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
                 resp.raise_for_status()
@@ -52,15 +79,20 @@ class MXClient:
                     log.debug(f"妙想频率限制(112)，{wait}秒后重试 ({attempt+1}/{retries})")
                     time.sleep(wait)
                     continue
-                if code == 113:  # 今日调用次数达上限
-                    log.warning("妙想今日调用次数已达上限(113)")
-                    return None
+                if code == 113:  # 该 key 今日额度用尽，禁用并切换
+                    log.warning("妙想 key 额度用尽(113)，切换到下一个 key")
+                    self._disabled_keys.add(key)
+                    continue
+                if code in (114, 116):  # key 失效
+                    log.warning("妙想 key 失效，切换到下一个")
+                    self._disabled_keys.add(key)
+                    continue
                 return result
             except requests.HTTPError as e:
                 if resp is not None and resp.status_code == 401:
-                    log.warning("妙想 API Key 无效或已失效")
-                    return None
-                # 其他 HTTP 错误也重试
+                    log.warning("妙想 key 401 失效，切换到下一个")
+                    self._disabled_keys.add(key)
+                    continue
                 if attempt < retries - 1:
                     time.sleep(2 * (attempt + 1))
                     continue
@@ -394,13 +426,13 @@ class MXClient:
 
 
 def get_mx_client(config=None) -> MXClient:
-    """获取妙想客户端单例"""
+    """获取妙想客户端单例（支持多 key 轮询）"""
     global _mx_client
-    api_key = None
+    api_keys = []
     if config is not None:
-        api_key = config.mx_apikey
-    if _mx_client is None or (api_key and _mx_client.api_key != api_key):
-        _mx_client = MXClient(api_key)
+        api_keys = config.mx_apikeys  # [主key, 备用key]
+    if _mx_client is None or (api_keys and _mx_client.api_key != api_keys[0]):
+        _mx_client = MXClient(api_keys)
     return _mx_client
 
 
@@ -414,7 +446,7 @@ def fetch_news_for_report(config, query: str) -> str:
     Returns:
         格式化的资讯文本，失败或无 key 返回空串
     """
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
     try:
         client = get_mx_client(config)
@@ -427,7 +459,7 @@ def fetch_news_for_report(config, query: str) -> str:
 
 def fetch_data_for_report(config, query: str) -> str:
     """报告用：获取妙想金融数据（静默降级，失败返回空串）"""
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
     try:
         client = get_mx_client(config)
@@ -440,7 +472,7 @@ def fetch_data_for_report(config, query: str) -> str:
 
 def fetch_stock_screen_for_report(config, keyword: str) -> str:
     """报告用：获取妙想选股结果（静默降级，失败返回空串）"""
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
     try:
         client = get_mx_client(config)
@@ -462,7 +494,7 @@ def fetch_alert_news_batch(config, movers: list, max_alerts: int = 3) -> list:
     Returns:
         [(name, code, news_text), ...] 有新闻的异动标的列表
     """
-    if not config.mx_apikey or not movers:
+    if not config.mx_apikeys or not movers:
         return []
 
     from concurrent.futures import ThreadPoolExecutor
@@ -511,7 +543,7 @@ def fetch_sector_flow_scan(config, sectors: list = None) -> str:
     Returns:
         格式化的板块涨跌幅摘要，失败或无数据返回空串
     """
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
 
     from concurrent.futures import ThreadPoolExecutor
@@ -587,7 +619,7 @@ def fetch_sector_flow_scan(config, sectors: list = None) -> str:
 
 def fetch_opportunity_screen(config) -> str:
     """盯盘用：定期智能选股（P3 发现新机会）"""
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
     try:
         client = get_mx_client(config)
@@ -610,7 +642,7 @@ def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str
     Returns:
         格式化的持仓消息面汇总，失败返回空串
     """
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         return ""
 
     from concurrent.futures import ThreadPoolExecutor

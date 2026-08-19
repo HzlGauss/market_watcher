@@ -68,12 +68,12 @@ def main():
     base = Path(__file__).resolve().parent.parent
     load_env(base)
     config = Config(base / "watchlist_config.json")
-    api_key = config.mx_apikey
-    if not api_key:
+    api_keys = config.mx_apikeys
+    if not api_keys:
         print("❌ 未配置 MX_APIKEY")
         return
-    mx = MXClient(api_key)
-    print(f"妙想客户端初始化成功（key 已配置）\n")
+    mx = MXClient(api_keys)
+    print(f"妙想客户端初始化成功（{len(api_keys)} 个 key）\n")
 
     test_query(mx)
     test_stock_screen(mx)
