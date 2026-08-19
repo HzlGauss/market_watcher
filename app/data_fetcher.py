@@ -21,6 +21,7 @@ from app.http_client import sina_client, eastmoney_client
 SINA_API = "https://hq.sinajs.cn/list="
 NORTH_FLOW_API = "https://push2.eastmoney.com/api/qt/kamt.kline/get"
 STOCK_FLOW_API = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+STOCK_FLOW_DAILY_API = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 TENCENT_API = "https://qt.gtimg.cn/q="
 
 
@@ -307,10 +308,12 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
 
 
 def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
-    """获取个股实时资金流向明细（超大单/大单/中单/小单）
+    """获取个股当日资金流向明细（超大单/大单/中单/小单）
 
-    使用东方财富 fflow/kline/get 接口，lmt=1 取最新一条数据。
-    返回 klines 数组，每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单)
+    使用东方财富 fflow/daykline/get 接口，klt=101（日线）+ lmt=1 取最新一天。
+    交易时段内返回当日实时累计值，收盘后返回当日完整数据。
+    每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单),
+              f57(主力占比),f58(小单占比),f59(中单占比),f60(大单占比),f61(超大单占比)
 
     Args:
         code: 股票代码
@@ -321,18 +324,25 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
     """
     secid = _get_secid(code, market)
     import requests
+    url = (f"{STOCK_FLOW_DAILY_API}?secid={secid}"
+           f"&fields1=f1,f2,f3,f7"
+           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+           f"&lmt=1&klt=101&ut=b2884a393a59ad64002292a3e90d46a5")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://data.eastmoney.com/",
+    }
     try:
-        resp = requests.get(
-            f"{STOCK_FLOW_API}?secid={secid}"
-            f"&fields1=f1,f2,f3"
-            f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-            f"&lmt=1&klt=1",
-            timeout=5,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://data.eastmoney.com/",
-            },
-        )
+        # 东财资金流接口易触发限频(RemoteDisconnected)，退避重试 3 次
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=5, headers=headers)
+                break
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
         if resp.status_code != 200:
             return None
         data = resp.json().get("data")
@@ -343,10 +353,14 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
         if not klines or len(klines) == 0:
             return None
 
-        # 解析最后一条 kline: 日期,f52,f53,f54,f55,f56,...
+        # 解析最后一条 kline: 日期,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61
         parts = klines[-1].split(",")
         if len(parts) < 6:
             return None
+
+        def _pct(i: int) -> Optional[float]:
+            """取第 i 列的净占比（%），越界或非法返回 None"""
+            return _parse_float(parts[i]) if len(parts) > i else None
 
         flow = FundFlowDetail(
             main_net=_parse_float(parts[1]) if len(parts) > 1 else None,           # f52 主力净流入
@@ -354,12 +368,12 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
             medium_net=_parse_float(parts[3]) if len(parts) > 3 else None,         # f54 中单
             large_net=_parse_float(parts[4]) if len(parts) > 4 else None,          # f55 大单
             super_large_net=_parse_float(parts[5]) if len(parts) > 5 else None,    # f56 超大单
-            # 占比字段在 f57-f61，当前 kline 可能不包含，暂设为 None
-            main_pct=None,
-            super_large_pct=None,
-            large_pct=None,
-            medium_pct=None,
-            small_pct=None,
+            # 直接使用东方财富提供的净占比（避免用新浪成交额二次换算造成口径不一致）
+            main_pct=_pct(6),          # f57 主力净占比
+            small_pct=_pct(7),         # f58 小单净占比
+            medium_pct=_pct(8),        # f59 中单净占比
+            large_pct=_pct(9),         # f60 大单净占比
+            super_large_pct=_pct(10),  # f61 超大单净占比
         )
         if flow.main_net is None and flow.super_large_net is None:
             return None
@@ -367,7 +381,7 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
     except Exception:
         pass  # 静默失败，走新浪兜底
 
-    # 东方财富断连，回退到新浪资金流
+    # 东方财富断连，回退到新浪资金流（新浪无小单/中单/大单分类，拆单检测会退化）
     return _fetch_fund_flow_sina(code, market)
 
 
@@ -424,11 +438,13 @@ def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
         return
 
     def _fetch_one(q: Quote) -> tuple[str, Optional[FundFlowDetail]]:
+        time.sleep(0.3)  # 降低并发请求频率，避免触发东财限频
         flow = fetch_fund_flow_detail(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
         return (q.code, flow)
 
     try:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        # 并发度降至 3：东财资金流接口对高并发敏感，过高会 RemoteDisconnected 导致回退新浪
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(_fetch_one, q) for q in quotes]
             for fut in futures:
                 try:

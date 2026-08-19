@@ -366,10 +366,19 @@ def analyze_sector_context(
     return result
 
 
+# 拆单检测阈值（可调）
+_SPLIT_SMALL_PCT = 6.0    # 小单净流入/流出占成交额比重的下限（%）
+_SPLIT_BIG_PCT = 3.0      # 大单+超大单净流入占成交额比重的上限（%，拆单时大单应接近无动作）
+_SPLIT_PRICE_MAX = 3.0    # 价格温和变动幅度上限（%，排除暴涨暴跌）
+
+
 def detect_split_order(ff, amount: float, change_pct: Optional[float]) -> Optional[str]:
     """检测疑似主力拆单行为（把小单伪装成散户，隐藏真实意图）
 
     核心逻辑：小单持续单边流入/流出 + 大单/超大单几乎无动作 = 资金在刻意隐藏。
+
+    优先使用东方财富直接提供的净占比字段（f57-f61），
+    缺失时回退到「净额 / 成交额」计算。
 
     Args:
         ff: FundFlowDetail 资金流明细
@@ -379,17 +388,32 @@ def detect_split_order(ff, amount: float, change_pct: Optional[float]) -> Option
     Returns:
         拆单信号字符串，无拆单迹象时返回 None
     """
-    if not ff or not amount or amount <= 0:
+    if not ff:
         return None
 
-    small_pct = (ff.small_net / amount * 100) if ff.small_net is not None else 0.0
-    big_pct = ((abs(ff.super_large_net or 0) + abs(ff.large_net or 0)) / amount * 100)
+    # 小单净占比（%）：优先直接字段，回退到净额/成交额
+    if ff.small_pct is not None:
+        small_pct = ff.small_pct
+    elif ff.small_net is not None and amount and amount > 0:
+        small_pct = ff.small_net / amount * 100
+    else:
+        return None
+
+    # 大单+超大单净占比（%）：拆单时大单/超大单净额接近零
+    if ff.large_pct is not None or ff.super_large_pct is not None:
+        big_pct = abs(ff.large_pct or 0) + abs(ff.super_large_pct or 0)
+    elif amount and amount > 0:
+        big_pct = (abs(ff.super_large_net or 0) + abs(ff.large_net or 0)) / amount * 100
+    else:
+        return None
 
     # 拆单吸筹：小单显著流入 + 大单无动作 + 温和上涨（非暴涨）
-    if small_pct >= 8 and big_pct <= 3 and change_pct is not None and 0 < change_pct < 3:
+    if (small_pct >= _SPLIT_SMALL_PCT and big_pct <= _SPLIT_BIG_PCT
+            and change_pct is not None and 0 < change_pct < _SPLIT_PRICE_MAX):
         return f"🔍 疑似拆单吸筹(小单流入占{small_pct:.0f}%但大单仅{big_pct:.0f}%，价格温和涨{change_pct:+.1f}%)"
     # 拆单出货：小单显著流出 + 大单无动作 + 温和下跌（非暴跌）
-    if small_pct <= -8 and big_pct <= 3 and change_pct is not None and -3 < change_pct < 0:
+    if (small_pct <= -_SPLIT_SMALL_PCT and big_pct <= _SPLIT_BIG_PCT
+            and change_pct is not None and -_SPLIT_PRICE_MAX < change_pct < 0):
         return f"🔍 疑似拆单出货(小单流出占{abs(small_pct):.0f}%但大单仅{big_pct:.0f}%，价格温和跌{change_pct:+.1f}%)"
     return None
 
