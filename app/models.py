@@ -748,6 +748,144 @@ class DragonTigerSummary:
 
 
 # ============================================================
+# 智能选股模型
+# ============================================================
+
+@dataclass
+class FundFlowDaily:
+    """
+    单日主力资金流快照（多日序列的一环）
+
+    Attributes:
+        date: 日期（YYYY-MM-DD）
+        main_net: 主力净流入（元）= 超大单 + 大单
+        large_net: 大单净流入（元），通常代表游资/私募
+        super_large_net: 超大单净流入（元），通常代表机构/国家队
+        main_pct: 主力净流入占成交额比例 (%)
+    """
+    date: str = ""
+    main_net: Optional[float] = None
+    large_net: Optional[float] = None
+    super_large_net: Optional[float] = None
+    main_pct: Optional[float] = None
+
+
+@dataclass
+class AccumulationScore:
+    """
+    主力资金「持续低吸」评分结果
+
+    核心思想：主力资金连续净流入（低吸）但股价横盘/微跌（背离），
+    意味着筹码在低位悄悄集中，行情随时可能启动。
+
+    Attributes:
+        code: 股票代码
+        name: 股票名称
+        score: 综合吸筹分（0-100），越高越像「低位吸筹待启动」
+        label: 吸筹标签（强吸筹/吸筹/中性/出货）
+        inflow_days: 窗口内主力净流入天数
+        consecutive_days: 最近连续主力净流入天数
+        total_net: 窗口累计主力净流入（元）
+        price_change_10d: 窗口股价涨跌幅（%），用于算背离度
+        divergence: 背离度（0-1），资金净流入 + 股价滞涨 → 越高越背离
+        large_ratio_rising: 大单+超大单占比近 5 日是否较前 5 日上升（机构/大户吸筹）
+        notes: 判定说明（供报告/LLM 引用）
+    """
+    code: str = ""
+    name: str = ""
+    score: float = 0.0
+    label: str = "中性"
+    inflow_days: int = 0
+    consecutive_days: int = 0
+    total_net: Optional[float] = None
+    price_change_10d: Optional[float] = None
+    divergence: Optional[float] = None
+    large_ratio_rising: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScreeningCondition:
+    """
+    LLM 生成的妙想选股条件（对应一个热点板块）
+
+    Attributes:
+        sector: 热点板块名（LLM 归一化后的最终板块名）
+        condition: 妙想可执行的自然语言条件，带板块限定，方向=低位埋伏
+        intent: 策略意图说明
+        risk_note: 风险提示
+    """
+    sector: str = ""
+    condition: str = ""
+    intent: str = ""
+    risk_note: str = ""
+
+
+@dataclass
+class ScreeningCandidate:
+    """
+    智能选股候选（妙想筛出 + 资金流持续低吸评分）
+
+    Attributes:
+        code: 股票代码
+        name: 股票名称
+        market: 市场标识（SH/SZ）
+        price: 最新价
+        change_pct: 涨跌幅（%）
+        flow_days: 妙想选股自带的多日主力净额序列（省去东财 daykline 取数）
+        industry: 东财行业总分类（黑名单硬过滤用）
+        concept: 概念题材
+        hot_sectors: 命中的热点板块
+        hit_conditions: 命中的妙想条件文本
+        resonance: 命中条件数（共振加分）
+        accumulation: 资金流持续低吸评分结果
+        tech_signals: 技术面信号（RSI/MACD/均线等）
+        blacklisted: 是否被黑名单过滤
+        rank: 最终排名
+        grade: 关注分级（强关注/关注/风险/剔除）
+    """
+    code: str = ""
+    name: str = ""
+    market: str = ""
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    flow_days: list[FundFlowDaily] = field(default_factory=list)
+    industry: str = ""
+    concept: str = ""
+    hot_sectors: list[str] = field(default_factory=list)
+    hit_conditions: list[str] = field(default_factory=list)
+    resonance: int = 0
+    accumulation: Optional[AccumulationScore] = None
+    tech_signals: list[str] = field(default_factory=list)
+    blacklisted: bool = False
+    rank: int = 0
+    grade: str = ""
+
+
+@dataclass
+class ScreeningReport:
+    """
+    智能选股最终报告
+
+    Attributes:
+        date: 报告日期
+        hot_sectors: 今日热点板块（已排除黑名单）
+        conditions: LLM 生成的选股条件列表
+        candidates: 候选列表（已按吸筹分排序、过滤黑名单）
+        llm_analysis: LLM 综合排序解读
+        degraded: 是否降级（妙想/LLM 失败回退技术面筛选）
+        error: 错误信息（若有）
+    """
+    date: str = ""
+    hot_sectors: list[str] = field(default_factory=list)
+    conditions: list[ScreeningCondition] = field(default_factory=list)
+    candidates: list[ScreeningCandidate] = field(default_factory=list)
+    llm_analysis: str = ""
+    degraded: bool = False
+    error: str = ""
+
+
+# ============================================================
 # 常量
 # ============================================================
 

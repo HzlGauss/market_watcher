@@ -132,6 +132,43 @@ class MXClient:
             return ""
         return self._format_stock_screen(result)
 
+    def stock_screen_structured(self, keyword: str, page_size: int = 20) -> list[dict]:
+        """智能选股，返回结构化候选列表（解析 allResults.result.dataList）
+
+        相比 stock_screen_as_text 只返回文本表格，本方法解析结构化字段，
+        供智能选股管线直接使用（含代码/名称/行业/主力净额等，便于黑名单过滤与吸筹评分）。
+
+        返回的每个 dict 字段（标准化键名）：
+            code, name, market, price, change_pct, industry, concept,
+            main_net(元), low_position(bool), turnover_rate, vol_ratio,
+            flow_days([{date, main_net}...]，按日期升序的多日主力净额，查「连续N日净流入」时返回)
+
+        失败/无结果返回空列表（不抛异常）。
+        """
+        result = self.stock_screen(keyword, page_size=page_size)
+        if not result:
+            return []
+        try:
+            data = result.get("data") or {}
+            inner = data.get("data") or {}
+            all_results = inner.get("allResults") or {}
+            res = all_results.get("result") or {}
+            data_list = res.get("dataList") or []
+            if not isinstance(data_list, list):
+                return []
+
+            parsed = []
+            for row in data_list:
+                if not isinstance(row, dict):
+                    continue
+                item = self._parse_screen_row(row)
+                if item and item.get("code"):
+                    parsed.append(item)
+            return parsed
+        except Exception as e:
+            log.debug(f"妙想选股结构化解析失败: {e}")
+            return []
+
     # ---- 3. 财经资讯搜索 ----
 
     def fin_search(self, keyword: str) -> Optional[dict]:
@@ -139,12 +176,17 @@ class MXClient:
         payload = {"query": keyword}
         return self._post("news-search", payload)
 
-    def fin_search_as_text(self, keyword: str) -> str:
-        """财经资讯搜索，返回格式化的文本结果"""
+    def fin_search_as_text(self, keyword: str, hours: Optional[int] = None) -> str:
+        """财经资讯搜索，返回格式化的文本结果
+
+        Args:
+            keyword: 搜索关键词
+            hours: 只保留最近 N 小时内的资讯（None=默认最近 7 天）
+        """
         result = self.fin_search(keyword)
         if result is None:
             return ""
-        return self._format_fin_search(result)
+        return self._format_fin_search(result, hours=hours)
 
     # ---- 4. 自选股管理 ----
 
@@ -276,7 +318,87 @@ class MXClient:
         return "\n".join(lines)
 
     @staticmethod
-    def _format_fin_search(result: dict) -> str:
+    def _find_key(row: dict, *prefixes: str) -> str:
+        """按前缀匹配找 row 的 key（处理带日期后缀的动态字段）"""
+        for key in row:
+            for p in prefixes:
+                if key.startswith(p):
+                    return key
+        return ""
+
+    @staticmethod
+    def _parse_amount(value) -> Optional[float]:
+        """解析妙想返回的数值（可能带单位/百分号/千分位）
+
+        "198.88万" → 1988800.0，"-3.20亿" → -320000000.0，"+5.09%" → 5.09，
+        "1,234.5" → 1234.5，None/"--"/"-" → None
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip().replace(",", "").replace("%", "").replace("+", "")
+        if not s or s in ("-", "--", "None", "null", "nan"):
+            return None
+        try:
+            if s.endswith("亿"):
+                return float(s[:-1]) * 1e8
+            if s.endswith("万"):
+                return float(s[:-1]) * 1e4
+            return float(s)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _parse_screen_row(cls, row: dict) -> Optional[dict]:
+        """解析 stock_screen dataList 单行 → 标准化 dict（无 code 返回 None）"""
+        code = str(row.get("SECURITY_CODE") or "").strip()
+        if not code:
+            return None
+
+        # 东财行业总分类（三级行业，黑名单硬过滤用）
+        industry_key = cls._find_key(row, "010000_RPT_F10_ORG_BASICINFO_BOARD_NAME")
+        industry = str(row.get(industry_key) or "").strip() if industry_key else ""
+
+        # 主力净额多日序列（带日期后缀，如 010000_FLOWZLAMOUNT<70>{2026-08-20}）。
+        # 妙想按查询条件动态返回：查「连续N日净流入」会返回最近 N 个交易日的主力净额
+        # （实测最多 5 个交易日），正好替代东财 daykline 的多日资金流取数。
+        import re as _re
+        flow_days: list[dict] = []
+        for key, val in row.items():
+            if not key.startswith("010000_FLOWZLAMOUNT"):
+                continue
+            m = _re.search(r"\{(\d{4}-\d{2}-\d{2})\}", key)
+            amt = cls._parse_amount(val)
+            if amt is None:
+                continue
+            flow_days.append({"date": m.group(1) if m else "", "main_net": amt})
+        flow_days.sort(key=lambda d: d["date"])  # 按日期升序
+        main_net = flow_days[-1]["main_net"] if flow_days else None  # 最新交易日主力净额
+
+        # 低位标记（带日期后缀，如 010000_DW<70>{2026-08-20} = "符合"）
+        low_key = cls._find_key(row, "010000_DW")
+        low_position = str(row.get(low_key) or "").strip() == "符合" if low_key else False
+
+        return {
+            "code": code,
+            "name": str(row.get("SECURITY_SHORT_NAME") or "").strip(),
+            "market": str(row.get("MARKET_SHORT_NAME") or "").strip().upper(),
+            "price": cls._parse_amount(row.get("NEWEST_PRICE")),
+            "change_pct": cls._parse_amount(row.get("CHG")),
+            "industry": industry,
+            "concept": str(row.get("STYLE_CONCEPT") or "").strip(),
+            "main_net": main_net,
+            "flow_days": flow_days,
+            "low_position": low_position,
+            "turnover_rate": cls._parse_amount(row.get("010000_TURNOVER_RATE")),
+            "vol_ratio": cls._parse_amount(row.get("010000_LIANGBI")),
+        }
+
+    @staticmethod
+    def _format_fin_search(result: dict, hours: Optional[int] = None) -> str:
         """格式化财经资讯搜索结果"""
         lines = []
         status = result.get("status")
@@ -296,7 +418,7 @@ class MXClient:
             lines.append("⚠️ 未搜索到相关资讯")
             return "\n".join(lines)
 
-        # 日期过滤：只保留最近 7 天的资讯
+        # 日期过滤：默认只保留最近 7 天；hours 指定时只保留最近 N 小时
         from datetime import datetime as _dt, timedelta
         import re as _re
 
@@ -309,7 +431,7 @@ class MXClient:
                     pass
             return None
 
-        cutoff = _dt.now() - timedelta(days=7)
+        cutoff = _dt.now() - (timedelta(hours=hours) if hours else timedelta(days=7))
         recent_items = []
         for item in items:
             d = _parse_date(item.get("date", "") if isinstance(item, dict) else "")
@@ -339,7 +461,8 @@ class MXClient:
                 seen_titles.add(norm)
             deduped.append(item)
 
-        lines.append(f"**资讯结果: {len(deduped)} 条（最近7天，已去重）**\n")
+        window = f"最近{hours}小时" if hours else "最近7天"
+        lines.append(f"**资讯结果: {len(deduped)} 条（{window}，已去重）**\n")
         for item in deduped[:15]:
             if not isinstance(item, dict):
                 lines.append(f"  - {item}")

@@ -74,6 +74,7 @@ Thumbs.db
 state/*.json
 monitoring_briefs/*.md
 investment_reports/*.md
+smart_screening/*.md
 *.log
 
 # Keep .gitkeep files

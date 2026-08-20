@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from datetime import datetime
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, SectorBoard, MarginData
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, FundFlowDaily, SectorBoard, MarginData
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -383,6 +383,85 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
 
     # 东方财富断连，回退到新浪资金流（新浪无小单/中单/大单分类，拆单检测会退化）
     return _fetch_fund_flow_sina(code, market)
+
+
+def fetch_fund_flow_history(code: str, market: str = "SH", days: int = 10) -> list[FundFlowDaily]:
+    """获取个股最近 N 日主力资金流序列（用于「持续低吸」判定）
+
+    复用 STOCK_FLOW_DAILY_API（fflow/daykline/get），klt=101（日线）+ lmt=days，
+    返回完整多日序列而非仅最新一天。klines 按日期升序（最旧→最新）。
+
+    每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单),
+              f57(主力占比),f58(小单占比),f59(中单占比),f60(大单占比),f61(超大单占比)
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+        days: 取最近多少天（默认 10）
+
+    Returns:
+        list[FundFlowDaily]（按日期升序），失败返回空列表（静默失败）
+    """
+    secid = _get_secid(code, market)
+    import requests
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://data.eastmoney.com/",
+    }
+
+    def _fetch_klines(lmt: int) -> list[str]:
+        """按指定 lmt 拉取原始 klines 列表，失败返回空列表"""
+        url = (f"{STOCK_FLOW_DAILY_API}?secid={secid}"
+               f"&fields1=f1,f2,f3,f7"
+               f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+               f"&lmt={lmt}&klt=101&ut=b2884a393a59ad64002292a3e90d46a5")
+        # 东财资金流接口易触发限频(RemoteDisconnected)，退避重试 3 次（对齐 fetch_fund_flow_detail）
+        resp = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=5, headers=headers)
+                break
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    return []
+                time.sleep(1.5 * (attempt + 1))
+        if resp is None or resp.status_code != 200:
+            return []
+        data = resp.json().get("data")
+        if not data:
+            return []
+        return data.get("klines") or []
+
+    try:
+        klines = _fetch_klines(days)
+        if not klines:
+            # lmt=days 个别情况下可能返回空，回退到 lmt=0（全部历史）再取尾部 days 天
+            klines = _fetch_klines(0)
+            if len(klines) > days:
+                klines = klines[-days:]
+        if not klines:
+            return []
+
+        result: list[FundFlowDaily] = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 6:
+                continue
+            main_net = _parse_float(parts[1]) if len(parts) > 1 else None
+            super_large_net = _parse_float(parts[5]) if len(parts) > 5 else None
+            if main_net is None and super_large_net is None:
+                # 无任何资金流数据的天，跳过（避免污染「净流入天数」统计）
+                continue
+            result.append(FundFlowDaily(
+                date=parts[0],
+                main_net=main_net,                                             # f52 主力净流入
+                large_net=_parse_float(parts[4]) if len(parts) > 4 else None,  # f55 大单
+                super_large_net=super_large_net,                               # f56 超大单
+                main_pct=_parse_float(parts[6]) if len(parts) > 6 else None,   # f57 主力占比
+            ))
+        return result
+    except Exception:
+        return []  # 静默失败，调用方按空处理
 
 
 def _fetch_fund_flow_sina(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
@@ -1219,6 +1298,68 @@ def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
             log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
         except Exception as e:
             log.debug(f"行业分类获取失败: {e}")
+            return {}
+
+    return {code: full_map[code] for code in codes if code in full_map}
+
+
+def fetch_stock_listing_date_map(codes: list[str]) -> dict[str, str]:
+    """批量获取个股上市日期（带日级缓存，用于新股/次新股过滤）
+
+    数据源：东方财富 clist 全 A 股列表（f26=上市日期 YYYYMMDD）。
+    首次调用拉取全市场并缓存到 state/listing_cache.json，同日后续调用直接读缓存。
+
+    Args:
+        codes: 股票代码列表
+
+    Returns:
+        {code: 上市日期(YYYYMMDD)} 映射字典
+    """
+    import json
+    from pathlib import Path
+
+    today = datetime.now().strftime("%Y%m%d")
+    cache_dir = Path(__file__).resolve().parent.parent / "state"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "listing_cache.json"
+
+    full_map: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("_date") == today:
+                full_map = {k: v for k, v in cached.items() if not k.startswith("_")}
+        except Exception:
+            pass
+
+    if not full_map:
+        try:
+            url = (
+                "https://push2.eastmoney.com/api/qt/clist/get"
+                "?pn=1&pz=6000&po=1&np=1&fltt=2&invt=2&fid=f12"
+                "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+                "&fields=f12,f14,f26"
+            )
+            resp = eastmoney_client.get(url, timeout=15)
+            if resp is not None:
+                data = resp.json()
+                diff = (data.get("data") or {}).get("diff") or []
+                # 分页时 diff 可能是 dict（键为页码序号），归一为 list
+                if isinstance(diff, dict):
+                    diff = list(diff.values())
+                for item in diff:
+                    code = str(item.get("f12", ""))
+                    list_date = item.get("f26")
+                    if code and list_date not in (None, "", "-"):
+                        full_map[code] = str(list_date)
+            if full_map:
+                cache_data = {"_date": today, **full_map}
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, ensure_ascii=False)
+                log.info(f"上市日期已缓存: {len(full_map)} 只个股 → {cache_path}")
+        except Exception as e:
+            log.debug(f"上市日期获取失败: {e}")
             return {}
 
     return {code: full_map[code] for code in codes if code in full_map}

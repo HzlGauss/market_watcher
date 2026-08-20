@@ -51,17 +51,27 @@ def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
         return []
 
     today = datetime.now().strftime("%Y%m%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    # 回看 10 天，覆盖周末/节假日，取最近一个交易日的数据
+    start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
 
     try:
-        df = ak.stock_lhb_detail_em(start_date=yesterday, end_date=today)
+        df = ak.stock_lhb_detail_em(start_date=start_date, end_date=today)
     except Exception as e:
         log.warning(f"龙虎榜数据获取失败: {e}")
         return []
 
     if df is None or df.empty:
-        log.info("龙虎榜无数据（可能非交易日）")
+        log.info("龙虎榜无数据（最近10日无上榜记录）")
         return []
+
+    # 取最近一个交易日的数据（适配周末/节假日跑）
+    date_col = next(
+        (c for c in ("上榜日", "上榜日期", "交易日期", "日期") if c in df.columns), None
+    )
+    if date_col is not None:
+        latest = df[date_col].max()
+        df = df[df[date_col] == latest]
+        log.info(f"龙虎榜取最新交易日数据: {latest}")
 
     records = []
     for _, row in df.iterrows():
