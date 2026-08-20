@@ -30,7 +30,7 @@ pytest tests/test_config.py -v            # single test file
 
 The app reads from three sources (priority order):
 
-1. **`.env`** — API keys: `DEEPSEEK_API_KEY`, `SCT_SENDKEY` (ServerChan), `MX_APIKEY` (East Money, optional), `LLM_BASE_URL` (custom LLM endpoint), `LLM_VERIFY_SSL`
+1. **`.env`** — API keys: `DEEPSEEK_API_KEY`, `SCT_SENDKEY` (ServerChan), `MX_APIKEY` / `MX_APIKEY_2` (East Money, optional), `LLM_BASE_URL` (custom LLM endpoint), `LLM_VERIFY_SSL`
 2. **`watchlist_config.json`** — thresholds, scan interval, LLM/push toggles, report schedules, T+0 monitoring, dynamic threshold settings
 3. **`watchlist.csv`** / **`holdings.csv`** — preferred over the JSON arrays for watch items and holdings; CSV takes priority when both exist
 

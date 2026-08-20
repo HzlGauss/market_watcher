@@ -46,6 +46,13 @@ class Config:
     DEFAULT_NORTH_FLOW_INTERVAL = 30
     DEFAULT_ADJUSTMENT_INTENSITY = 1.5
     DEFAULT_SECTOR_THRESHOLD = 2.0
+    DEFAULT_SCREENING_CONDITIONS = 5
+    DEFAULT_SCREENING_CANDIDATE_LIMIT = 30
+    DEFAULT_SCREENING_FUND_FLOW_DAYS = 10
+    DEFAULT_SCREENING_BLACKLIST = ["房地产", "地产", "保险"]
+    DEFAULT_SCREENING_BLACKLIST_CONCEPTS = []
+    DEFAULT_SCREENING_EXCLUDE_ST = True
+    DEFAULT_SCREENING_SUB_NEW_DAYS = 60
 
     def __init__(self, config_path: Path) -> None:
         """
@@ -383,6 +390,67 @@ class Config:
         value = self._raw.get("做T监控", {}).get("扫描间隔秒", 30)
         return max(10, safe_int(value, 30))
 
+    # ---- 智能选股 ----
+
+    @property
+    def screening_condition_count(self) -> int:
+        """智能选股：LLM 生成的选股条件数（≈热点板块数）"""
+        value = self._raw.get("智能选股", {}).get(
+            "条件数", self.DEFAULT_SCREENING_CONDITIONS
+        )
+        return max(1, safe_int(value, self.DEFAULT_SCREENING_CONDITIONS))
+
+    @property
+    def screening_candidate_limit(self) -> int:
+        """智能选股：候选池上限（资金流评分/LLM 排序前截断）"""
+        value = self._raw.get("智能选股", {}).get(
+            "候选数上限", self.DEFAULT_SCREENING_CANDIDATE_LIMIT
+        )
+        return max(5, safe_int(value, self.DEFAULT_SCREENING_CANDIDATE_LIMIT))
+
+    @property
+    def screening_fund_flow_days(self) -> int:
+        """智能选股：资金流回看天数（用于「持续低吸」判定）"""
+        value = self._raw.get("智能选股", {}).get(
+            "资金流天数", self.DEFAULT_SCREENING_FUND_FLOW_DAYS
+        )
+        return max(5, safe_int(value, self.DEFAULT_SCREENING_FUND_FLOW_DAYS))
+
+    @property
+    def screening_blacklist_sectors(self) -> list[str]:
+        """智能选股板块黑名单（排除不看的板块，如房地产/保险）"""
+        raw = self._raw.get("智能选股", {}).get(
+            "黑名单板块", self.DEFAULT_SCREENING_BLACKLIST
+        )
+        if not isinstance(raw, list):
+            raw = [raw]
+        return [str(s).strip() for s in raw if str(s).strip()]
+
+    @property
+    def screening_blacklist_concepts(self) -> list[str]:
+        """智能选股概念黑名单（按概念题材排除，如「壳资源」「ST板块」，可留空）"""
+        raw = self._raw.get("智能选股", {}).get(
+            "黑名单概念", self.DEFAULT_SCREENING_BLACKLIST_CONCEPTS
+        )
+        if not isinstance(raw, list):
+            raw = [raw]
+        return [str(s).strip() for s in raw if str(s).strip()]
+
+    @property
+    def screening_exclude_st(self) -> bool:
+        """智能选股：是否剔除 ST/*ST/退市整理等风险股"""
+        return bool(self._raw.get("智能选股", {}).get(
+            "排除ST", self.DEFAULT_SCREENING_EXCLUDE_ST
+        ))
+
+    @property
+    def screening_sub_new_days(self) -> int:
+        """智能选股：上市不满 N 个自然日视为新股/次新股剔除（0=不过滤）"""
+        value = self._raw.get("智能选股", {}).get(
+            "次新股天数", self.DEFAULT_SCREENING_SUB_NEW_DAYS
+        )
+        return max(0, safe_int(value, self.DEFAULT_SCREENING_SUB_NEW_DAYS))
+
     # ---- Investment Reports ----
 
     @property
@@ -439,6 +507,17 @@ class Config:
     def mx_apikey(self) -> Optional[str]:
         """东方财富妙想 API Key（基金深度数据用）"""
         return self._env("MX_APIKEY")
+
+    @property
+    def mx_apikey_2(self) -> Optional[str]:
+        """东方财富妙想 API Key 2（备用，与主 key 轮询使用）"""
+        return self._env("MX_APIKEY_2")
+
+    @property
+    def mx_apikeys(self) -> list[str]:
+        """所有妙想 API Key 列表（主 key + 备用 key，去重去空）"""
+        keys = [self.mx_apikey, self.mx_apikey_2]
+        return [k for k in keys if k]
 
     @staticmethod
     def _env(key: str) -> Optional[str]:

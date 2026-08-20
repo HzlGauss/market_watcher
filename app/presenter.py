@@ -44,7 +44,8 @@ def _format_flow_signal(q: Quote) -> str:
         from app.analyzer import detect_split_order
         split = detect_split_order(ff, q.amount or 0, q.change_pct)
         if split:
-            small_pct = (ff.small_net / q.amount * 100) if (ff.small_net is not None and q.amount) else 0.0
+            small_pct = ff.small_pct if ff.small_pct is not None else (
+                (ff.small_net / q.amount * 100) if (ff.small_net is not None and q.amount) else 0.0)
             if "吸筹" in split:
                 return f"{Color.YELLOW}拆单吸筹{abs(small_pct):.0f}%{Color.RESET}"
             return f"{Color.GREEN}拆单出货{abs(small_pct):.0f}%{Color.RESET}"

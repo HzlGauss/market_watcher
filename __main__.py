@@ -79,6 +79,7 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}7{Color.RESET}. Query Period Returns (近期走势)")
     print(f"  {Color.CYAN}8{Color.RESET}. ETF Bottom Reversal Screen (ETF底部反转)")
     print(f"  {Color.CYAN}9{Color.RESET}. Stock Bottom Reversal Screen (A股底部反转)")
+    print(f"  {Color.CYAN}S{Color.RESET}. Smart Screening (智能选股·热点板块低位吸筹)")
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
@@ -86,10 +87,10 @@ def _show_menu() -> str:
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M"):
+            choice = input(f" Enter option [0-9/D/M/S]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D or M{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M or S{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -1317,6 +1318,39 @@ def main() -> None:
             except Exception as e:
                 log.error(f"股票筛选失败: {e}")
                 print(f"{Color.RED}❌ 股票筛选失败: {e}{Color.RESET}")
+        elif choice == "S":
+            log.info("Starting smart screening...")
+            print(f"\n{Color.BOLD}{Color.CYAN}🎯 智能选股（热点板块 · 低位埋伏 · 主力持续低吸）{Color.RESET}")
+            print(f"{Color.DIM}正在采集市场背景并筛选（约需 1-2 分钟），请耐心等待...{Color.RESET}")
+            try:
+                from app.smart_screener import run_smart_screening
+                import time as _time
+                _start = _time.time()
+                report = run_smart_screening(config)
+                elapsed = _time.time() - _start
+
+                print(f"\n{Color.GREEN}✅ 智能选股完成 ({elapsed:.0f}秒){Color.RESET}")
+                if report.hot_sectors:
+                    print(f"   {Color.CYAN}🔥 当前热点板块: {'、'.join(report.hot_sectors)}{Color.RESET}")
+                print(f"   {Color.DIM}候选标的: {len(report.candidates)} 只{Color.RESET}")
+                strong = [c for c in report.candidates if c.grade == "强关注"]
+                watch = [c for c in report.candidates if c.grade == "关注"]
+                print(f"   {Color.RED}强关注: {len(strong)}只{Color.RESET}  {Color.YELLOW}关注: {len(watch)}只{Color.RESET}")
+                if strong or watch:
+                    print(f"\n{Color.BOLD}🔥 重点关注候选:{Color.RESET}")
+                    for c in (strong + watch)[:10]:
+                        acc = c.accumulation
+                        score = f"{acc.score:.0f}" if acc else "—"
+                        label = acc.label if acc else "—"
+                        sector = "、".join(c.hot_sectors) or (c.industry.split("-")[0] if c.industry else "—")
+                        print(f"  {Color.BOLD}{c.name}({c.code}){Color.RESET} [{sector}] "
+                              f"吸筹分{score} {label}")
+                if report.error:
+                    print(f"  {Color.YELLOW}⚠️ {report.error}{Color.RESET}")
+                print(f"   {Color.DIM}完整报告已保存至 smart_screening/ 目录" + ("并推送微信" if config.push_enabled else "") + f"{Color.RESET}")
+            except Exception as e:
+                log.error(f"智能选股失败: {e}")
+                print(f"{Color.RED}❌ 智能选股失败: {e}{Color.RESET}")
         elif choice == "D":
             log.info("Starting dragon tiger deep analysis...")
             print(f"\n{Color.BOLD}{Color.RED}🐉 龙虎榜深度分析{Color.RESET}")
@@ -1443,7 +1477,7 @@ def _run_miaoxiang_menu(config: Config) -> None:
     """东方财富妙想 Skills 功能菜单（循环停留在子菜单）"""
     from app.miaoxiang import get_mx_client
 
-    if not config.mx_apikey:
+    if not config.mx_apikeys:
         print(f"\n{Color.YELLOW}⚠️ 未配置 MX_APIKEY{Color.RESET}")
         print(f"  {Color.DIM}请在 .env 文件中设置: MX_APIKEY=你的妙想API_Key{Color.RESET}")
         print(f"  {Color.DIM}获取地址: https://dl.dfcfs.com/m/itc4{Color.RESET}")
