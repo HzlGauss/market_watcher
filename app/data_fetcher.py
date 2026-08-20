@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from datetime import datetime
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, FundFlowDaily, SectorBoard, MarginData
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, FundFlowDaily, SectorBoard, SectorFundFlow, MarginData
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -1297,7 +1297,8 @@ def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
                 json.dump(cache_data, f, ensure_ascii=False)
             log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
         except Exception as e:
-            log.debug(f"行业分类获取失败: {e}")
+            # 东财全市场快照易断连/限频，安静失败即可，避免重试风暴
+            log.warning(f"东财全市场行业分类不可达，跳过: {type(e).__name__}")
             return {}
 
     return {code: full_map[code] for code in codes if code in full_map}
@@ -1359,7 +1360,8 @@ def fetch_stock_listing_date_map(codes: list[str]) -> dict[str, str]:
                     json.dump(cache_data, f, ensure_ascii=False)
                 log.info(f"上市日期已缓存: {len(full_map)} 只个股 → {cache_path}")
         except Exception as e:
-            log.debug(f"上市日期获取失败: {e}")
+            # 东财 push2 clist 断连，安静失败即可（未过滤次新股，不影响主流程）
+            log.warning(f"东财上市日期列表不可达，跳过: {type(e).__name__}")
             return {}
 
     return {code: full_map[code] for code in codes if code in full_map}
@@ -1474,6 +1476,103 @@ def _safe_float(val) -> Optional[float]:
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+_SECTOR_TYPE_MAP = {"行业资金流": "2", "概念资金流": "3", "地域资金流": "1"}
+# indicator -> (fid0 排序字段, stat, 涨跌幅字段, 主力净额字段, 主力净占比字段, 最大股字段)
+_SECTOR_FLOW_KEYS = {
+    "今日": ("f62", "1", "f3", "f62", "f184", "f204"),
+    "5日": ("f164", "5", "f109", "f164", "f165", "f257"),
+    "10日": ("f174", "10", "f160", "f174", "f175", "f260"),
+}
+_SECTOR_FLOW_FIELDS = {
+    "今日": "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124",
+    "5日": "f12,f14,f2,f109,f164,f165,f166,f167,f168,f169,f170,f171,f172,f173,f257,f258,f124",
+    "10日": "f12,f14,f2,f160,f174,f175,f176,f177,f178,f179,f180,f181,f182,f183,f260,f261,f124",
+}
+
+
+def fetch_sector_fund_flow_rank(
+    indicator: str = "5日", sector_type: str = "行业资金流"
+) -> list[SectorFundFlow]:
+    """获取东财板块资金流排名（行业板块），直连 push2 clist 接口。
+
+    用于「资金潜伏板块」判断：主力净流入多、但涨幅小的板块，说明资金在悄悄吸筹。
+
+    绕过 akshare 的 stock_sector_fund_flow_rank：其首个请求不带 timeout，
+    push2 断连时可能无限挂起。此处用 eastmoney_client（带超时 + 有限重试），
+    并按字段 key（f14/f109/f164...）解析，规避 akshare 按列位置映射的脆弱性。
+
+    Args:
+        indicator: 回看周期 {"今日", "5日", "10日"}，默认 5日（多日持续净流入更稳）
+        sector_type: 板块类型 {"行业资金流", "概念资金流", "地域资金流"}
+
+    Returns:
+        SectorFundFlow 列表（按主力净流入降序），失败返回空列表
+    """
+    if indicator not in _SECTOR_FLOW_KEYS:
+        indicator = "5日"
+    sector_code = _SECTOR_TYPE_MAP.get(sector_type, "2")
+    fid0, stat, change_key, net_key, pct_key, top_key = _SECTOR_FLOW_KEYS[indicator]
+    fields = _SECTOR_FLOW_FIELDS[indicator]
+
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+        "fltt": "2",
+        "invt": "2",
+        "fid0": fid0,
+        "fs": f"m:90 t:{sector_code}",
+        "stat": stat,
+        "fields": fields,
+        "rt": "52975239",
+    }
+
+    all_items: list[dict] = []
+    try:
+        resp = eastmoney_client.get(url, params=params, timeout=15)
+        if resp is None:
+            return []
+        data = resp.json().get("data") or {}
+        total = int(data.get("total") or 0)
+        diff = data.get("diff") or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        all_items.extend(diff)
+
+        for page in range(2, (total + 99) // 100 + 1):
+            params["pn"] = str(page)
+            resp = eastmoney_client.get(url, params=params, timeout=15)
+            if resp is None:
+                break
+            data = resp.json().get("data") or {}
+            diff = data.get("diff") or []
+            if isinstance(diff, dict):
+                diff = list(diff.values())
+            all_items.extend(diff)
+    except Exception as e:
+        # 东财 push2 易触发 RemoteDisconnected/限频，安静失败即可，避免重试风暴
+        log.warning(f"东财板块资金流不可达，跳过（回退 LLM 热点判断）: {type(e).__name__}")
+        return []
+
+    flows: list[SectorFundFlow] = []
+    for item in all_items:
+        name = str(item.get("f14", "") or "").strip()
+        if not name:
+            continue
+        flows.append(SectorFundFlow(
+            name=name,
+            change_pct=_safe_float(item.get(change_key)),
+            main_net=_safe_float(item.get(net_key)),
+            main_pct=_safe_float(item.get(pct_key)),
+            top_stock=str(item.get(top_key, "") or "").strip(),
+        ))
+    flows.sort(key=lambda s: (s.main_net or 0.0), reverse=True)
+    return flows
 
 
 def fetch_major_indices() -> list[Quote]:

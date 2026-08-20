@@ -380,6 +380,24 @@ class SectorBoard:
 
 
 @dataclass
+class SectorFundFlow:
+    """板块资金流排名快照（东财数据中心-资金流向-板块资金流）
+
+    Attributes:
+        name: 板块名称（如 "半导体"）
+        change_pct: 涨跌幅（%）
+        main_net: 主力净流入（元）
+        main_pct: 主力净流入净占比（%）
+        top_stock: 主力净流入最大股名称
+    """
+    name: str = ""
+    change_pct: Optional[float] = None
+    main_net: Optional[float] = None
+    main_pct: Optional[float] = None
+    top_stock: str = ""
+
+
+@dataclass
 class MarketBreadth:
     """全市场广度数据
 
@@ -830,8 +848,12 @@ class ScreeningCandidate:
         code: 股票代码
         name: 股票名称
         market: 市场标识（SH/SZ）
-        price: 最新价
+        price: 最新价（妙想返回，可能缺失）
         change_pct: 涨跌幅（%）
+        last_price: 最新收盘价（K线末尾，供 LLM 引用，避免臆造价格）
+        ma20: 20日均线
+        support: 主要支撑位
+        resistance: 主要压力位
         flow_days: 妙想选股自带的多日主力净额序列（省去东财 daykline 取数）
         industry: 东财行业总分类（黑名单硬过滤用）
         concept: 概念题材
@@ -849,6 +871,10 @@ class ScreeningCandidate:
     market: str = ""
     price: Optional[float] = None
     change_pct: Optional[float] = None
+    last_price: Optional[float] = None
+    ma20: Optional[float] = None
+    support: Optional[float] = None
+    resistance: Optional[float] = None
     flow_days: list[FundFlowDaily] = field(default_factory=list)
     industry: str = ""
     concept: str = ""
@@ -869,8 +895,9 @@ class ScreeningReport:
 
     Attributes:
         date: 报告日期
-        hot_sectors: 今日热点板块（已排除黑名单）
-        conditions: LLM 生成的选股条件列表
+        hot_sectors: 选中的板块名（已排除黑名单）
+        accumulating_sectors: 资金潜伏板块（东财板块资金流排名，含净流入/涨幅）
+        conditions: 选股条件列表
         candidates: 候选列表（已按吸筹分排序、过滤黑名单）
         llm_analysis: LLM 综合排序解读
         degraded: 是否降级（妙想/LLM 失败回退技术面筛选）
@@ -878,6 +905,7 @@ class ScreeningReport:
     """
     date: str = ""
     hot_sectors: list[str] = field(default_factory=list)
+    accumulating_sectors: list[SectorFundFlow] = field(default_factory=list)
     conditions: list[ScreeningCondition] = field(default_factory=list)
     candidates: list[ScreeningCandidate] = field(default_factory=list)
     llm_analysis: str = ""

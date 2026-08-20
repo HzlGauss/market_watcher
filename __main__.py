@@ -1323,7 +1323,7 @@ def main() -> None:
             print(f"\n{Color.BOLD}{Color.CYAN}🎯 智能选股（热点板块 · 低位埋伏 · 主力持续低吸）{Color.RESET}")
             print(f"{Color.DIM}正在采集市场背景并筛选（约需 1-2 分钟），请耐心等待...{Color.RESET}")
             try:
-                from app.smart_screener import run_smart_screening
+                from app.smart_screener import run_smart_screening, _industry_label
                 import time as _time
                 _start = _time.time()
                 report = run_smart_screening(config)
@@ -1331,7 +1331,7 @@ def main() -> None:
 
                 print(f"\n{Color.GREEN}✅ 智能选股完成 ({elapsed:.0f}秒){Color.RESET}")
                 if report.hot_sectors:
-                    print(f"   {Color.CYAN}🔥 当前热点板块: {'、'.join(report.hot_sectors)}{Color.RESET}")
+                    print(f"   {Color.CYAN}💰 资金潜伏板块: {'、'.join(report.hot_sectors)}{Color.RESET}")
                 print(f"   {Color.DIM}候选标的: {len(report.candidates)} 只{Color.RESET}")
                 strong = [c for c in report.candidates if c.grade == "强关注"]
                 watch = [c for c in report.candidates if c.grade == "关注"]
@@ -1342,7 +1342,7 @@ def main() -> None:
                         acc = c.accumulation
                         score = f"{acc.score:.0f}" if acc else "—"
                         label = acc.label if acc else "—"
-                        sector = "、".join(c.hot_sectors) or (c.industry.split("-")[0] if c.industry else "—")
+                        sector = _industry_label(c)
                         print(f"  {Color.BOLD}{c.name}({c.code}){Color.RESET} [{sector}] "
                               f"吸筹分{score} {label}")
                 if report.error:

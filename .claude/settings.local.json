@@ -9,7 +9,8 @@
       "Read(//c//**)",
       "Read(//c/Users/hanzhanli/AppData/Local/Programs/**)",
       "Bash(C:/Users/hanzhanli/AppData/Local/Programs/Python/Python312/python.exe *)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }
