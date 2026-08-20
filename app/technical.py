@@ -87,11 +87,16 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
     # 新浪数据为空或解析失败，尝试 AKShare 兜底
     try:
         import akshare as ak
+        # ETF/LOF 基金代码需用 fund_etf_* 接口（stock_zh_a_* 只支持股票，会报 NoneType 错误）
+        is_etf = code.startswith(("51", "56", "58", "15", "16", "18"))
         if scale < 240:
             # 分钟级兜底（5分钟/15分钟等）
             period_map = {5: "5", 15: "15", 30: "30", 60: "60"}
             period = period_map.get(scale, "5")
-            df = ak.stock_zh_a_hist_min_em(symbol=code, period=period)
+            if is_etf:
+                df = ak.fund_etf_hist_min_em(symbol=code, period=period)
+            else:
+                df = ak.stock_zh_a_hist_min_em(symbol=code, period=period)
             if df is not None and not df.empty:
                 df = df.tail(120).reset_index(drop=True)
                 results = []
@@ -108,7 +113,10 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
                     return results
         else:
             # 日线兜底
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq", start_date="", end_date="")
+            if is_etf:
+                df = ak.fund_etf_hist_em(symbol=code, period="daily", adjust="qfq")
+            else:
+                df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq", start_date="", end_date="")
             if df is not None and not df.empty:
                 df = df.tail(days).reset_index(drop=True)
                 results = []
