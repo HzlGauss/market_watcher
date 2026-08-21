@@ -118,6 +118,41 @@ class MXClient:
             return ""
         return self._format_query_result(result)
 
+    def query_structured(self, tool_query: str) -> list[dict]:
+        """金融数据查询，返回结构化表格列表（替代 query_as_text，供机器处理）
+
+        相比 query_as_text 只返回文本，本方法解析 searchDataResultDTO.dataTableDTOList，
+        每个数据表归一化为 {title, entity_name, code, columns, rows}，直接供持仓体检、
+        财务数据批量取数、历史序列等场景使用（数值保留原始字符串，单位可再用 _parse_amount 解析）。
+
+        返回的每个表格 dict 字段：
+            title(表格标题), entity_name(证券全称), code(证券代码),
+            columns([日期, ...中文列名]), rows([{列名: 值, ...}，日期为行])
+
+        失败/无数据返回空列表（不抛异常）。
+        """
+        result = self.query(tool_query)
+        if not result or result.get("status") != 0:
+            return []
+        try:
+            data = result.get("data") or {}
+            inner = data.get("data") or {}
+            search = inner.get("searchDataResultDTO") or {}
+            dto_list = search.get("dataTableDTOList") or []
+            if not isinstance(dto_list, list):
+                return []
+            tables = []
+            for dto in dto_list:
+                if not isinstance(dto, dict):
+                    continue
+                parsed = self._parse_query_dto(dto)
+                if parsed:
+                    tables.append(parsed)
+            return tables
+        except Exception as e:
+            log.debug(f"妙想查询结构化解析失败: {e}")
+            return []
+
     # ---- 2. 智能选股 ----
 
     def stock_screen(self, keyword: str, page_no: int = 1, page_size: int = 20) -> Optional[dict]:
@@ -136,12 +171,13 @@ class MXClient:
         """智能选股，返回结构化候选列表（解析 allResults.result.dataList）
 
         相比 stock_screen_as_text 只返回文本表格，本方法解析结构化字段，
-        供智能选股管线直接使用（含代码/名称/行业/主力净额等，便于黑名单过滤与吸筹评分）。
+        供智能选股管线直接使用（含代码/名称/行业/主力净额等，便于黑名单过滤与资金流入+估值评分）。
 
         返回的每个 dict 字段（标准化键名）：
             code, name, market, price, change_pct, industry, concept,
             main_net(元), low_position(bool), turnover_rate, vol_ratio,
-            flow_days([{date, main_net}...]，按日期升序的多日主力净额，查「连续N日净流入」时返回)
+            flow_days([{date, main_net}...]，按日期升序的多日主力净额，查「连续N日净流入」时返回),
+            circulation_value(元), valuation_status(估值较低/适中/较高), valuation_percentile(0-100)
 
         失败/无结果返回空列表（不抛异常）。
         """
@@ -188,6 +224,45 @@ class MXClient:
             return ""
         return self._format_fin_search(result, hours=hours)
 
+    def fin_search_structured(self, keyword: str, hours: Optional[int] = None) -> list[dict]:
+        """财经资讯搜索，返回结构化列表（含评级/机构/关联证券/公告类型等完整字段）
+
+        相比 fin_search_as_text 只返回文本，本方法保留每条资讯的全部字段，
+        供「研报评级上调/下调→加减仓」「公告事件驱动（减持/增持/回购/解禁）→建仓/清仓」
+        「题材新闻→个股映射（secu_list）」等场景直接使用。
+
+        返回的每个 dict 字段：
+            title, source, date, url, content,
+            information_type(REPORT=研报/NEWS=新闻/ANNOUNCEMENT=公告),
+            rating(研报评级), ins_name(机构), entity_full_name(关联证券全称),
+            secu_list([{code,name,type}]), trunk(结构化正文块)
+
+        Args:
+            keyword: 搜索关键词
+            hours: 只保留最近 N 小时内的资讯（None=默认最近 7 天）
+
+        失败/无结果返回空列表（不抛异常）。
+        """
+        result = self.fin_search(keyword)
+        if not result or result.get("status") != 0:
+            return []
+        try:
+            data = result.get("data") or {}
+            inner = data.get("data") or {}
+            search_resp = inner.get("llmSearchResponse") or {}
+            items = search_resp.get("data") or []
+            if not isinstance(items, list) or not items:
+                return []
+            items = self._filter_recent_news(items, hours=hours)
+            parsed = []
+            for item in items:
+                if isinstance(item, dict):
+                    parsed.append(self._parse_fin_item(item))
+            return parsed
+        except Exception as e:
+            log.debug(f"妙想资讯结构化解析失败: {e}")
+            return []
+
     # ---- 4. 自选股管理 ----
 
     def self_select_get(self) -> Optional[dict]:
@@ -211,6 +286,64 @@ class MXClient:
         if result is None:
             return ""
         return self._format_self_select(result)
+
+    # ---- 5. 模拟组合（mockTrading） ----
+
+    def mock_positions(self) -> Optional[dict]:
+        """查询模拟组合当前持仓
+
+        返回 data 结构（成功时 code=200）：持仓列表，含股票代码/名称/持仓数量/成本/现价/盈亏等。
+        未绑定模拟组合账户时返回 code=404。
+        """
+        return self._post("mockTrading/positions", {"moneyUnit": 1})
+
+    def mock_balance(self) -> Optional[dict]:
+        """查询模拟组合资金
+
+        返回 data 结构：totalAssets(总资产)/availBalance(可用资金) 等。
+        """
+        return self._post("mockTrading/balance", {"moneyUnit": 1})
+
+    def mock_orders(self) -> Optional[dict]:
+        """查询模拟组合委托订单（含已成交/未成交/已撤单）"""
+        return self._post("mockTrading/orders", {"fltOrderDrt": 0, "fltOrderStatus": 0})
+
+    def mock_trade(self, side: str, stock_code: str, quantity: int, price: Optional[float] = None) -> Optional[dict]:
+        """模拟买卖下单
+
+        Args:
+            side: "buy" 或 "sell"
+            stock_code: 6 位 A 股代码
+            quantity: 数量（股），须为 100 的整数倍
+            price: 限价（None=市价委托，自动以最新价成交）
+
+        Returns:
+            data 结构：成功含 orderId(委托编号)。
+        """
+        payload = {
+            "type": side,
+            "stockCode": stock_code,
+            "quantity": quantity,
+            "useMarketPrice": price is None,
+        }
+        if price is not None:
+            payload["price"] = price
+        return self._post("mockTrading/trade", payload)
+
+    def mock_cancel(self, order_id: Optional[str] = None, stock_code: Optional[str] = None) -> Optional[dict]:
+        """撤销模拟组合委托
+
+        Args:
+            order_id: 委托编号（None=一键撤单，撤销当日所有未成交委托）
+            stock_code: 可选，按股票代码过滤
+        """
+        if order_id is None:
+            payload = {"type": "all"}
+        else:
+            payload = {"type": "order", "orderId": order_id}
+            if stock_code:
+                payload["stockCode"] = stock_code
+        return self._post("mockTrading/cancel", payload)
 
     # ---- 结果格式化 ----
 
@@ -283,6 +416,92 @@ class MXClient:
             lines.append("")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _flatten_query_value(value) -> str:
+        """查询结果单元格值 → 字符串（dict/list 序列化为 JSON）"""
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            import json as _json
+            return _json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    @classmethod
+    def _parse_query_dto(cls, dto: dict) -> Optional[dict]:
+        """解析 query 返回的单个 dataTableDTO → 标准化表格 dict（无有效 table 返回 None）"""
+        table = dto.get("table") or {}
+        if not isinstance(table, dict):
+            return None
+
+        name_map = dto.get("nameMap") or {}
+        if isinstance(name_map, list):
+            name_map = {str(i): v for i, v in enumerate(name_map)}
+        elif not isinstance(name_map, dict):
+            name_map = {}
+
+        def _label(key) -> str:
+            v = name_map.get(key)
+            if v is None:
+                v = name_map.get(str(key))
+            if v is None and isinstance(key, str) and key.isdigit():
+                v = name_map.get(int(key))
+            return str(v) if v not in (None, "") else str(key)
+
+        # 证券代码：优先 dto.code（含市场后缀），回退 entityTagDTO.secuCode
+        code = str(dto.get("code") or "").strip()
+        if not code:
+            tag = dto.get("entityTagDTO") or {}
+            code = str(tag.get("secuCode") or "").strip()
+
+        head = table.get("headName") or []
+        if not isinstance(head, list):
+            head = []
+
+        # 指标列（排除 headName），按 indicatorOrder 排序
+        data_keys = [k for k in table.keys() if k != "headName"]
+        order = dto.get("indicatorOrder") or []
+        if isinstance(order, list) and order:
+            key_map = {str(k): k for k in data_keys}
+            ordered, seen = [], set()
+            for k in order:
+                ks = str(k)
+                if ks in key_map and ks not in seen:
+                    ordered.append(key_map[ks])
+                    seen.add(ks)
+            for k in data_keys:
+                if k not in seen:
+                    ordered.append(k)
+                    seen.add(k)
+            data_keys = ordered
+
+        columns = ["日期"] + [_label(k) for k in data_keys]
+        rows = []
+        if head:
+            # 日期为行：headName 为日期列，每个指标是等长数组
+            for i, date in enumerate(head):
+                row = {"日期": str(date)}
+                for k in data_keys:
+                    vals = table.get(k, [])
+                    v = vals[i] if isinstance(vals, list) and i < len(vals) else ""
+                    row[_label(k)] = cls._flatten_query_value(v)
+                rows.append(row)
+        else:
+            # 单值（当前报价等）：每个指标只有一个值
+            row = {"日期": ""}
+            for k in data_keys:
+                vals = table.get(k, [])
+                v = vals[0] if isinstance(vals, list) and vals else vals
+                row[_label(k)] = cls._flatten_query_value(v)
+            rows.append(row)
+
+        return {
+            "title": str(dto.get("title") or dto.get("entityName") or "").strip(),
+            "entity_name": str(dto.get("entityName") or "").strip(),
+            "code": code,
+            "columns": columns,
+            "rows": rows,
+        }
 
     @staticmethod
     def _format_stock_screen(result: dict) -> str:
@@ -378,6 +597,18 @@ class MXClient:
         flow_days.sort(key=lambda d: d["date"])  # 按日期升序
         main_net = flow_days[-1]["main_net"] if flow_days else None  # 最新交易日主力净额
 
+        # 流通市值（主力净流入强度归一化用）
+        circ_key = cls._find_key(row, "010000_CIRCULATION_MARKET_VALUE")
+        circulation_value = cls._parse_amount(row.get(circ_key)) if circ_key else None
+
+        # 估值状态（分类：估值较低/适中/较高，组合查询时返回）
+        val_status_key = cls._find_key(row, "010000_RPT_VALUATIONSTATUS_VALATION_STATUS")
+        valuation_status = str(row.get(val_status_key) or "").strip() if val_status_key else ""
+
+        # PE-TTM 历史百分位（数值 0-100，越小越便宜，纯估值查询时返回）
+        pct_key = cls._find_key(row, "010000_RPT_IA_VALUEINDICATOR_HIST_PE_TTM_PERCENTILE")
+        valuation_percentile = cls._parse_amount(row.get(pct_key)) if pct_key else None
+
         # 低位标记（带日期后缀，如 010000_DW<70>{2026-08-20} = "符合"）
         low_key = cls._find_key(row, "010000_DW")
         low_position = str(row.get(low_key) or "").strip() == "符合" if low_key else False
@@ -392,37 +623,21 @@ class MXClient:
             "concept": str(row.get("STYLE_CONCEPT") or "").strip(),
             "main_net": main_net,
             "flow_days": flow_days,
+            "circulation_value": circulation_value,
+            "valuation_status": valuation_status,
+            "valuation_percentile": valuation_percentile,
             "low_position": low_position,
             "turnover_rate": cls._parse_amount(row.get("010000_TURNOVER_RATE")),
             "vol_ratio": cls._parse_amount(row.get("010000_LIANGBI")),
         }
 
     @staticmethod
-    def _format_fin_search(result: dict, hours: Optional[int] = None) -> str:
-        """格式化财经资讯搜索结果"""
-        lines = []
-        status = result.get("status")
-        message = result.get("message", "")
-        if status != 0:
-            lines.append(f"❌ 错误: 状态码 {status} - {message}")
-            return "\n".join(lines)
-
-        data = result.get("data") or {}
-        inner = data.get("data") or {}
-        search_resp = inner.get("llmSearchResponse") or {}
-        items = search_resp.get("data") or []
-        if not isinstance(items, list):
-            items = []
-
-        if not items:
-            lines.append("⚠️ 未搜索到相关资讯")
-            return "\n".join(lines)
-
-        # 日期过滤：默认只保留最近 7 天；hours 指定时只保留最近 N 小时
+    def _filter_recent_news(items: list, hours: Optional[int] = None) -> list:
+        """资讯列表：时间窗口过滤 + 标题去重 + 日期降序（格式化与结构化共用）"""
         from datetime import datetime as _dt, timedelta
         import re as _re
 
-        def _parse_date(date_str) -> Optional["_dt"]:
+        def _parse_date(date_str):
             m = _re.search(r"(\d{4}-\d{2}-\d{2})", str(date_str or ""))
             if m:
                 try:
@@ -453,47 +668,95 @@ class MXClient:
             title = item.get("title") or "?"
             if " - " in title:
                 title = title.rsplit(" - ", 1)[0]
-            # 归一化标题（去空格标点）用于相似判断
             norm = _re.sub(r"[\s\W]", "", title)[:40]
             if norm and norm in seen_titles:
-                continue  # 重复，跳过
+                continue
             if norm:
                 seen_titles.add(norm)
             deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _parse_fin_item(item: dict) -> dict:
+        """归一化单条资讯 → dict（含评级/机构/关联证券/公告类型等完整字段）"""
+        title = item.get("title") or "?"
+        if " - " in title:
+            title = title.rsplit(" - ", 1)[0]
+
+        secu_list = item.get("secuList") or []
+        if isinstance(secu_list, list):
+            secu_list = [
+                {
+                    "code": str(s.get("secuCode") or "").strip(),
+                    "name": str(s.get("secuName") or "").strip(),
+                    "type": str(s.get("secuType") or "").strip(),
+                }
+                for s in secu_list
+                if isinstance(s, dict)
+            ]
+        else:
+            secu_list = []
+
+        return {
+            "title": title,
+            "source": str(item.get("source") or "").strip(),
+            "date": str(item.get("date") or "").strip(),
+            "url": str(item.get("jumpUrl") or "").strip(),
+            "content": str(item.get("content") or "").strip(),
+            "information_type": str(item.get("informationType") or "").strip(),
+            "rating": str(item.get("rating") or "").strip(),
+            "ins_name": str(item.get("insName") or "").strip(),
+            "entity_full_name": str(item.get("entityFullName") or "").strip(),
+            "secu_list": secu_list,
+            "trunk": item.get("trunk"),
+        }
+
+    @staticmethod
+    def _format_fin_search(result: dict, hours: Optional[int] = None) -> str:
+        """格式化财经资讯搜索结果"""
+        lines = []
+        status = result.get("status")
+        message = result.get("message", "")
+        if status != 0:
+            lines.append(f"❌ 错误: 状态码 {status} - {message}")
+            return "\n".join(lines)
+
+        data = result.get("data") or {}
+        inner = data.get("data") or {}
+        search_resp = inner.get("llmSearchResponse") or {}
+        items = search_resp.get("data") or []
+        if not isinstance(items, list):
+            items = []
+
+        if not items:
+            lines.append("⚠️ 未搜索到相关资讯")
+            return "\n".join(lines)
+
+        items = MXClient._filter_recent_news(items, hours=hours)
 
         window = f"最近{hours}小时" if hours else "最近7天"
-        lines.append(f"**资讯结果: {len(deduped)} 条（{window}，已去重）**\n")
-        for item in deduped[:15]:
+        lines.append(f"**资讯结果: {len(items)} 条（{window}，已去重）**\n")
+        for item in items[:15]:
             if not isinstance(item, dict):
                 lines.append(f"  - {item}")
                 continue
-            title = item.get("title") or "?"
-            source = item.get("source") or ""
-            date = item.get("date") or ""
-            url = item.get("jumpUrl") or ""
-            content = item.get("content") or ""
-            info_type = item.get("informationType") or ""
-
-            # 标题（去掉尾部 "-来源" 后缀）
-            if " - " in title:
-                title = title.rsplit(" - ", 1)[0]
-
-            line = f"  - {title}"
+            info = MXClient._parse_fin_item(item)
+            line = f"  - {info['title']}"
             meta = []
-            if source:
-                meta.append(source)
-            if date:
-                meta.append(date[:10])
-            if info_type:
-                meta.append(info_type)
+            if info["source"] or info["ins_name"]:
+                meta.append(info["source"] or info["ins_name"])
+            if info["date"]:
+                meta.append(info["date"][:10])
+            if info["information_type"]:
+                meta.append(info["information_type"])
             if meta:
                 line += f"  [{', '.join(meta)}]"
             lines.append(line)
-            if url:
-                lines.append(f"    {url}")
-            if content:
+            if info["url"]:
+                lines.append(f"    {info['url']}")
+            if info["content"]:
                 # 内容截取前 100 字
-                lines.append(f"    {content[:100]}")
+                lines.append(f"    {info['content'][:100]}")
         return "\n".join(lines)
 
     @staticmethod
@@ -825,6 +1088,206 @@ def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ============================================================
+# 持仓体检 / 评级事件（P2：给加减仓/建仓/清仓补充基本面+资金面+事件面）
+# ============================================================
+
+def _pick_columns(columns: list, patterns: list[str]) -> list[str]:
+    """按子串匹配从列名列表中挑选关键列（保序去重，每个 pattern 只取首个命中）"""
+    picked: list[str] = []
+    for pat in patterns:
+        for c in columns:
+            if pat in c and c not in picked:
+                picked.append(c)
+                break
+    return picked
+
+
+def _compact_table(table: dict, patterns: list[str], max_rows: int = 4) -> str:
+    """把 query_structured 的表格压缩成紧凑文本（只保留关键列）"""
+    columns = table.get("columns") or []
+    cols = _pick_columns(columns, patterns)
+    if not cols:
+        return ""
+    lines = []
+    for row in (table.get("rows") or [])[:max_rows]:
+        date = str(row.get("日期", "")).strip()
+        cells = []
+        for c in cols:
+            v = row.get(c)
+            if v is not None and str(v).strip() not in ("", "-"):
+                label = c.replace("(区间)", "").strip()
+                cells.append(f"{label}={v}")
+        if cells:
+            prefix = f"{date}: " if date else ""
+            lines.append(f"  {prefix}{' | '.join(cells)}")
+    return "\n".join(lines)
+
+
+def _norm_code(c: str) -> str:
+    """归一化证券代码（去 SH/SZ/BJ 前缀与 . 后缀），用于 secu_list 精确匹配"""
+    c = (c or "").strip().upper()
+    for p in ("SH", "SZ", "BJ"):
+        c = c.replace(p, "")
+    return c.replace(".", "")
+
+
+def _belongs_to(item: dict, name: str, code: str) -> bool:
+    """资讯是否真正关联该证券：优先 secu_list 代码/简称匹配，缺失时退化标题/全称包含简称"""
+    secus = item.get("secu_list") or []
+    if secus:
+        for s in secus:
+            if _norm_code(s.get("code")) == _norm_code(code):
+                return True
+            if s.get("name") and s.get("name") == name:
+                return True
+        return False
+    hay = (item.get("title") or "") + (item.get("entity_full_name") or "")
+    return name in hay
+
+
+def fetch_holdings_fundamental(config, holdings, max_holdings: int = 8) -> str:
+    """报告用：并发查询持仓的资金面+筹码+基本面（妙想 query_structured）
+
+    每个持仓 3 个维度（自然语言 → 结构化表格 → 压缩摘要）：
+      1. 资金面：近5日主力资金净流入趋势
+      2. 筹码：机构持股比例合计（按报告期，看机构进出）
+      3. 基本面：最新财报净利润同比/营收/ROE/负债率
+
+    返回格式化文本，失败或无 key 返回空串。
+    """
+    if not config.mx_apikeys or not holdings:
+        return ""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = get_mx_client(config)
+    items = [h for h in holdings if getattr(h, "amount", 0) > 0][:max_holdings]
+    if not items:
+        return ""
+
+    def _query_one(h):
+        name, code = h.name, h.code
+        parts: list[str] = []
+        try:
+            # 1. 资金面
+            tables = client.query_structured(f"{name} 近5日主力资金净流入")
+            if tables:
+                txt = _compact_table(tables[0], ["主力净流入资金", "净流入天数", "净流出天数"], max_rows=5)
+                if txt:
+                    parts.append(f"**资金面(近5日主力净流入)**:\n{txt}")
+            time.sleep(0.4)
+            # 2. 筹码
+            tables = client.query_structured(f"{name} 机构持股比例")
+            if tables:
+                txt = _compact_table(tables[0], ["机构持股比例"], max_rows=4)
+                if txt:
+                    parts.append(f"**筹码(机构持股比例)**:\n{txt}")
+            time.sleep(0.4)
+            # 3. 基本面
+            tables = client.query_structured(f"{name} 最新财报 净利润 营业收入 同比增长")
+            if tables:
+                txt = _compact_table(
+                    tables[0],
+                    ["净利润同比增长率", "营业收入", "净资产收益率ROE", "资产负债率"],
+                    max_rows=2,
+                )
+                if txt:
+                    parts.append(f"**基本面(最新财报)**:\n{txt}")
+        except Exception as e:
+            log.debug(f"持仓体检查询失败 {name}: {e}")
+        if not parts:
+            return None
+        return f"### {name}({code})\n" + "\n".join(parts)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_query_one, h) for h in items]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=60)
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    if not results:
+        return ""
+    return "**持仓体检（资金面+筹码+基本面）**\n\n" + "\n\n".join(results)
+
+
+def fetch_holdings_events(config, holdings, max_holdings: int = 8) -> str:
+    """报告用：并发检索持仓的研报评级 + 减持/增持/回购/解禁事件（妙想 fin_search_structured）
+
+    每个持仓 2 个维度：
+      1. 研报评级：最新研报的评级（买入/增持/中性/减持/卖出）+ 机构
+      2. 事件监控：减持/增持/回购/解禁/业绩预告/质押
+
+    返回格式化文本，失败或无 key 返回空串。
+    """
+    if not config.mx_apikeys or not holdings:
+        return ""
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = get_mx_client(config)
+    items = [h for h in holdings if getattr(h, "amount", 0) > 0][:max_holdings]
+    if not items:
+        return ""
+
+    _EVENT_KEYWORDS = ("减持", "增持", "回购", "解禁", "业绩预告", "质押")
+
+    def _search_one(h):
+        name, code = h.name, h.code
+        parts: list[str] = []
+        try:
+            # 1. 研报评级
+            reports = client.fin_search_structured(f"{name} 研报 评级 目标价")
+            rating_lines = []
+            for it in reports[:6]:
+                if (
+                    it.get("information_type") == "REPORT"
+                    and it.get("rating")
+                    and _belongs_to(it, name, code)
+                ):
+                    ins = it.get("ins_name") or "研报"
+                    rating_lines.append(f"    [{it['rating']}] {ins}: {it['title'][:36]}")
+            if rating_lines:
+                parts.append("**研报评级**:\n" + "\n".join(rating_lines[:3]))
+            time.sleep(0.4)
+            # 2. 事件监控
+            events = client.fin_search_structured(f"{name} 减持 增持 回购 解禁")
+            event_lines = []
+            for it in events[:8]:
+                t = it.get("title", "")
+                if any(k in t for k in _EVENT_KEYWORDS) and _belongs_to(it, name, code):
+                    itype = it.get("information_type", "")
+                    tag = "公告" if itype == "ANNOUNCEMENT" else (itype or "资讯")
+                    event_lines.append(f"    [{tag}] {t[:36]}")
+            if event_lines:
+                parts.append("**事件监控(减持/增持/回购/解禁)**:\n" + "\n".join(event_lines[:4]))
+        except Exception as e:
+            log.debug(f"持仓事件检索失败 {name}: {e}")
+        if not parts:
+            return None
+        return f"### {name}({code})\n" + "\n".join(parts)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_search_one, h) for h in items]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=60)
+                if r:
+                    results.append(r)
+            except Exception:
+                pass
+
+    if not results:
+        return ""
+    return "**持仓评级与事件监控**\n\n" + "\n\n".join(results)
 
 
 _mx_client: Optional[MXClient] = None

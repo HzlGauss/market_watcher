@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import statistics
+import time
 from typing import Optional
 
 from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData, MarketBreadth
@@ -269,15 +270,88 @@ def calc_sector_deviations(quotes: list[Quote]) -> dict[str, dict]:
     return deviations
 
 
+# ============================================================
+# 行业名 → 板块名 对齐（精确 → 手工别名表 → 模糊包含）
+# ============================================================
+
+_alias_cache: dict = {"_ts": 0.0, "_data": {}}
+_ALIAS_TTL = 300  # 别名表每 5 分钟重读一次，手工改表后最多 5 分钟生效
+
+
+def _load_industry_alias() -> dict[str, str]:
+    """读取 state/industry_alias.json 手工别名表（带缓存）
+
+    表内容形如 {"券商": "证券Ⅱ", "军工": "国防军工", ...}，
+    用于把 ETF 名称推断出的粗粒度行业名对齐到东财实时板块名。
+    """
+    global _alias_cache
+    now = time.time()
+    if now - _alias_cache["_ts"] < _ALIAS_TTL:
+        return _alias_cache["_data"]
+
+    from pathlib import Path
+    import json as _json
+    from app.utils import log
+
+    path = Path(__file__).resolve().parent.parent / "state" / "industry_alias.json"
+    alias: dict[str, str] = {}
+    try:
+        if path.exists():
+            raw = _json.loads(path.read_text(encoding="utf-8"))
+            alias = {k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, str) and v}
+    except Exception as e:
+        log.warning(f"行业别名表读取失败: {e}")
+    _alias_cache = {"_ts": now, "_data": alias}
+    return alias
+
+
+def _resolve_board_name(industry: str, board_names: set) -> Optional[str]:
+    """把（ETF 推断的）行业名解析到实时板块名
+
+    三层匹配：精确命中 → 手工别名表 → 模糊包含（板块名包含行业词）。
+    都匹配不到返回 None，调用方降级为「无板块指数」。
+    """
+    if not industry:
+        return None
+    # 1. 精确命中
+    if industry in board_names:
+        return industry
+    # 2. 手工别名表（同义词/改名，模糊救不了的）
+    alias = _load_industry_alias()
+    if industry in alias and alias[industry] in board_names:
+        return alias[industry]
+    # 3. 模糊：板块名包含行业词，优先非 III 级、名称最短
+    candidates = [bn for bn in board_names if industry in bn]
+    if candidates:
+        candidates.sort(key=lambda b: (b.endswith("Ⅲ"), len(b)))
+        return candidates[0]
+    return None
+
+
+# 宽基指数 ETF 行业标签 → 大盘指数基准名（对应 fetch_major_indices 返回的 name）
+_INDEX_ETF_BENCHMARK: dict[str, str] = {
+    "创业板": "创业板指",
+    "创业板50": "创业板50",
+    "沪深300": "沪深300",
+    "中证500": "中证500",
+    "中证1000": "中证1000",
+    "科创50": "科创50",
+    "科创": "科创50",
+}
+
+
 def analyze_sector_context(
     quotes: list[Quote],
     sector_boards: Optional[list] = None,
+    major_indices: Optional[list[Quote]] = None,
 ) -> dict:
     """综合分析标的与所属行业板块的关系
 
     Args:
         quotes: 已填充 industry 字段的行情列表
         sector_boards: 行业板块数据列表（SectorBoard），可选
+        major_indices: 大盘指数行情列表（Quote），可选；宽基指数 ETF
+            匹配不到行业板块时，回退用它做基准对比
 
     Returns:
         {
@@ -310,6 +384,9 @@ def analyze_sector_context(
                     "main_net": sb.main_net_inflow,
                 }
 
+    # 全部板块名集合（含 change_pct 为空的板块），供行业名对齐用
+    board_names = {sb.name for sb in sector_boards if sb.name} if sector_boards else set()
+
     # 2. Top/Bottom 板块
     if sector_boards:
         sorted_boards = sorted(
@@ -333,12 +410,29 @@ def analyze_sector_context(
             for q in group
         ]
 
+    # 大盘指数涨跌映射（宽基指数 ETF 兜底基准）
+    index_chg_map: dict[str, float] = {}
+    if major_indices:
+        index_chg_map = {
+            m.name: m.change_pct
+            for m in major_indices
+            if m.name and m.change_pct is not None
+        }
+
     # 4. 每只标的 vs 板块对比
     for q in quotes:
         ind = q.industry or q.type or ""
         if not ind or q.change_pct is None:
             continue
-        sector_chg = sector_chg_map.get(ind)
+        resolved = _resolve_board_name(ind, board_names)
+        sector_chg = sector_chg_map.get(resolved) if resolved else None
+        benchmark = "板块"  # 基准标签：行业板块，或回退后的宽基指数
+        if sector_chg is None:
+            # 行业板块匹配不到时，宽基指数 ETF 回退到大盘指数基准
+            index_name = _INDEX_ETF_BENCHMARK.get(ind)
+            if index_name and index_name in index_chg_map:
+                sector_chg = index_chg_map[index_name]
+                benchmark = index_name
         info: dict = {
             "sector": ind,
             "sector_chg": sector_chg,
@@ -349,11 +443,11 @@ def analyze_sector_context(
             rs = round(q.change_pct - sector_chg, 2)
             info["relative_strength"] = rs
             if rs > 1.0:
-                info["label"] = f"领先板块{rs:+.1f}%"
+                info["label"] = f"领先{benchmark}{rs:+.1f}%"
             elif rs < -1.0:
-                info["label"] = f"落后板块{rs:+.1f}%"
+                info["label"] = f"落后{benchmark}{rs:+.1f}%"
             else:
-                info["label"] = "与板块同步"
+                info["label"] = f"与{benchmark}同步"
         else:
             info["label"] = f"板块{ind}(无板块指数)"
 
@@ -460,6 +554,7 @@ def analyze(
         vol = q.volume
         amp = q.amplitude
         items: list[str] = []
+        priority_items: list[str] = []  # 高优先级资金流提醒（转向/背离），展示时排最前
 
         # ---- 涨跌幅异动 ----
         if cp is not None:
@@ -542,6 +637,7 @@ def analyze(
         inflow = q.main_net_inflow
         amount = q.amount
         ff = q.fund_flow  # 资金流向明细
+        total_net = ff.total_net if ff else None  # 总体净流入（超大+大+中+小）
         if inflow is not None and amount and amount > 0:
             inflow_pct = inflow / amount * 100  # 主力净流入占成交额百分比
 
@@ -559,6 +655,7 @@ def analyze(
             # 获取历史流强（从 prev_state 读取上轮数据做趋势对比）
             prev_flow = prev_state.get(q.code, {}).get("main_net_inflow") if isinstance(prev_state.get(q.code, {}), dict) else None
             prev_flow_pct = prev_state.get(q.code, {}).get("flow_pct") if isinstance(prev_state.get(q.code, {}), dict) else None
+            prev_total_net = prev_state.get(q.code, {}).get("total_net") if isinstance(prev_state.get(q.code, {}), dict) else None
             flow_trend = ""  # 趋势标注
             flow_intensity = ""  # 强度标注
             if prev_flow_pct is not None and prev_flow is not None:
@@ -589,6 +686,24 @@ def analyze(
                     elif intensity_ratio >= 1.5:
                         flow_intensity = "[偏强]"
 
+            # ---- 资金流转向提醒（主力 / 总体，跨周期符号反转） ----
+            # 过滤微小波动导致的假转向：当前净额需达到阈值以上才算有效转向
+            reversal_min = config.flow_reversal_min
+            if prev_flow is not None and inflow is not None:
+                if inflow > 0 and prev_flow < 0 and abs(inflow) >= reversal_min:
+                    priority_items.append("🔄 主力资金由流出转流入")
+                    alert_count += 1
+                elif inflow < 0 and prev_flow > 0 and abs(inflow) >= reversal_min:
+                    priority_items.append("🔄 主力资金由流入转流出")
+                    alert_count += 1
+            if prev_total_net is not None and total_net is not None:
+                if total_net > 0 and prev_total_net < 0 and abs(total_net) >= reversal_min:
+                    priority_items.append("🔄 总资金由流出转流入")
+                    alert_count += 1
+                elif total_net < 0 and prev_total_net > 0 and abs(total_net) >= reversal_min:
+                    priority_items.append("🔄 总资金由流入转流出")
+                    alert_count += 1
+
             # 主力大幅买入
             if inflow > 0 and inflow_pct >= buy_threshold:
                 context = f"(涨{cp:+.1f}%)" if cp and cp > 0 else (f"(跌{cp:+.1f}%)" if cp and cp < 0 else "(平盘)")
@@ -603,7 +718,8 @@ def analyze(
                     elif ff.is_mid_capital_active:
                         items.append(f"🔵 游资活跃{context}{trend_str}(中单{ff.medium_net/1e8:+.2f}亿,主力{ff.main_net/1e8:+.2f}亿)")
                     else:
-                        items.append(f"🔵 主力买入{context}{trend_str}(净{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%)")
+                        extra = f",总体{total_net/1e8:+.2f}亿" if total_net is not None else ""
+                        items.append(f"🔵 主力买入{context}{trend_str}(净{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%{extra})")
                 else:
                     items.append(f"🔵 主力买入{context}{trend_str}(净{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%)")
                 alert_count += 1
@@ -618,23 +734,34 @@ def analyze(
                     elif ff.is_retail_driven:
                         items.append(f"🔴 主力出逃{context}{trend_str}(主力{ff.main_net/1e8:+.2f}亿,散户接盘+{ff.small_net/1e8:.2f}亿)")
                     else:
-                        items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
+                        extra = f",总体{total_net/1e8:+.2f}亿" if total_net is not None else ""
+                        items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%{extra})")
                 else:
                     items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
                 alert_count += 1
 
-            # 量价背离
-            if cp is not None and cp > 2 and inflow < 0:
-                if ff and ff.super_large_net is not None and ff.super_large_net < 0:
-                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但超大单净流出{abs(ff.super_large_net)/1e8:.2f}亿)")
+            # 量价背离：价升但资金流出 / 价跌但资金流入（主力或总体口径）
+            # 回测结论：价升+资金流出若仅要求「任意净流出」会频繁「喊跌却涨」
+            # （日线回测 5 日反向 +1.67%、5 日胜率仅 41.7%），属普通获利了结而非顶部派发。
+            # 故此处收紧：净流出需达到显著幅度（主力占比达标 或 总资金净流出≥转向阈值）才算有效。
+            diverge_price = config.flow_diverge_pct
+            main_outflow = inflow < 0 and abs(inflow_pct) >= sell_threshold  # 主力净流出占比达标
+            total_outflow = total_net is not None and total_net < 0 and abs(total_net) >= reversal_min  # 总资金净流出达阈值
+            if cp is not None and cp > diverge_price and (main_outflow or total_outflow):
+                if ff and ff.super_large_net is not None and ff.super_large_net < 0 and abs(ff.super_large_net) >= reversal_min:
+                    priority_items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但超大单净流出{abs(ff.super_large_net)/1e8:.2f}亿)")
+                elif total_outflow:
+                    priority_items.append(f"⚠️ 价升资金流出(涨{cp:+.1f}%但总资金净流出{abs(total_net)/1e8:.2f}亿)")
                 else:
-                    items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
+                    priority_items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
                 alert_count += 1
-            elif cp is not None and cp < -2 and inflow > 0 and inflow_pct >= diverge_threshold:
+            elif cp is not None and cp < -diverge_price and ((inflow > 0 and inflow_pct >= diverge_threshold) or (total_net is not None and total_net > 0)):
                 if ff and ff.is_institution_driven:
-                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但超大单流入+{ff.super_large_net/1e8:.2f}亿)")
+                    priority_items.append(f"💎 打压吸筹(跌{cp:+.1f}%但超大单流入+{ff.super_large_net/1e8:.2f}亿)")
+                elif total_net is not None and total_net > 0:
+                    priority_items.append(f"💎 价跌资金流入(跌{cp:+.1f}%但总资金净流入{total_net/1e8:+.2f}亿)")
                 else:
-                    items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
+                    priority_items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
                 alert_count += 1
 
             # 散户主导上涨（追高风险）
@@ -822,8 +949,15 @@ def analyze(
         elif q.type != "指数":
             items.insert(0, "📊 数据不足，无法评分")
 
-        if items:
-            alerts.append(Alert(code=q.code, name=q.name, messages=items))
+        if priority_items or items:
+            alerts.append(Alert(
+                code=q.code, name=q.name,
+                messages=priority_items + items,
+                priority=bool(priority_items),
+            ))
+
+    # 高优先级资金流提醒（转向/背离）排在最前
+    alerts.sort(key=lambda a: not a.priority)
 
     stats = AnalysisStats(
         total=len(quotes),

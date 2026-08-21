@@ -1,15 +1,21 @@
 """
-智能选股管线 —— 妙想 + LLM + 主力资金持续低吸
+智能选股管线 —— 妙想 + LLM + 主力资金持续低吸 + 估值分位
 
-策略：稳健 / 低位埋伏。核心逻辑是「先用东财板块资金流排名锁定『主力净流入多 +
-涨幅小』的资金潜伏板块，再在这些板块内找低位滞涨 + 主力持续低吸 + 尚未启动的个股」
-——板块有资金悄悄流入但还没涨（潜伏），个股在低位横盘、主力持续吸筹，等板块启动时补涨。
+策略：稳健 / 低位埋伏 + 价值。核心逻辑分两层：
+  1. 板块层：先用东财板块资金流排名锁定「主力净流入多 + 涨幅小」的资金潜伏板块
+     （东财失败时回退 LLM 热点板块判断 + 妙想新闻题材/龙虎榜背景）
+  2. 个股层：在潜伏板块内找「低位滞涨 + 主力持续低吸 + 估值历史低位」的补涨标的
+     —— 资金持续悄悄流入但股价还没涨（低吸），估值分位低安全边际足，两者共振最划算。
 
-五阶段管线：
+综合评分 = 持续低吸子分（50%）+ 估值分位子分（50%）：
+  - 持续低吸：主力连续净流入 + 股价横盘/微跌的背离度、净流入天数、累计净流入规模、占比趋势
+  - 估值分位：主力净流入占流通市值强度 + PE-TTM 历史百分位（分位越低越便宜分越高）
+
+六阶段管线：
   Stage 0  数据驱动板块选择：东财板块资金流排名（5日）→ 筛「主力净流入多 + 涨幅小」潜伏板块
            （东财失败时回退 LLM 热点板块判断 + 妙想新闻题材/龙虎榜背景）
-  Stage 1  妙想 stock_screen 执行 → 候选池（跨条件去重 + 共振加分）
-  Stage 2  主力资金持续低吸评分 + 多维过滤（黑名单板块/概念 + ST/退市 + 新股/次新股，核心）
+  Stage 1  妙想 stock_screen 执行 → 候选池（跨条件去重 + 共振加分，同时带出 flow_days 与估值字段）
+  Stage 2  综合评分（持续低吸 + 估值分位）+ 多维过滤（黑名单板块/概念 + ST/退市 + 新股/次新股，核心）
   Stage 3  LLM 综合排序解读 → 强关注/关注/风险分级
   Stage 4  报告生成 + 保存 + ServerChan 推送
 
@@ -39,43 +45,33 @@ NEWS_WINDOW_HOURS = 24  # 背景新闻回看窗口（小时）
 
 
 # ============================================================
-# 吸筹评分器（核心信号）
+# 吸筹评分器（核心信号）：持续低吸 + 估值分位
 # ============================================================
 
-def analyze_accumulation(
-    code: str,
-    name: str,
+def _main_pct_rising(flow_history: list[FundFlowDaily]) -> bool:
+    """主力净占比近 5 日是否较前 5 日上升（机构/大户吸筹深化）"""
+    pcts = [d.main_pct for d in flow_history if d.main_pct is not None]
+    if len(pcts) < 10:
+        return False
+    recent = pcts[-5:]
+    prior = pcts[-10:-5]
+    if len(recent) != 5 or len(prior) != 5:
+        return False
+    return (sum(recent) / 5.0) > (sum(prior) / 5.0)
+
+
+def _absorb_score(
     flow_history: list[FundFlowDaily],
     price_change_pct: Optional[float],
-) -> AccumulationScore:
-    """主力资金「持续低吸」评分（0-100）
+) -> tuple[float, dict]:
+    """持续低吸子分（0-100）+ 相关字段
 
     核心思想：主力资金连续净流入（低吸）但股价横盘/微跌（背离），
     意味着筹码在低位悄悄集中，行情随时可能启动。
-
-    评分维度（合计 100 分）：
-      - 净流入天数占比   0-25 分  （窗口内主力净流入天数越多越强）
-      - 最近连续净流入   0-15 分  （近期仍在持续吸筹加分）
-      - 背离度（灵魂）   0-35 分  （资金净流入 + 股价滞涨 = 背离，涨幅越小分越高）
-      - 累计净流入规模   0-15 分  （净流入金额越大越强）
-      - 主力占比趋势     0-10 分  （近 5 日主力净占比较前 5 日上升 = 吸筹深化）
-
-    Args:
-        code: 股票代码
-        name: 股票名称
-        flow_history: 多日资金流序列（按日期升序）
-        price_change_pct: 窗口股价涨跌幅（%），用于算背离度
-
-    Returns:
-        AccumulationScore
     """
-    notes: list[str] = []
     days = len(flow_history)
     if days == 0:
-        return AccumulationScore(
-            code=code, name=name, score=0.0, label="无数据",
-            notes=["无资金流数据"],
-        )
+        return 0.0, {}
 
     main_nets = [d.main_net or 0.0 for d in flow_history]
     inflow_days = sum(1 for n in main_nets if n > 0)
@@ -89,80 +85,182 @@ def analyze_accumulation(
         else:
             break
 
-    # 1. 净流入天数占比
+    # 1. 净流入天数占比 0-25
     inflow_score = (inflow_days / max(days, 1)) * 25.0
-
-    # 2. 最近连续净流入
+    # 2. 最近连续净流入 0-15
     consecutive_score = (min(consecutive_days, 5) / 5.0) * 15.0
-
-    # 3. 背离度（灵魂）：资金净流入但股价滞涨
+    # 3. 背离度（灵魂）0-35：资金净流入 + 股价滞涨
     divergence: Optional[float] = None
     if total_net > 0 and price_change_pct is not None:
         pc = price_change_pct
         if pc <= 0:
             divergence = 1.0  # 资金净流入 + 股价下跌 = 最强背离
         elif pc < 5:
-            divergence = 1.0 - (pc / 5.0) * 0.5  # 0~5% 之间线性衰减到 0.5
+            divergence = 1.0 - (pc / 5.0) * 0.5
         else:
-            divergence = max(0.0, 0.5 - (pc - 5.0) / 30.0)  # 5%+ 继续衰减，约 20% 归零
+            divergence = max(0.0, 0.5 - (pc - 5.0) / 30.0)
         divergence = max(0.0, min(1.0, divergence))
     divergence_score = (divergence or 0.0) * 35.0
-
-    # 4. 累计净流入规模（粗略：每 5000 万加 1 分，封顶 15）
-    if total_net > 0:
-        net_score = min(15.0, 8.0 + abs(total_net) / 5e7)
-    else:
-        net_score = 0.0
-
-    # 5. 主力净占比趋势（近 5 日 vs 前 5 日）
+    # 4. 累计净流入规模 0-15（每 5000 万 +1，封顶 15）
+    net_score = min(15.0, 8.0 + abs(total_net) / 5e7) if total_net > 0 else 0.0
+    # 5. 主力净占比趋势 0-10
     large_ratio_rising = _main_pct_rising(flow_history)
     large_ratio_score = 10.0 if large_ratio_rising else 0.0
 
-    score = round(inflow_score + consecutive_score + divergence_score + net_score + large_ratio_score, 1)
+    score = inflow_score + consecutive_score + divergence_score + net_score + large_ratio_score
+    score = max(0.0, min(100.0, score))
+    return score, {
+        "inflow_days": inflow_days,
+        "consecutive_days": consecutive_days,
+        "total_net": total_net,
+        "price_change_10d": price_change_pct,
+        "divergence": divergence,
+        "large_ratio_rising": large_ratio_rising,
+    }
+
+
+def _valuation_score(
+    main_net: Optional[float],
+    circulation_value: Optional[float],
+    valuation_status: str,
+    valuation_percentile: Optional[float],
+) -> tuple[float, dict]:
+    """估值分位子分（0-100）+ 相关字段
+
+    首要：资金流入强度 —— 主力净流入占流通市值比例（0-60）
+    次要：估值分位 —— PE-TTM 历史百分位 / 估值状态（0-40，分位越低越便宜分越高）
+    """
+    # 1. 流入强度（0-60）
+    inflow_strength_pct: Optional[float] = None
+    if main_net is not None and circulation_value:
+        inflow_strength_pct = main_net / circulation_value * 100.0
+    inflow_score = min(60.0, inflow_strength_pct * 30.0) if (
+        inflow_strength_pct is not None and inflow_strength_pct > 0) else 0.0
+
+    # 2. 估值分位（0-40）
+    val_score = 20.0  # 默认中性
+    if valuation_percentile is not None:
+        p = max(0.0, min(100.0, valuation_percentile))
+        val_score = (100.0 - p) / 100.0 * 40.0
+    elif valuation_status:
+        s = str(valuation_status)
+        if "较低" in s or "低估" in s or "偏低" in s:
+            val_score = 40.0
+        elif "较高" in s or "高估" in s or "偏高" in s:
+            val_score = 0.0
+        else:
+            val_score = 20.0
+
+    score = max(0.0, min(100.0, inflow_score + val_score))
+    return score, {
+        "inflow_strength_pct": inflow_strength_pct,
+        "valuation_status": valuation_status,
+        "valuation_percentile": valuation_percentile,
+    }
+
+
+def analyze_accumulation(
+    code: str,
+    name: str,
+    flow_history: list[FundFlowDaily],
+    price_change_pct: Optional[float],
+    main_net: Optional[float],
+    circulation_value: Optional[float],
+    valuation_status: str = "",
+    valuation_percentile: Optional[float] = None,
+) -> AccumulationScore:
+    """综合评分（0-100）= 持续低吸子分（50%）+ 估值分位子分（50%）
+
+    缺某一维度数据时，用另一维度单独撑起（比例保持 100 分制）。
+    两者都缺时返回「无数据」。
+
+    Args:
+        code / name: 股票代码、名称
+        flow_history: 多日资金流序列（按日期升序）
+        price_change_pct: 窗口股价涨跌幅（%），用于算背离度
+        main_net: 主力净流入额（元，妙想当日口径）
+        circulation_value: 流通市值（元），用于算净流入强度
+        valuation_status: 估值状态（估值较低/适中/较高）
+        valuation_percentile: PE-TTM 历史百分位（0-100，越小越便宜）
+
+    Returns:
+        AccumulationScore
+    """
+    notes: list[str] = []
+    has_absorb = bool(flow_history)
+    has_val = main_net is not None or bool(valuation_status) or valuation_percentile is not None
+
+    if not has_absorb and not has_val:
+        return AccumulationScore(
+            code=code, name=name, score=0.0, label="无数据",
+            notes=["无资金流/估值数据"],
+        )
+
+    absorb_score, absorb = _absorb_score(flow_history, price_change_pct) if has_absorb else (None, {})
+    val_score, val = _valuation_score(
+        main_net, circulation_value, valuation_status, valuation_percentile,
+    ) if has_val else (None, {})
+
+    if absorb_score is not None and val_score is not None:
+        score = round(0.5 * absorb_score + 0.5 * val_score, 1)
+    elif absorb_score is not None:
+        score = round(absorb_score, 1)
+    else:
+        score = round(val_score, 1)
     score = max(0.0, min(100.0, score))
 
+    # 主力净流入：优先用窗口累计口径，缺省回退当日口径
+    total_net = absorb.get("total_net") if absorb.get("total_net") is not None else main_net
+
     # 标签
-    if total_net < 0:
+    if total_net is not None and total_net < 0:
         label = "出货"
     elif score >= 70:
-        label = "强吸筹"
+        label = "强吸筹+低估值"
     elif score >= 50:
-        label = "吸筹"
-    else:
+        label = "吸筹+估值适中"
+    elif score >= 30:
         label = "中性"
+    else:
+        label = "偏弱"
 
     # 判定说明
-    notes.append(f"窗口{inflow_days}/{days}日净流入，连续{consecutive_days}日")
-    if total_net > 0:
-        notes.append(f"累计净流入 {total_net / 1e8:.2f} 亿")
-    else:
-        notes.append(f"累计净流出 {abs(total_net) / 1e8:.2f} 亿")
-    if price_change_pct is not None:
-        notes.append(f"窗口涨幅 {price_change_pct:+.1f}%")
-    if divergence is not None:
-        notes.append(f"背离度 {divergence:.2f}")
-    if large_ratio_rising:
-        notes.append("主力占比近5日上升")
+    if has_absorb:
+        notes.append(f"窗口{absorb['inflow_days']}/{len(flow_history)}日净流入，连续{absorb['consecutive_days']}日")
+        if absorb["total_net"] is not None:
+            if absorb["total_net"] > 0:
+                notes.append(f"累计净流入 {absorb['total_net'] / 1e8:.2f} 亿")
+            else:
+                notes.append(f"累计净流出 {abs(absorb['total_net']) / 1e8:.2f} 亿")
+        if absorb["price_change_10d"] is not None:
+            notes.append(f"窗口涨幅 {absorb['price_change_10d']:+.1f}%")
+        if absorb["divergence"] is not None:
+            notes.append(f"背离度 {absorb['divergence']:.2f}")
+        if absorb["large_ratio_rising"]:
+            notes.append("主力占比近5日上升")
+    if has_val:
+        if main_net is not None:
+            notes.append(f"主力净流入 {main_net / 1e8:.2f} 亿")
+        if val.get("inflow_strength_pct") is not None:
+            notes.append(f"净流入占流通市值 {val['inflow_strength_pct']:.2f}%")
+        if valuation_status:
+            notes.append(f"估值: {valuation_status}")
+        if valuation_percentile is not None:
+            notes.append(f"PE-TTM 历史分位 {valuation_percentile:.0f}%")
 
     return AccumulationScore(
         code=code, name=name, score=score, label=label,
-        inflow_days=inflow_days, consecutive_days=consecutive_days,
-        total_net=total_net, price_change_10d=price_change_pct,
-        divergence=divergence, large_ratio_rising=large_ratio_rising,
+        inflow_days=absorb.get("inflow_days", 0),
+        consecutive_days=absorb.get("consecutive_days", 0),
+        total_net=total_net,
+        price_change_10d=absorb.get("price_change_10d"),
+        divergence=absorb.get("divergence"),
+        large_ratio_rising=absorb.get("large_ratio_rising", False),
+        inflow_strength_pct=val.get("inflow_strength_pct"),
+        valuation_status=val.get("valuation_status", ""),
+        valuation_percentile=val.get("valuation_percentile"),
         notes=notes,
     )
-
-
-def _main_pct_rising(flow_history: list[FundFlowDaily]) -> bool:
-    """主力净占比近 5 日是否较前 5 日上升（机构/大户吸筹深化）"""
-    pcts = [d.main_pct for d in flow_history if d.main_pct is not None]
-    if len(pcts) < 10:
-        return False
-    recent = pcts[-5:]
-    prior = pcts[-10:-5]
-    if len(recent) != 5 or len(prior) != 5:
-        return False
-    return (sum(recent) / 5.0) > (sum(prior) / 5.0)
 
 
 # ============================================================
@@ -280,7 +378,7 @@ SCREENING_TOOL = {
                             "sector": {"type": "string", "description": "所属热点板块名"},
                             "condition": {
                                 "type": "string",
-                                "description": "妙想可执行的自然语言选股条件（带板块限定，低位埋伏方向，与当前时点一致的语义）",
+                                "description": "妙想可执行的自然语言选股条件（带板块限定，低位埋伏+低估值方向，与当前时点一致的语义）",
                             },
                             "intent": {"type": "string", "description": "策略意图"},
                             "risk_note": {"type": "string", "description": "风险提示"},
@@ -297,7 +395,7 @@ SCREENING_TOOL = {
 
 def _build_stage1_prompt(context: str, blacklist: list[str], count: int) -> str:
     lines = [
-        f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。你是一名A股低位埋伏策略师。请根据以下市场背景，判断当前热点板块并给出妙想智能选股条件。",
+        f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。你是一名A股低位埋伏+价值策略师。请根据以下市场背景，判断当前热点板块并给出妙想智能选股条件。",
         "",
         "【板块黑名单 —— 严禁选为热点、严禁出现在任何条件中】",
         "、".join(blacklist) if blacklist else "（无）",
@@ -305,7 +403,7 @@ def _build_stage1_prompt(context: str, blacklist: list[str], count: int) -> str:
         f"【要求】输出 {count} 条选股条件，覆盖 3~5 个热点板块；条件必须带板块限定、使用与当前时点一致的语义。",
         "",
         "【市场背景】",
-        context if context else "（背景数据获取失败，请基于常识谨慎判断；若无法判断热点，hot_sectors 可留空、conditions 可给通用低位埋伏条件）",
+        context if context else "（背景数据获取失败，请基于常识谨慎判断；若无法判断热点，hot_sectors 可留空、conditions 可给通用低位埋伏+低估值条件）",
         "",
         "请调用 submit_screening_plan 工具提交结果。",
     ]
@@ -406,6 +504,10 @@ def _run_mx_screening(
                     market=row.get("market", "") or _detect_market(code),
                     price=row.get("price"),
                     change_pct=row.get("change_pct"),
+                    main_net=row.get("main_net"),
+                    circulation_value=row.get("circulation_value"),
+                    valuation_status=row.get("valuation_status", ""),
+                    valuation_percentile=row.get("valuation_percentile"),
                     industry=row.get("industry", ""),
                     concept=row.get("concept", ""),
                 )
@@ -430,7 +532,7 @@ def _run_mx_screening(
 
 
 # ============================================================
-# Stage 3：主力资金持续低吸评分 + 板块黑名单硬过滤（核心）
+# Stage 3：综合评分（持续低吸 + 估值分位）+ 板块黑名单硬过滤（核心）
 # ============================================================
 
 def _hits_blacklist(text: Optional[str], blacklist: list[str]) -> bool:
@@ -499,7 +601,7 @@ def _exclusion_reason(
 def _score_accumulation(
     config: Config, candidates: list[ScreeningCandidate]
 ) -> list[ScreeningCandidate]:
-    """对候选做资金流持续低吸评分，并执行多维排除过滤 + 截断到上限"""
+    """对候选做「持续低吸 + 估值分位」综合评分，并执行多维排除过滤 + 截断到上限"""
     if not candidates:
         return []
 
@@ -566,7 +668,7 @@ def _score_accumulation(
             flow_map[c.code] = []
         time.sleep(0.5)
 
-    # 4b. 串行拉K线（AKShare 个股限流约 1 次/秒）+ 计算背离度 + 评分
+    # 4b. 串行拉K线（AKShare 个股限流约 1 次/秒）+ 计算背离度 + 综合评分
     from app import technical
     for c in kept:
         flow = flow_map.get(c.code, [])
@@ -589,7 +691,10 @@ def _score_accumulation(
         except Exception as e:
             log.debug(f"K线获取失败 {c.code}: {e}")
 
-        c.accumulation = analyze_accumulation(c.code, c.name, flow, price_chg)
+        c.accumulation = analyze_accumulation(
+            c.code, c.name, flow, price_chg,
+            c.main_net, c.circulation_value, c.valuation_status, c.valuation_percentile,
+        )
         time.sleep(0.7)
 
     return kept
@@ -600,7 +705,7 @@ def _score_accumulation(
 # ============================================================
 
 def _finalize_ranking(candidates: list[ScreeningCandidate]) -> list[ScreeningCandidate]:
-    """按吸筹分排序 + 确定性分级 + 排名（供报告与 __main__ 摘要用）"""
+    """按综合分排序 + 确定性分级 + 排名（供报告与 __main__ 摘要用）"""
     scored = [c for c in candidates if c.accumulation is not None]
     scored.sort(key=lambda c: c.accumulation.score, reverse=True)
     for i, c in enumerate(scored, 1):
@@ -633,8 +738,8 @@ def _industry_label(c: ScreeningCandidate) -> str:
 
 def _build_stage4_prompt(top: list[ScreeningCandidate], sectors: list[SectorFundFlow]) -> str:
     lines = [
-        f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。以下是机器筛出的「低位吸筹」候选（已按吸筹分排序）。"
-        "请结合所属板块资金潜伏强度、技术位置、资金持续低吸强度，做综合排序与分级。"
+        f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。以下是机器筛出的「低位吸筹+低估值」候选（已按综合分排序）。"
+        "请结合所属板块资金潜伏强度、技术位置、资金持续低吸强度、估值分位，做综合排序与分级。"
         "（输出标题与日期时请使用今天日期，不要臆造。）",
         "",
     ]
@@ -653,15 +758,19 @@ def _build_stage4_prompt(top: list[ScreeningCandidate], sectors: list[SectorFund
         industry = _industry_label(c)
         div = f"{acc.divergence:.2f}" if acc and acc.divergence is not None else "—"
         pchg = f"{acc.price_change_10d:+.1f}%" if acc and acc.price_change_10d is not None else "—"
+        strength = f"{acc.inflow_strength_pct:.2f}%" if acc and acc.inflow_strength_pct is not None else "—"
+        val = acc.valuation_status if acc and acc.valuation_status else (
+            f"分位{acc.valuation_percentile:.0f}%" if acc and acc.valuation_percentile is not None else "—"
+        )
         tech = "、".join(c.tech_signals) if c.tech_signals else "—"
         price = f"{c.last_price:.2f}元" if c.last_price else "—"
         ma20 = f"{c.ma20:.2f}元" if c.ma20 else "—"
         sup = f"{c.support:.2f}元" if c.support else "—"
         res = f"{c.resistance:.2f}元" if c.resistance else "—"
         lines.append(
-            f"- {c.name}({c.code}) 行业={industry} 潜伏板块={hot} 吸筹分={acc.score:.1f} "
+            f"- {c.name}({c.code}) 行业={industry} 潜伏板块={hot} 综合分={acc.score:.1f} "
             f"净流入{acc.inflow_days}天 连续{acc.consecutive_days}天 背离度={div} "
-            f"窗口涨幅={pchg} 现价={price} MA20={ma20} 支撑={sup} 压力={res} 技术={tech}"
+            f"窗口涨幅={pchg} 占流通={strength} 估值={val} 现价={price} MA20={ma20} 支撑={sup} 压力={res} 技术={tech}"
         )
     lines.append("")
     lines.append(
@@ -680,7 +789,7 @@ def _analyze_and_rank(
     if not (config.llm_enabled and config.deepseek_key):
         return ""
 
-    top = candidates[:15]  # 只传吸筹分 top 15，控制 prompt 大小
+    top = candidates[:15]  # 只传综合分 top 15，控制 prompt 大小
     prompt = _build_stage4_prompt(top, sectors)
     try:
         from app.llm_client import get_llm_client, SYSTEM_PROMPTS
@@ -732,10 +841,10 @@ def _fallback_technical_screen(config: Config) -> list[ScreeningCandidate]:
 
 def _build_markdown(report: ScreeningReport) -> str:
     lines = [
-        "# 🎯 智能选股（资金潜伏板块 · 低位埋伏 · 主力持续低吸）",
+        "# 🎯 智能选股（资金潜伏板块 · 低位埋伏 · 持续低吸+估值分位）",
         "",
         f"**日期**: {report.date}",
-        "**策略**: 先锁「主力净流入多 + 涨幅小」的资金潜伏板块 → 板块内找「低位滞涨 + 主力持续低吸」的补涨标的",
+        "**策略**: 先锁「主力净流入多 + 涨幅小」的资金潜伏板块 → 板块内找「低位滞涨 + 主力持续低吸 + 估值历史低位」的补涨标的",
     ]
     if report.degraded:
         lines.append("**模式**: ⚠️ 降级（妙想/LLM 不可用，已回退技术面筛选）")
@@ -768,22 +877,26 @@ def _build_markdown(report: ScreeningReport) -> str:
             lines.append(f"| {c.sector} | {c.condition} | {c.intent} |")
         lines.append("")
 
-    lines.append("## 📈 候选标的（按吸筹分排序）")
+    lines.append("## 📈 候选标的（按综合分排序）")
     lines.append("")
     if not report.candidates:
         lines.append("> 无候选。今日可能非交易日，或妙想/技术面筛选均未命中。")
     else:
-        lines.append("| 排名 | 代码 | 名称 | 行业 | 潜伏板块 | 吸筹分 | 评级 | 背离度 | 净流入天数 |")
-        lines.append("|------|------|------|------|---------|--------|------|--------|-----------|")
+        lines.append("| 排名 | 代码 | 名称 | 行业 | 潜伏板块 | 综合分 | 评级 | 背离度 | 净流入天数 | 占流通 | 估值 |")
+        lines.append("|------|------|------|------|---------|--------|------|--------|-----------|--------|------|")
         for c in report.candidates:
             acc = c.accumulation
             score = f"{acc.score:.1f}" if acc else "—"
             label = acc.label if acc else "—"
             div = f"{acc.divergence:.2f}" if acc and acc.divergence is not None else "—"
             inflow = f"{acc.inflow_days}" if acc else "—"
+            strength = f"{acc.inflow_strength_pct:.2f}%" if acc and acc.inflow_strength_pct is not None else "—"
+            val = acc.valuation_status if acc and acc.valuation_status else (
+                f"{acc.valuation_percentile:.0f}%" if acc and acc.valuation_percentile is not None else "—"
+            )
             industry = _industry_label(c)
             hot = "、".join(c.hot_sectors) or "—"
-            lines.append(f"| {c.rank} | {c.code} | {c.name} | {industry} | {hot} | {score} | {label} | {div} | {inflow} |")
+            lines.append(f"| {c.rank} | {c.code} | {c.name} | {industry} | {hot} | {score} | {label} | {div} | {inflow} | {strength} | {val} |")
         lines.append("")
 
     if report.llm_analysis:
@@ -798,7 +911,7 @@ def run_smart_screening(config: Config) -> ScreeningReport:
     Returns:
         ScreeningReport（含热点板块、条件、候选、LLM 解读），报告已落盘并推送
     """
-    log.info("========== 智能选股（资金潜伏板块 · 低位埋伏 · 主力持续低吸） ==========")
+    log.info("========== 智能选股（资金潜伏板块 · 持续低吸 + 估值分位） ==========")
     report = ScreeningReport(date=datetime.now().strftime("%Y-%m-%d"))
     context = ""
 
@@ -828,7 +941,7 @@ def run_smart_screening(config: Config) -> ScreeningReport:
         candidates = _fallback_technical_screen(config)
         log.info(f"技术面兜底: {len(candidates)} 只候选")
 
-    # Stage 2：吸筹评分 + 黑名单过滤
+    # Stage 2：综合评分（持续低吸 + 估值分位）+ 黑名单过滤
     candidates = _score_accumulation(config, candidates)
     candidates = _finalize_ranking(candidates)
     report.candidates = candidates
@@ -849,7 +962,7 @@ def run_smart_screening(config: Config) -> ScreeningReport:
         saved = reporter._save_report(content, "智能选股", save_dir)
         log.info(f"报告已保存: {saved}")
         if config.push_enabled and config.sct_sendkey:
-            reporter._push_report("智能选股（低位吸筹）", content, config)
+            reporter._push_report("智能选股（持续低吸+估值分位）", content, config)
     except Exception as e:
         log.warning(f"报告保存/推送失败: {e}")
 

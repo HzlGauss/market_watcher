@@ -100,11 +100,11 @@ def print_quotes_table(quotes: list[Quote]) -> None:
 
     header = (
         f"{'代码':>8} {'名称':<12} {'最新价':>8} {'均价':>8} "
-        f"{'涨跌幅':>8} {'主力净流入':>10} {'资金信号':<14} "
+        f"{'涨跌幅':>8} {'主力净流入':>10} {'总体':>10} {'资金信号':<14} "
         f"{'量比':>6} {'换手率':>8} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 100}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 112}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -155,6 +155,17 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         else:
             flow_str = f"{Color.DIM}  ---  {Color.RESET}"
 
+        # 总体净流入（超大+大+中+小，东财四档齐全时才有）
+        total_net_val = q.fund_flow.total_net if (q.fund_flow and q.fund_flow.total_net is not None) else None
+        if total_net_val is not None:
+            total_str = _format_compact_flow(total_net_val)
+            if total_net_val > 0:
+                total_str = f"{Color.RED}{total_str}{Color.RESET}"
+            elif total_net_val < 0:
+                total_str = f"{Color.GREEN}{total_str}{Color.RESET}"
+        else:
+            total_str = f"{Color.DIM}  ---  {Color.RESET}"
+
         # 资金信号
         sig_str = _format_flow_signal(q)
 
@@ -188,7 +199,7 @@ def print_quotes_table(quotes: list[Quote]) -> None:
 
         line = (
             f"{q.code:>8} {q.name:<12} {price:>8} {avg_str:>8} {cp:>8} "
-            f"{flow_str:>10} {sig_str:<14} "
+            f"{flow_str:>10} {total_str:>10} {sig_str:<14} "
             f"{vr_str:>6} {tr_str:>8} {amp_str:>7}"
         )
         print(f"  {line}")
@@ -256,7 +267,11 @@ def print_alerts(alerts: list[Alert]) -> None:
     print(f"\n{Color.BOLD}{Color.YELLOW}═══ 异动提醒详情 ═══{Color.RESET}")
     for a in alerts:
         msg = " | ".join(a.messages)
-        print(f"  {Color.BOLD}{a.name}({a.code}){Color.RESET}  →  {msg}")
+        if a.priority:
+            # 高优先级资金流提醒：红色加粗，醒目置顶
+            print(f"  {Color.BOLD}{Color.RED}{a.name}({a.code}){Color.RESET}  →  {Color.BOLD}{Color.RED}{msg}{Color.RESET}")
+        else:
+            print(f"  {Color.BOLD}{a.name}({a.code}){Color.RESET}  →  {msg}")
     print()
 
 

@@ -29,8 +29,30 @@ def _detect_market(code: str, provided_market: str = "") -> str:
     # 上海代码特征：60, 68, 51, 58
     if code.startswith(("60", "68", "51", "58")):
         return "SH"
-        
+
     return "SH"  # 默认上海
+
+
+def is_a_share_stock(code: str, market: str = "") -> bool:
+    """判断是否为普通 A 股（排除 ETF/LOF/封闭基金/B 股/港股）
+
+    用于判断某标的是否可能有两融（融资融券）数据——只有普通 A 股
+    才可能是融资融券标的，ETF/基金/港股没有个股两融明细。
+
+    号段规则：
+    - 港股为 5 位代码 → False
+    - 上海：60xxxx(主板) / 68xxxx(科创板) 是股票；5xxxxx(ETF/基金)、9xxxxx(B股) 排除
+    - 深圳：00xxxx(主板) / 30xxxx(创业板) 是股票；15/16/18xxxx(ETF/LOF/封闭基金)、20xxxx(B股) 排除
+    """
+    c = str(code).strip()
+    if len(c) != 6:
+        return False
+    m = _detect_market(c, market)
+    if m == "SH":
+        return c.startswith(("60", "68"))
+    if m == "SZ":
+        return c.startswith(("00", "30"))
+    return False
 
 
 def validate_watch_item(item: dict, source: str = "unknown") -> Optional[WatchItem]:

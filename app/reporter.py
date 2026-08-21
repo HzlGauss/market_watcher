@@ -1105,6 +1105,9 @@ def generate_midday_review(config: Config) -> Path | None:
 # Evening Review 16:00
 # ============================================================
 
+FUND_FLOW_DISPLAY_LIMIT = 15  # 主力资金动向表格最多展示的标的数（按主力净流入占比截断）
+
+
 def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") -> tuple[str, str]:
     """生成主力资金流向摘要，返回 (数据区Markdown, LLM紧凑文本)
 
@@ -1122,7 +1125,9 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     total_large = 0.0
     total_medium = 0.0
     total_small = 0.0
+    total_overall = 0.0
     has_detail = False
+    has_overall = False
     for q in has_flow:
         pct = q.main_net_inflow / q.amount * 100  # type: ignore[operator]
         total_inflow += q.main_net_inflow  # type: ignore[operator]
@@ -1137,6 +1142,9 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                 total_medium += ff.medium_net
             if ff.small_net is not None:
                 total_small += ff.small_net
+            if ff.total_net is not None:
+                total_overall += ff.total_net
+                has_overall = True
         scored.append((q, pct))
     scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -1145,10 +1153,10 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     md_lines.append("")
 
     if has_detail:
-        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占比 | 超大单 | 大单 | 中单 | 散户(小单) | 信号 |")
-        md_lines.append("|------|--------|-----------|------|--------|------|------|-----------|------|")
+        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占比 | 超大单 | 大单 | 中单 | 散户(小单) | 总体 | 信号 |")
+        md_lines.append("|------|--------|-----------|------|--------|------|------|-----------|------|------|")
 
-        for q, pct in scored[:8]:
+        for q, pct in scored[:FUND_FLOW_DISPLAY_LIMIT]:
             chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
             inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
             ff = q.fund_flow
@@ -1157,6 +1165,7 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                 lg_str = _format_money(ff.large_net) if ff.large_net is not None else "--"
                 md_str = _format_money(ff.medium_net) if ff.medium_net is not None else "--"
                 sm_str = _format_money(ff.small_net) if ff.small_net is not None else "--"
+                ov_str = _format_money(ff.total_net) if ff.total_net is not None else "--"
                 # 信号判断（使用增强的资金结构标签）
                 sig = ff.flow_structure if ff.is_valid else ("⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出"))
                 # 映射到带图标的标签
@@ -1177,17 +1186,17 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                 if split:
                     sig = f"{sig} {split}"
             else:
-                sl_str = lg_str = md_str = sm_str = "--"
+                sl_str = lg_str = md_str = sm_str = ov_str = "--"
                 sig = "⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出")
             md_lines.append(
                 f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% "
-                f"| {sl_str} | {lg_str} | {md_str} | {sm_str} | {sig} |"
+                f"| {sl_str} | {lg_str} | {md_str} | {sm_str} | {ov_str} | {sig} |"
             )
     else:
         # 无明细数据时沿用旧格式
         md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 信号 |")
         md_lines.append("|------|--------|-----------|---------|------|")
-        for q, pct in scored[:8]:
+        for q, pct in scored[:FUND_FLOW_DISPLAY_LIMIT]:
             chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
             inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
             if pct >= 15:
@@ -1209,6 +1218,8 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
         if has_detail:
             summary += f" | 超大单: {total_super_large/1e8:+.2f}亿 | 大单: {total_large/1e8:+.2f}亿"
             summary += f" | 中单: {total_medium/1e8:+.2f}亿 | 散户: {total_small/1e8:+.2f}亿"
+        if has_overall:
+            summary += f" | 总体: {total_overall/1e8:+.2f}亿"
         md_lines.append(f"\n{summary}")
     elif abs(total_inflow) >= 1e6:
         direction = "净流入" if total_inflow > 0 else "净流出"
@@ -1216,6 +1227,8 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
         if has_detail:
             summary += f" | 超大单: {total_super_large/1e4:+.0f}万"
             summary += f" | 散户: {total_small/1e4:+.0f}万"
+        if has_overall:
+            summary += f" | 总体: {total_overall/1e4:+.0f}万"
         md_lines.append(f"\n{summary}")
 
     md = "\n".join(md_lines) + "\n"
@@ -1595,6 +1608,10 @@ def _analyze_capital_flow(quote: Quote, prev_volume: float | None = None) -> str
             parts.append(f"主力净流入{ff.main_net/1e4:+.1f}万")
         else:
             parts.append(f"主力净流入{ff.main_net/1e4:+.2f}万")
+
+        # 总体净流入（超大+大+中+小）
+        if ff.total_net is not None and abs(ff.total_net) >= 1e6:
+            parts.append(f"总体{ff.total_net/1e8:+.2f}亿")
 
         # 资金结构
         if ff.is_institution_driven:
@@ -3255,7 +3272,7 @@ def generate_evening_review(config: Config) -> Path | None:
             data_lines.append("")
 
     # 主力资金流向
-    fund_md_ev, fund_llm_ev = _format_fund_flow_section(quotes, label="自选")
+    fund_md_ev, fund_llm_ev = _format_fund_flow_section(quotes, label="持仓")
     if fund_md_ev:
         data_lines.append(f"\n## 十三、💰 主力资金动向（全天）")
         data_lines.append(fund_md_ev)
@@ -3292,18 +3309,73 @@ def generate_evening_review(config: Config) -> Path | None:
                 )
             data_lines.append("")
 
-    # 妙想增强：持仓逐个消息 + 智能选股（盘中快讯已在"一"用妙想）
-    from app.miaoxiang import fetch_stock_screen_for_report, fetch_holdings_news
+    # 个股两融数据（融资融券，逐标的：持仓 + 自选，仅普通 A 股）
+    from app.data_fetcher import fetch_stock_margin_detail
+    from app.helpers import is_a_share_stock
+    stock_margin = fetch_stock_margin_detail()
+    margin_targets = []  # [(name, code, StockMarginData)]
+    margin_llm = []
+    seen_codes = set()
+    for h in list(holdings) + [
+        Holding(name=w.name, code=w.code, market=w.market, amount=0, cost=0.0)
+        for w in watchlist
+    ]:
+        if h.code in seen_codes:
+            continue
+        seen_codes.add(h.code)
+        if not is_a_share_stock(h.code, h.market):
+            continue
+        md = stock_margin.get(h.code)
+        if md is None:
+            continue
+        margin_targets.append((h.name or md.name, h.code, md))
+
+    if margin_targets:
+        data_lines.append(f"\n## 十五、💰 个股两融（融资融券，T+1 披露）")
+        data_lines.append("")
+        data_lines.append("| 标的 | 融资余额 | 融资净买入 | 融券余额 | 数据日期 |")
+        data_lines.append("|------|---------|-----------|---------|---------|")
+        for name, code, md in margin_targets:
+            data_lines.append(
+                f"| {name}({code}) | {md.financing_balance/1e8:.2f}亿 | "
+                f"{md.financing_net_buy/1e8:+.2f}亿 ({md.financing_change_direction}) | "
+                f"{md.securities_lending_balance/1e8:.2f}亿 | {md.date} |"
+            )
+            margin_llm.append(
+                f"{name}: 融资余额{md.financing_balance/1e8:.2f}亿,"
+                f"净买入{md.financing_net_buy/1e8:+.2f}亿({md.financing_change_direction})"
+            )
+        data_lines.append("")
+        data_lines.append("*注：仅普通 A 股为两融标的，ETF/基金/港股无个股两融数据；融资净买入为最新日相对前一日的余额变化。*")
+        data_lines.append("")
+
+    # 妙想增强：持仓消息 + 智能选股 + 持仓体检 + 评级/事件（盘中快讯已在"一"用妙想）
+    from app.miaoxiang import (
+        fetch_stock_screen_for_report,
+        fetch_holdings_news,
+        fetch_holdings_fundamental,
+        fetch_holdings_events,
+    )
 
     mx_holdings_news = fetch_holdings_news(config, holdings, quotes)
     if mx_holdings_news:
-        data_lines.append(f"\n## 十五、📌 持仓消息面（妙想逐个检索）")
+        data_lines.append(f"\n## 十六、📌 持仓消息面（妙想逐个检索）")
         data_lines.append(mx_holdings_news)
 
     mx_screen = fetch_stock_screen_for_report(config, "今日涨幅超过3%且主力资金净流入的股票")
     if mx_screen:
-        data_lines.append(f"\n## 十六、🧠 妙想智能选股（建仓参考）")
+        data_lines.append(f"\n## 十七、🧠 妙想智能选股（建仓参考）")
         data_lines.append(mx_screen)
+
+    mx_fundamental = fetch_holdings_fundamental(config, holdings)
+    if mx_fundamental:
+        data_lines.append(f"\n## 十八、📊 持仓体检（资金面+筹码+基本面）")
+        data_lines.append(mx_fundamental)
+
+    mx_events = fetch_holdings_events(config, holdings)
+    if mx_events:
+        data_lines.append(f"\n## 十九、🚨 持仓评级与事件监控")
+        data_lines.append(mx_events)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -3320,6 +3392,12 @@ def generate_evening_review(config: Config) -> Path | None:
     if mx_screen:
         llm_lines.append("\n[妙想智能选股]")
         llm_lines.append(mx_screen[:1000])
+    if mx_fundamental:
+        llm_lines.append("\n[持仓体检（资金面+筹码+基本面）]")
+        llm_lines.append(mx_fundamental[:2500])
+    if mx_events:
+        llm_lines.append("\n[持仓评级与事件（减持/增持/回购/解禁/评级）]")
+        llm_lines.append(mx_events[:2000])
 
     if mx_day_news:
         llm_lines.append("\n[盘中快讯（妙想）]")
@@ -3385,6 +3463,10 @@ def generate_evening_review(config: Config) -> Path | None:
 
     if fund_llm_ev:
         llm_lines.append(f"\n{fund_llm_ev}")
+
+    if margin_llm:
+        llm_lines.append("\n[💰 个股两融（融资融券，杠杆资金动向）]")
+        llm_lines.append("  " + "; ".join(margin_llm))
 
     if vol_llm:
         llm_lines.append(f"\n{vol_llm}")
@@ -3472,7 +3554,7 @@ def generate_evening_review(config: Config) -> Path | None:
 ### 三、重点持仓深度点评（按重要性排序，不超过 3 只）
 对每只持仓输出：
 - **技术状态**：价在均线什么位置？RSI/MACD/KDJ 是否同向？
-- **资金行为**：主力主导还是散户主导？有无异常放量/缩量？
+- **资金行为**：主力主导还是散户主导？有无异常放量/缩量？结合[个股两融]的融资净买入判断杠杆资金是否在加/减仓。
 - **估值水平**：结合 PE/PB 判断贵贱（标注置信度）
 - **核心判断**：一句话结论（如："短期超买，明日有回调需求"）
 
@@ -3486,6 +3568,7 @@ def generate_evening_review(config: Config) -> Path | None:
 - 抄底：是否有抄底信号？什么价位可以试探性建仓/加仓？仓位多少？置信度[高/中/低]
 - 网格：按照预计算的网格区间和间距，给出买卖挂单建议（买单挂在支撑位下方，卖单挂在压力位上方）
 - 止损/止盈：硬止损位（跌破即走），硬止盈位（触及即减仓）
+- 基本面/事件：结合[持仓体检]的净利润增速/机构持股变化，及[评级与事件]的减持/回购/评级变化，判断是否需要因基本面恶化而减仓/清仓，或因增持/回购/评级上调而加仓
 
 ### 五、🔍 自选标的建仓机会
 根据预计算的建仓评分，分析自选标的的建仓机会。请对评分最高的 2-3 只给出：

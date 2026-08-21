@@ -53,6 +53,8 @@ class Config:
     DEFAULT_SCREENING_BLACKLIST_CONCEPTS = []
     DEFAULT_SCREENING_EXCLUDE_ST = True
     DEFAULT_SCREENING_SUB_NEW_DAYS = 60
+    DEFAULT_FLOW_REVERSAL_MIN = 1e7  # 资金流转向最小净额（元），默认 1000 万
+    DEFAULT_FLOW_DIVERGE_PCT = 2.0   # 资金背离价格阈值（%）
 
     def __init__(self, config_path: Path) -> None:
         """
@@ -270,6 +272,22 @@ class Config:
             "振幅预警": 5.0,
         }))
 
+    @property
+    def flow_reversal_min(self) -> float:
+        """资金流转向最小净额（元），低于此值不计入主力/总资金转向提醒"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金流转向最小净额", self.DEFAULT_FLOW_REVERSAL_MIN
+        )
+        return max(0.0, safe_float(value, self.DEFAULT_FLOW_REVERSAL_MIN))
+
+    @property
+    def flow_diverge_pct(self) -> float:
+        """资金背离价格阈值（%），涨跌幅超过此幅度才检查主力/总资金背离"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金背离价格阈值", self.DEFAULT_FLOW_DIVERGE_PCT
+        )
+        return max(0.0, safe_float(value, self.DEFAULT_FLOW_DIVERGE_PCT))
+
     # ---- 标的列表 ----
 
     @property
@@ -410,7 +428,7 @@ class Config:
 
     @property
     def screening_fund_flow_days(self) -> int:
-        """智能选股：资金流回看天数（用于「持续低吸」判定）"""
+        """智能选股：资金流回看天数（历史主力资金流序列，保留以备扩展）"""
         value = self._raw.get("智能选股", {}).get(
             "资金流天数", self.DEFAULT_SCREENING_FUND_FLOW_DAYS
         )

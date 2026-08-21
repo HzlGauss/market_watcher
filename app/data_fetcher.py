@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from datetime import datetime
-from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, FundFlowDaily, SectorBoard, SectorFundFlow, MarginData
+from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNews, MarketBreadth, FundFlowDetail, FundFlowDaily, SectorBoard, SectorFundFlow, MarginData, StockMarginData
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
@@ -386,7 +386,7 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
 
 
 def fetch_fund_flow_history(code: str, market: str = "SH", days: int = 10) -> list[FundFlowDaily]:
-    """获取个股最近 N 日主力资金流序列（用于「持续低吸」判定）
+    """获取个股最近 N 日主力资金流序列（历史多日序列，供需要资金流回看的调用方使用）
 
     复用 STOCK_FLOW_DAILY_API（fflow/daykline/get），klt=101（日线）+ lmt=days，
     返回完整多日序列而非仅最新一天。klines 按日期升序（最旧→最新）。
@@ -1253,6 +1253,55 @@ _sector_cache: dict = {"_ts": 0.0, "_data": []}
 _SECTOR_CACHE_TTL = 300  # 板块数据缓存 5 分钟
 
 
+# 东方财富 clist 接口（行情/板块/个股列表）。实时子域 push2 被反爬断连，优先用延迟子域 push2delay。
+_EM_CLIST_HOSTS = (
+    "https://push2delay.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/api/qt/clist/get",
+)
+
+
+def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80) -> list[dict]:
+    """分页拉取东方财富 clist 接口，返回原始 item dict 列表
+
+    clist 每页最多返回 100 条（pz 上限），按 fid 排序逐页拉取直至 total。
+    优先 push2delay，失败回退 push2；任一 host 拉到数据即返回。
+    """
+    params = {
+        "pn": "1", "pz": "100", "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2", "invt": "2", "fid": fid,
+        "fs": fs,
+        "fields": fields,
+    }
+    headers = {"Referer": "https://quote.eastmoney.com/"}
+
+    for host in _EM_CLIST_HOSTS:
+        items: list[dict] = []
+        total = None
+        for pn in range(1, max_pages + 1):
+            params["pn"] = str(pn)
+            resp = eastmoney_client.get(host, params=params, headers=headers, timeout=15)
+            if resp is None:
+                break
+            try:
+                payload = resp.json()
+            except ValueError:
+                break
+            data = payload.get("data") or {}
+            total = data.get("total")
+            diff = data.get("diff") or []
+            if isinstance(diff, dict):  # 个别响应 diff 为 dict（键为页码）
+                diff = list(diff.values())
+            if not diff:
+                break
+            items.extend(diff)
+            if total is not None and len(items) >= total:
+                break
+        if items:
+            return items
+    return []
+
+
 def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
     """批量获取个股所属行业（带日级缓存）
 
@@ -1285,17 +1334,22 @@ def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
 
     if not full_map:
         try:
-            import akshare as ak
-            df = ak.stock_zh_a_spot_em()
-            for _, row in df.iterrows():
-                code = str(row.get("代码", ""))
-                industry = str(row.get("行业", ""))
+            # f100=所属行业。原 akshare stock_zh_a_spot_em 已不含行业列且打被断连的 push2，改直连 push2delay
+            items = _fetch_em_clist(
+                fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
+                fields="f12,f14,f100",
+                fid="f12",
+            )
+            for it in items:
+                code = str(it.get("f12", ""))
+                industry = str(it.get("f100", "") or "")
                 if code and industry:
                     full_map[code] = industry
-            cache_data = {"_date": today, **full_map}
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, ensure_ascii=False)
-            log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
+            if full_map:
+                cache_data = {"_date": today, **full_map}
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, ensure_ascii=False)
+                log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
         except Exception as e:
             # 东财全市场快照易断连/限频，安静失败即可，避免重试风暴
             log.warning(f"东财全市场行业分类不可达，跳过: {type(e).__name__}")
@@ -1336,24 +1390,17 @@ def fetch_stock_listing_date_map(codes: list[str]) -> dict[str, str]:
 
     if not full_map:
         try:
-            url = (
-                "https://push2.eastmoney.com/api/qt/clist/get"
-                "?pn=1&pz=6000&po=1&np=1&fltt=2&invt=2&fid=f12"
-                "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-                "&fields=f12,f14,f26"
+            # f26=上市日期。原直连 push2 的 clist（被断连），改用 push2delay 分页拉取
+            items = _fetch_em_clist(
+                fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
+                fields="f12,f14,f26",
+                fid="f12",
             )
-            resp = eastmoney_client.get(url, timeout=15)
-            if resp is not None:
-                data = resp.json()
-                diff = (data.get("data") or {}).get("diff") or []
-                # 分页时 diff 可能是 dict（键为页码序号），归一为 list
-                if isinstance(diff, dict):
-                    diff = list(diff.values())
-                for item in diff:
-                    code = str(item.get("f12", ""))
-                    list_date = item.get("f26")
-                    if code and list_date not in (None, "", "-"):
-                        full_map[code] = str(list_date)
+            for item in items:
+                code = str(item.get("f12", ""))
+                list_date = item.get("f26")
+                if code and list_date not in (None, "", "-"):
+                    full_map[code] = str(list_date)
             if full_map:
                 cache_data = {"_date": today, **full_map}
                 with open(cache_path, "w", encoding="utf-8") as f:
@@ -1395,7 +1442,7 @@ def _etf_name_to_industry(name: str) -> str:
         "科技": "科技", "科创": "科创",
         "消费电子": "消费电子", "消电": "消费电子",
         "红利": "红利", "中证红利": "红利",
-        "创业": "创业板", "创成长": "创业板",
+        "创业板50": "创业板50", "创业": "创业板", "创成长": "创业板",
         "沪深300": "沪深300", "上证50": "上证50", "中证500": "中证500", "中证1000": "中证1000",
         "红利低波": "红利",
         "兴全趋势": "混合基金",
@@ -1432,6 +1479,29 @@ def enrich_quotes_with_industry(quotes: list[Quote]) -> None:
                 q.industry = industry_map[q.code]
 
 
+# 字段映射：f12=板块代码 f14=板块名称 f3=涨跌幅 f6=成交额(元)
+#          f62=主力净流入(元) f104=上涨家数 f105=下跌家数 f128=领涨股 f136=领涨股涨跌幅
+_EM_BOARD_FIELDS = "f12,f14,f3,f6,f62,f104,f105,f128,f136"
+
+
+def _fetch_sector_boards_raw() -> list[SectorBoard]:
+    """从东方财富 clist 接口拉取行业板块（t:2）全量列表"""
+    items = _fetch_em_clist(fs="m:90 t:2", fields=_EM_BOARD_FIELDS, fid="f3", max_pages=8)
+    boards: list[SectorBoard] = []
+    for it in items:
+        boards.append(SectorBoard(
+            code=str(it.get("f12", "")),
+            name=str(it.get("f14", "")),
+            change_pct=_safe_float(it.get("f3")),
+            amount=_safe_float(it.get("f6")),
+            leader_stock=str(it.get("f128", "")),
+            leader_change_pct=_safe_float(it.get("f136")),
+            main_net_inflow=_safe_float(it.get("f62")),
+            stock_count=int(it.get("f104", 0) or 0) + int(it.get("f105", 0) or 0),
+        ))
+    return boards
+
+
 def fetch_sector_boards() -> list[SectorBoard]:
     """获取东方财富行业板块实时数据（带内存缓存 5 分钟）
 
@@ -1443,29 +1513,17 @@ def fetch_sector_boards() -> list[SectorBoard]:
     if now - _sector_cache["_ts"] < _SECTOR_CACHE_TTL and _sector_cache["_data"]:
         return _sector_cache["_data"]
 
-    boards: list[SectorBoard] = []
-    try:
-        import akshare as ak
-        df = ak.stock_board_industry_index_em()
-        for _, row in df.iterrows():
-            boards.append(SectorBoard(
-                code=str(row.get("板块代码", "")),
-                name=str(row.get("板块名称", "")),
-                change_pct=_safe_float(row.get("最新价")),
-                amount=_safe_float(row.get("成交额")),
-                leader_stock=str(row.get("领涨股", "")),
-                leader_change_pct=_safe_float(row.get("领涨股-涨跌幅")),
-                main_net_inflow=_safe_float(row.get("主力净流入")),
-                stock_count=int(row.get("公司家数", 0)) if row.get("公司家数") else 0,
-            ))
-    except Exception as e:
-        log.debug(f"行业板块数据获取失败: {e}")
-        return _sector_cache["_data"]  # 返回旧缓存
+    boards = _fetch_sector_boards_raw()
+    if boards:
+        boards.sort(key=lambda b: b.change_pct or 0, reverse=True)
+        _sector_cache = {"_ts": now, "_data": boards}
+        log.debug(f"行业板块数据已更新: {len(boards)} 个板块")
+        return boards
 
-    boards.sort(key=lambda b: b.change_pct or 0, reverse=True)
-    _sector_cache = {"_ts": now, "_data": boards}
-    log.debug(f"行业板块数据已更新: {len(boards)} 个板块")
-    return boards
+    # 负缓存：失败也刷新时间戳，避免有旧数据时每个扫描周期都空转重试
+    _sector_cache["_ts"] = now
+    log.warning("行业板块数据获取失败（push2delay/push2 均不可用），返回缓存/空数据")
+    return _sector_cache["_data"]
 
 
 def _safe_float(val) -> Optional[float]:
@@ -1585,6 +1643,7 @@ def fetch_major_indices() -> list[Quote]:
         WatchItem(name="上证指数", code="000001", market="SH", type="指数"),
         WatchItem(name="深证成指", code="399001", market="SZ", type="指数"),
         WatchItem(name="创业板指", code="399006", market="SZ", type="指数"),
+        WatchItem(name="创业板50", code="399673", market="SZ", type="指数"),
         WatchItem(name="科创50", code="000688", market="SH", type="指数"),
         WatchItem(name="沪深300", code="000300", market="SH", type="指数"),
         WatchItem(name="中证500", code="000905", market="SH", type="指数"),
@@ -1713,4 +1772,137 @@ def fetch_margin_data(force_refresh: bool = False) -> Optional["MarginData"]:
     except Exception as e:
         log.debug(f"两融数据获取失败: {e}")
         return _margin_cache["_data"]
+
+
+# ============================================================
+# 个股两融明细（融资融券，日频，T+1 披露）
+# ============================================================
+
+_stock_margin_cache: dict = {"_ts": 0.0, "_data": None}
+_STOCK_MARGIN_CACHE_TTL = 1800  # 30分钟
+
+
+def _margin_detail_sse(date: str):
+    """上交所个股融资融券明细（AKShare）"""
+    import akshare as ak
+    return ak.stock_margin_detail_sse(date=date)
+
+
+def _margin_detail_szse(date: str):
+    """深交所个股融资融券明细（AKShare）"""
+    import akshare as ak
+    return ak.stock_margin_detail_szse(date=date)
+
+
+def _latest_margin_detail(fetch_fn, days: int = 12):
+    """回溯查找最近一个有数据的交易日，返回 (date, df) 或 ("", None)"""
+    from datetime import datetime as _dt, timedelta
+    end = _dt.now()
+    for back in range(0, days):
+        d = (end - timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            df = fetch_fn(d)
+            if df is not None and not df.empty:
+                return d, df
+        except Exception:
+            continue
+    return "", None
+
+
+def _norm_margin_df(df):
+    """归一化个股两融明细 DataFrame → dict[code, (name, 融资余额, 融券余额, 融券余量)]
+
+    两接口（上交所/深交所）字段名与单位略有差异，此处统一为元/股。
+    """
+    result = {}
+    if df is None or df.empty:
+        return result
+
+    def _col(*names):
+        for n in names:
+            if n in df.columns:
+                return df[n]
+        return None
+
+    def _num(series, idx):
+        if series is None:
+            return 0.0
+        try:
+            v = float(series.iloc[idx])
+            return v if v == v else 0.0  # NaN 防护
+        except (ValueError, TypeError):
+            return 0.0
+
+    codes = _col("证券代码", "标的证券代码")
+    names = _col("证券简称", "标的证券简称")
+    fin_bal = _col("融资余额")
+    sec_bal = _col("融券余额")
+    sec_vol = _col("融券余量")
+
+    for i in range(len(df)):
+        raw = str(codes.iloc[i]).strip() if codes is not None else ""
+        code = raw.zfill(6) if raw else ""
+        if not code:
+            continue
+        name = str(names.iloc[i]).strip() if names is not None else ""
+        result[code] = (name, _num(fin_bal, i), _num(sec_bal, i), _num(sec_vol, i))
+    return result
+
+
+def fetch_stock_margin_detail(force_refresh: bool = False) -> dict[str, "StockMarginData"]:
+    """获取全市场个股两融明细（融资融券，最新可用日 + 前一日差额计算净买入）
+
+    数据来源：上交所 + 深交所个股融资融券明细（AKShare），T+1 披露、日频。
+    缓存 30 分钟。融资净买入 = 最新日融资余额 - 前一日融资余额（逐标的）。
+
+    Returns:
+        dict[code, StockMarginData]：仅含披露中有数据的标的。
+    """
+    global _stock_margin_cache
+    now = time.time()
+    if (not force_refresh and _stock_margin_cache["_data"] is not None
+            and now - _stock_margin_cache["_ts"] < _STOCK_MARGIN_CACHE_TTL):
+        return _stock_margin_cache["_data"]
+
+    try:
+        from datetime import datetime as _dt, timedelta
+        result: dict[str, StockMarginData] = {}
+
+        for fetch_fn in (_margin_detail_sse, _margin_detail_szse):
+            date, df = _latest_margin_detail(fetch_fn)
+            if not df:
+                continue
+
+            # 前一日（用于逐标的融资净买入差额）
+            prev = {}
+            dt0 = _dt.strptime(date, "%Y%m%d")
+            for back in range(1, 12):
+                d = (dt0 - timedelta(days=back)).strftime("%Y%m%d")
+                try:
+                    pdf = fetch_fn(d)
+                    if pdf is not None and not pdf.empty:
+                        prev = _norm_margin_df(pdf)
+                        break
+                except Exception:
+                    continue
+
+            latest = _norm_margin_df(df)
+            for code, (name, fin_bal, sec_bal, sec_vol) in latest.items():
+                prev_fin = prev.get(code, (None, 0.0, 0.0, 0.0))[1]
+                net_buy = fin_bal - prev_fin if code in prev else 0.0
+                result[code] = StockMarginData(
+                    code=code,
+                    name=name,
+                    financing_balance=fin_bal,
+                    financing_net_buy=net_buy,
+                    securities_lending_balance=sec_bal,
+                    securities_lending_volume=sec_vol,
+                    date=date,
+                )
+
+        _stock_margin_cache = {"_ts": now, "_data": result}
+        return result
+    except Exception as e:
+        log.debug(f"个股两融明细获取失败: {e}")
+        return _stock_margin_cache["_data"] or {}
 

@@ -19,6 +19,7 @@ def _format_flow_breakdown_for_llm(quotes: list[Quote]) -> str:
     total_lg = 0.0  # 大单
     total_md = 0.0  # 中单
     total_sm = 0.0  # 小单
+    total_overall = 0.0  # 总体净流入（超大+大+中+小）
     inst_count = 0   # 机构主导标的数
     retail_count = 0 # 散户主导标的数
     dist_count = 0   # 出货标的数
@@ -36,6 +37,8 @@ def _format_flow_breakdown_for_llm(quotes: list[Quote]) -> str:
                 total_md += ff.medium_net
             if ff.small_net is not None:
                 total_sm += ff.small_net
+            if ff.total_net is not None:
+                total_overall += ff.total_net
             if ff.is_institution_driven:
                 inst_count += 1
             if ff.is_distribution:
@@ -47,6 +50,10 @@ def _format_flow_breakdown_for_llm(quotes: list[Quote]) -> str:
         return "暂无资金结构数据"
 
     parts = []
+    if abs(total_overall) >= 1e8:
+        parts.append(f"总体{total_overall/1e8:+.2f}亿")
+    elif abs(total_overall) >= 1e6:
+        parts.append(f"总体{total_overall/1e4:+.0f}万")
     if abs(total_sl) >= 1e8:
         parts.append(f"超大单{total_sl/1e8:+.2f}亿")
     elif abs(total_sl) >= 1e6:

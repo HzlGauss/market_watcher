@@ -123,7 +123,9 @@ def push_alert(
     """推送异动提醒到微信（Server酱）"""
     if not config.push_enabled:
         return False
-    if config.push_trigger == "仅异动时" and stats.alert_count == 0:
+    # 仅在高优先级资金流提醒（主力/总资金转向、价量背离）出现时推送，
+    # 普通异动不再推送，避免消耗 Server 酱调用额度
+    if not any(a.priority for a in alerts):
         return False
 
     sendkey = os.environ.get("SCT_SENDKEY")
@@ -158,7 +160,10 @@ def push_alert(
     if alerts:
         lines.append("## 🔔 异动详情")
         for a in alerts[:5]:
-            lines.append(f"- **{a.name}**: {' | '.join(a.messages)}")
+            if a.priority:
+                lines.append(f"- 🚨 **{a.name}**: {' | '.join(a.messages)}")
+            else:
+                lines.append(f"- **{a.name}**: {' | '.join(a.messages)}")
         if len(alerts) > 5:
             lines.append(f"- ...还有 {len(alerts) - 5} 条")
         lines.append("")

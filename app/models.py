@@ -148,6 +148,29 @@ class FundFlowDetail:
             return "主力偏空"
         return "均衡"
 
+    @property
+    def total_net(self) -> Optional[float]:
+        """总体净流入（元）= 超大单 + 大单 + 中单 + 小单（全部订单类型）
+
+        仅当四档分类都齐全时才返回合计值；新浪兜底数据缺少大/中/小单，
+        此时返回 None（无法得出可信的总体净流入）。
+        """
+        if None in (self.super_large_net, self.large_net, self.medium_net, self.small_net):
+            return None
+        return (self.super_large_net + self.large_net
+                + self.medium_net + self.small_net)
+
+    @property
+    def total_pct(self) -> Optional[float]:
+        """总体净流入占成交额比例（%）= 各档净占比之和
+
+        仅当四档净占比都齐全时才返回；新浪兜底数据无占比字段，返回 None。
+        """
+        if None in (self.super_large_pct, self.large_pct, self.medium_pct, self.small_pct):
+            return None
+        return (self.super_large_pct + self.large_pct
+                + self.medium_pct + self.small_pct)
+
 
 @dataclass
 class Quote:
@@ -220,6 +243,7 @@ class Alert:
     code: str = ""
     name: str = ""
     messages: list[str] = field(default_factory=list)
+    priority: bool = False  # 是否包含高优先级资金流提醒（转向/背离），推送与展示时排最前
 
     def add_message(self, message: str) -> None:
         """添加异动消息"""
@@ -336,6 +360,40 @@ class MarginData:
     financing_net_buy: float = 0.0
     securities_lending_balance: float = 0.0
     total_balance: float = 0.0
+    date: str = ""
+
+    @property
+    def financing_change_direction(self) -> str:
+        """融资净买入方向"""
+        if self.financing_net_buy > 0:
+            return "融资加仓"
+        elif self.financing_net_buy < 0:
+            return "融资减仓"
+        return "持平"
+
+
+@dataclass
+class StockMarginData:
+    """个股两融明细（融资融券，日频，T+1 披露）
+
+    与 MarginData（全市场汇总）不同，本模型是逐标的的两融数据，
+    用于判断杠杆资金对单只股票的加/减仓。
+
+    Attributes:
+        code: 证券代码（6 位）
+        name: 证券简称
+        financing_balance: 融资余额（元）
+        financing_net_buy: 融资净买入（元，最新日余额 - 前一日余额）
+        securities_lending_balance: 融券余额（元）
+        securities_lending_volume: 融券余量（股）
+        date: 数据日期
+    """
+    code: str = ""
+    name: str = ""
+    financing_balance: float = 0.0
+    financing_net_buy: float = 0.0
+    securities_lending_balance: float = 0.0
+    securities_lending_volume: float = 0.0
     date: str = ""
 
     @property
@@ -791,22 +849,25 @@ class FundFlowDaily:
 @dataclass
 class AccumulationScore:
     """
-    主力资金「持续低吸」评分结果
+    综合评分结果（0-100）= 持续低吸子分(50%) + 估值分位子分(50%)
 
-    核心思想：主力资金连续净流入（低吸）但股价横盘/微跌（背离），
-    意味着筹码在低位悄悄集中，行情随时可能启动。
+    持续低吸维度：主力连续净流入但股价横盘/微跌（背离），筹码在低位悄悄集中
+    估值分位维度：主力净流入强度（占流通市值）+ PE-TTM 历史百分位（越低越便宜）
 
     Attributes:
         code: 股票代码
         name: 股票名称
-        score: 综合吸筹分（0-100），越高越像「低位吸筹待启动」
-        label: 吸筹标签（强吸筹/吸筹/中性/出货）
+        score: 综合评分（0-100）
+        label: 评级标签（强吸筹+低估值 / 吸筹+估值适中 / 中性 / 偏弱 / 出货 / 无数据）
         inflow_days: 窗口内主力净流入天数
         consecutive_days: 最近连续主力净流入天数
-        total_net: 窗口累计主力净流入（元）
+        total_net: 窗口累计主力净流入额（元），缺省回退当日口径
         price_change_10d: 窗口股价涨跌幅（%），用于算背离度
         divergence: 背离度（0-1），资金净流入 + 股价滞涨 → 越高越背离
         large_ratio_rising: 大单+超大单占比近 5 日是否较前 5 日上升（机构/大户吸筹）
+        inflow_strength_pct: 主力净流入占流通市值比例（%）
+        valuation_status: 估值状态（估值较低/适中/较高，妙想分类）
+        valuation_percentile: PE-TTM 历史百分位（0-100，越小越便宜）
         notes: 判定说明（供报告/LLM 引用）
     """
     code: str = ""
@@ -819,6 +880,9 @@ class AccumulationScore:
     price_change_10d: Optional[float] = None
     divergence: Optional[float] = None
     large_ratio_rising: bool = False
+    inflow_strength_pct: Optional[float] = None
+    valuation_status: str = ""
+    valuation_percentile: Optional[float] = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -829,7 +893,7 @@ class ScreeningCondition:
 
     Attributes:
         sector: 热点板块名（LLM 归一化后的最终板块名）
-        condition: 妙想可执行的自然语言条件，带板块限定，方向=低位埋伏
+        condition: 妙想可执行的自然语言条件，带板块限定，方向=资金流入+低估值
         intent: 策略意图说明
         risk_note: 风险提示
     """
@@ -842,7 +906,7 @@ class ScreeningCondition:
 @dataclass
 class ScreeningCandidate:
     """
-    智能选股候选（妙想筛出 + 资金流持续低吸评分）
+    智能选股候选（妙想筛出 + 资金流入+估值分位评分）
 
     Attributes:
         code: 股票代码
@@ -855,12 +919,16 @@ class ScreeningCandidate:
         support: 主要支撑位
         resistance: 主要压力位
         flow_days: 妙想选股自带的多日主力净额序列（省去东财 daykline 取数）
+        main_net: 主力净流入额（元）
+        circulation_value: 流通市值（元），用于算净流入强度
+        valuation_status: 估值状态（估值较低/适中/较高）
+        valuation_percentile: PE-TTM 历史百分位（0-100，越小越便宜）
         industry: 东财行业总分类（黑名单硬过滤用）
         concept: 概念题材
         hot_sectors: 命中的热点板块
         hit_conditions: 命中的妙想条件文本
         resonance: 命中条件数（共振加分）
-        accumulation: 资金流持续低吸评分结果
+        accumulation: 综合评分结果（持续低吸 + 估值分位）
         tech_signals: 技术面信号（RSI/MACD/均线等）
         blacklisted: 是否被黑名单过滤
         rank: 最终排名
@@ -876,6 +944,10 @@ class ScreeningCandidate:
     support: Optional[float] = None
     resistance: Optional[float] = None
     flow_days: list[FundFlowDaily] = field(default_factory=list)
+    main_net: Optional[float] = None
+    circulation_value: Optional[float] = None
+    valuation_status: str = ""
+    valuation_percentile: Optional[float] = None
     industry: str = ""
     concept: str = ""
     hot_sectors: list[str] = field(default_factory=list)
@@ -898,7 +970,7 @@ class ScreeningReport:
         hot_sectors: 选中的板块名（已排除黑名单）
         accumulating_sectors: 资金潜伏板块（东财板块资金流排名，含净流入/涨幅）
         conditions: 选股条件列表
-        candidates: 候选列表（已按吸筹分排序、过滤黑名单）
+        candidates: 候选列表（已按综合分排序、过滤黑名单）
         llm_analysis: LLM 综合排序解读
         degraded: 是否降级（妙想/LLM 失败回退技术面筛选）
         error: 错误信息（若有）
