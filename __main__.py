@@ -15,7 +15,7 @@ LLM_COOLDOWN: int = 1800  # 30 分钟最小间隔
 
 from app.config import Config
 from app.data_fetcher import NorthFlowFetcher
-from app.reporter import generate_morning_brief, generate_midday_review, generate_evening_review
+from app.reporter import generate_morning_brief, generate_midday_review, generate_evening_review, generate_weekly_review
 from app.fund_analyzer import analyze_funds
 from app.broker_api import auto_update_holdings
 from app.presenter import Color
@@ -79,18 +79,19 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}7{Color.RESET}. Query Period Returns (近期走势)")
     print(f"  {Color.CYAN}8{Color.RESET}. ETF Bottom Reversal Screen (ETF底部反转)")
     print(f"  {Color.CYAN}9{Color.RESET}. Stock Bottom Reversal Screen (A股底部反转)")
-    print(f"  {Color.CYAN}S{Color.RESET}. Smart Screening (智能选股·热点板块资金流入+低估值)")
+    print(f"  {Color.CYAN}S{Color.RESET}. Smart Screening (智能选股·热点板块低位吸筹)")
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
+    print(f"  {Color.CYAN}W{Color.RESET}. Weekly Review (周报·持仓+自选)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M/S]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S"):
+            choice = input(f" Enter option [0-9/D/M/S/W]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D, M or S{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S or W{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -461,8 +462,6 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
                         entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
-                if q.fund_flow is not None and q.fund_flow.total_net is not None:
-                    entry["total_net"] = q.fund_flow.total_net
                 cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
@@ -570,8 +569,6 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
                         entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
-                if q.fund_flow is not None and q.fund_flow.total_net is not None:
-                    entry["total_net"] = q.fund_flow.total_net
                 cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception:
@@ -820,9 +817,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # Sector analysis display
     if sector_boards:
         from app.analyzer import analyze_sector_context
-        from app.data_fetcher import fetch_major_indices
-        major_indices = fetch_major_indices()  # 宽基指数基准（创业板指/沪深300/中证500/中证1000）
-        sector_ctx = analyze_sector_context(quotes, sector_boards, major_indices)
+        sector_ctx = analyze_sector_context(quotes, sector_boards)
         from app.presenter import Color
         print(f"{Color.BOLD}{Color.CYAN}═══ 行业板块 ═══{Color.RESET}")
         # Top 3 / Bottom 3
@@ -843,8 +838,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             for code, info in deviating[:5]:
                 q = next((x for x in quotes if x.code == code), None)
                 if q:
-                    rs = info.get("relative_strength")
-                    emoji = "🔥" if (rs is not None and rs > 0) else ("❄️" if rs is not None else "◽")
+                    emoji = "🔥" if info.get("relative_strength", 0) > 0 else "❄️"
                     print(f"  {emoji} {q.name}({q.code}): {info['label']} [{info.get('sector', '')}]")
         print()
     elif mx_sector_fallback:
@@ -1005,8 +999,6 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
                         entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
-                if q.fund_flow is not None and q.fund_flow.total_net is not None:
-                    entry["total_net"] = q.fund_flow.total_net
                 cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
     except Exception:
@@ -1329,7 +1321,7 @@ def main() -> None:
                 print(f"{Color.RED}❌ 股票筛选失败: {e}{Color.RESET}")
         elif choice == "S":
             log.info("Starting smart screening...")
-            print(f"\n{Color.BOLD}{Color.CYAN}🎯 智能选股（热点板块 · 资金流入 · 低估值）{Color.RESET}")
+            print(f"\n{Color.BOLD}{Color.CYAN}🎯 智能选股（热点板块 · 低位埋伏 · 主力持续低吸）{Color.RESET}")
             print(f"{Color.DIM}正在采集市场背景并筛选（约需 1-2 分钟），请耐心等待...{Color.RESET}")
             try:
                 from app.smart_screener import run_smart_screening, _industry_label
@@ -1353,7 +1345,7 @@ def main() -> None:
                         label = acc.label if acc else "—"
                         sector = _industry_label(c)
                         print(f"  {Color.BOLD}{c.name}({c.code}){Color.RESET} [{sector}] "
-                              f"评分{score} {label}")
+                              f"吸筹分{score} {label}")
                 if report.error:
                     print(f"  {Color.YELLOW}⚠️ {report.error}{Color.RESET}")
                 print(f"   {Color.DIM}完整报告已保存至 smart_screening/ 目录" + ("并推送微信" if config.push_enabled else "") + f"{Color.RESET}")
@@ -1478,6 +1470,20 @@ def main() -> None:
                 log.error(f"龙虎榜分析失败: {e}")
                 print(f"{Color.RED}❌ 龙虎榜分析失败: {e}{Color.RESET}")
 
+        elif choice == "W":
+            log.info("Starting weekly review...")
+            print(f"\n{Color.BOLD}{Color.CYAN}📅 周度复盘报告（最近5个交易日）{Color.RESET}")
+            print(f"{Color.DIM}正在采集持仓+自选数据并生成分析（约需 1-2 分钟）...{Color.RESET}")
+            try:
+                result = generate_weekly_review(config)
+                if result:
+                    print(f"{Color.DIM}周报已生成: {result}{Color.RESET}")
+                else:
+                    log.error("Weekly review generation failed")
+                    print(f"{Color.RED}❌ 周报生成失败{Color.RESET}")
+            except Exception as e:
+                log.error(f"Weekly review failed: {e}")
+                print(f"{Color.RED}❌ 周报生成失败: {e}{Color.RESET}")
         elif choice == "M":
             _run_miaoxiang_menu(config)
 
@@ -1500,12 +1506,10 @@ def _run_miaoxiang_menu(config: Config) -> None:
         print(f"  {Color.CYAN}2{Color.RESET}. 智能选股 (自然语言条件)")
         print(f"  {Color.CYAN}3{Color.RESET}. 财经资讯搜索")
         print(f"  {Color.CYAN}4{Color.RESET}. 自选股管理 (查询/添加/删除)")
-        print(f"  {Color.CYAN}5{Color.RESET}. 持仓加减仓量化信号 (规则引擎)")
-        print(f"  {Color.CYAN}6{Color.RESET}. 模拟组合 (持仓/资金/委托/下单/撤单)")
         print(f"  {Color.CYAN}0{Color.RESET}. 返回主菜单")
 
         try:
-            sub = input(f" Enter option [0-6]: ").strip()
+            sub = input(f" Enter option [0-4]: ").strip()
         except (EOFError, KeyboardInterrupt):
             return
 
@@ -1519,10 +1523,6 @@ def _run_miaoxiang_menu(config: Config) -> None:
             _run_mx_search(mx)
         elif sub == "4":
             _run_mx_selfselect(mx)
-        elif sub == "5":
-            _run_mx_position_signal(config)
-        elif sub == "6":
-            _run_mx_mock_trading(config)
         else:
             print(f"{Color.YELLOW} 无效选项{Color.RESET}")
 
@@ -1618,80 +1618,6 @@ def _run_mx_selfselect(mx) -> None:
             print(f"{Color.DIM}删除中...{Color.RESET}")
             result = mx.self_select_manage_as_text(f"把{instr}从自选删除")
             print(result if result else f"{Color.YELLOW}⚠️ 删除失败{Color.RESET}")
-        else:
-            print(f"{Color.YELLOW} 无效选项{Color.RESET}")
-
-
-def _run_mx_position_signal(config: Config) -> None:
-    """持仓加减仓量化信号（规则引擎，不依赖 LLM）"""
-    print(f"\n{Color.BOLD}{Color.CYAN}📊 持仓加减仓量化信号{Color.RESET}")
-    print(f"{Color.DIM}正在采集资金面/筹码/基本面/事件/评级并规则评分（约 1-2 分钟）...{Color.RESET}")
-    try:
-        from app.position_signal import generate_position_signals, format_position_signals
-        import time as _time
-        _start = _time.time()
-        signals = generate_position_signals(config, config.holdings)
-        elapsed = _time.time() - _start
-
-        if signals:
-            print()
-            print(format_position_signals(signals))
-            # 信号→模拟盘下单建议
-            try:
-                from app.mock_trader import signals_to_orders
-                orders_txt = signals_to_orders(signals, config.holdings)
-                if orders_txt:
-                    print()
-                    print(orders_txt)
-            except Exception:
-                pass
-        else:
-            print(f"  {Color.YELLOW}⚠️ 未生成信号（可能无个股持仓或数据不足）{Color.RESET}")
-        print(f"\n  {Color.DIM}耗时 {elapsed:.0f}秒{Color.RESET}")
-    except Exception as e:
-        log.error(f"量化信号生成失败: {e}")
-        print(f"{Color.RED}❌ 量化信号生成失败: {e}{Color.RESET}")
-
-
-def _run_mx_mock_trading(config: Config) -> None:
-    """妙想模拟组合子菜单（循环停留）"""
-    from app.mock_trader import get_mock_portfolio, place_mock_order, cancel_mock_order
-
-    while True:
-        print(f"\n{Color.BOLD}{Color.CYAN}💼 妙想模拟组合{Color.RESET}")
-        print(f"  {Color.CYAN}1{Color.RESET}. 查看持仓/资金/委托")
-        print(f"  {Color.CYAN}2{Color.RESET}. 下单 (买入/卖出)")
-        print(f"  {Color.CYAN}3{Color.RESET}. 撤单")
-        print(f"  {Color.CYAN}0{Color.RESET}. 返回上级菜单")
-        try:
-            sub = input(f" Enter option [0-3]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return
-
-        if sub == "0" or sub == "":
-            return
-        elif sub == "1":
-            print(f"{Color.DIM}查询中...{Color.RESET}")
-            print(get_mock_portfolio(config))
-        elif sub == "2":
-            try:
-                side = input("  方向 buy=买入 / sell=卖出: ").strip().lower()
-                code = input("  股票代码(6位): ").strip()
-                qty_s = input("  数量(股, 100整数倍): ").strip()
-                price_s = input("  价格(留空=市价): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return
-            if side not in ("buy", "sell") or not code.isdigit() or len(code) != 6 or not qty_s.isdigit():
-                print(f"{Color.YELLOW}  输入格式错误（示例: buy 600036 100 留空）{Color.RESET}")
-                continue
-            price = float(price_s) if price_s else None
-            print(place_mock_order(config, side, code, int(qty_s), price))
-        elif sub == "3":
-            try:
-                oid = input("  委托号(留空=一键撤单全部): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return
-            print(cancel_mock_order(config, order_id=oid or None))
         else:
             print(f"{Color.YELLOW} 无效选项{Color.RESET}")
 

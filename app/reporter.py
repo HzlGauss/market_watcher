@@ -48,6 +48,37 @@ def _get_unique_items(config: Config) -> list[WatchItem]:
     return list(unique_map.values())
 
 
+def _append_mx_analysis(data_lines: list[str], config: Config, items, quotes) -> None:
+    """妙想分析：标的消息面 + 体检 + 评级事件（持仓+自选全量，就地追加到 data_lines）
+
+    Args:
+        data_lines: 报告数据行列表（就地追加）
+        config: 配置对象
+        items: 标的列表（Holding/WatchItem，需含 name/code）
+        quotes: 行情列表（用于异动优先排序）
+    """
+    from app.miaoxiang import (
+        fetch_holdings_news,
+        fetch_holdings_fundamental,
+        fetch_holdings_events,
+    )
+
+    mx_news = fetch_holdings_news(config, items, quotes)
+    if mx_news:
+        data_lines.append("\n## 📌 标的消息面（妙想逐个检索）")
+        data_lines.append(mx_news)
+
+    mx_fund = fetch_holdings_fundamental(config, items)
+    if mx_fund:
+        data_lines.append("\n## 📊 标的体检（资金面+筹码+基本面）")
+        data_lines.append(mx_fund)
+
+    mx_events = fetch_holdings_events(config, items)
+    if mx_events:
+        data_lines.append("\n## 🚨 标的评级与事件监控")
+        data_lines.append(mx_events)
+
+
 def _holdings_summary(
     holdings: list[Holding],
     quotes: list[Quote],
@@ -607,7 +638,9 @@ def generate_morning_brief(config: Config) -> Path | None:
                 data_lines.append(f"  - {s['name']}: {sig_text}")
 
     # 主力资金动向（昨日参考）
-    fund_md, fund_llm = _format_fund_flow_section(quotes, label="自选")
+    from app.miaoxiang import fetch_etf_fund_flow
+    etf_flow_map = fetch_etf_fund_flow(config, all_items)
+    fund_md, fund_llm = _format_fund_flow_section(quotes, label="自选", etf_flow_map=etf_flow_map)
     if not fund_md and morning_cache.get("fund_flow"):
         # 从缓存加载资金流数据
         cached_flow = morning_cache["fund_flow"]
@@ -632,6 +665,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     if pos_md:
         data_lines.append(f"\n## 七、📊 仓位操作建议")
         data_lines.append(pos_md)
+
+    # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
+    _append_mx_analysis(data_lines, config, all_items, quotes)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -927,7 +963,9 @@ def generate_midday_review(config: Config) -> Path | None:
         data_lines.append(pos_md_mid)
 
     # 主力资金流向
-    fund_md_mid, fund_llm_mid = _format_fund_flow_section(quotes, label="自选")
+    from app.miaoxiang import fetch_etf_fund_flow
+    etf_flow_map_mid = fetch_etf_fund_flow(config, all_items)
+    fund_md_mid, fund_llm_mid = _format_fund_flow_section(quotes, label="自选", etf_flow_map=etf_flow_map_mid)
     if fund_md_mid:
         data_lines.append(f"\n## 九、💰 主力资金动向")
         data_lines.append(fund_md_mid)
@@ -949,6 +987,9 @@ def generate_midday_review(config: Config) -> Path | None:
     if intraday_mid_md:
         data_lines.append(f"\n## 十二、📈 盘中复盘（上午）")
         data_lines.append(intraday_mid_md)
+
+    # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
+    _append_mx_analysis(data_lines, config, all_items, quotes)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
 
@@ -1108,15 +1149,27 @@ def generate_midday_review(config: Config) -> Path | None:
 FUND_FLOW_DISPLAY_LIMIT = 15  # 主力资金动向表格最多展示的标的数（按主力净流入占比截断）
 
 
-def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") -> tuple[str, str]:
+def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的", etf_flow_map: dict | None = None) -> tuple[str, str]:
     """生成主力资金流向摘要，返回 (数据区Markdown, LLM紧凑文本)
 
     汇总主力净流入/流出情况，标注重点关注标的。
     包含超大单/大单/中单/小单资金结构。
+    对 ETF 额外展示净申购额（申赎口径，来自妙想 etf_flow_map）。
     """
     has_flow = [q for q in quotes if q.main_net_inflow is not None and q.amount and q.amount > 0]
     if not has_flow:
         return "", ""
+
+    def _etf_sub_str(q: Quote) -> str:
+        """ETF 净申购额列（非 ETF 或无数据返回 --）"""
+        if etf_flow_map:
+            info = etf_flow_map.get(q.code)
+            if info and info.get("net_subscribe") is not None:
+                v = info["net_subscribe"]
+                if abs(v) >= 1e8:
+                    return f"{v/1e8:+.2f}亿"
+                return f"{v/1e4:+.0f}万"
+        return "--"
 
     # 按主力净流入占比排序
     scored = []
@@ -1153,8 +1206,8 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
     md_lines.append("")
 
     if has_detail:
-        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占比 | 超大单 | 大单 | 中单 | 散户(小单) | 总体 | 信号 |")
-        md_lines.append("|------|--------|-----------|------|--------|------|------|-----------|------|------|")
+        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占比 | 超大单 | 大单 | 中单 | 散户(小单) | 总体 | 净申购额 | 信号 |")
+        md_lines.append("|------|--------|-----------|------|--------|------|------|-----------|------|------|------|")
 
         for q, pct in scored[:FUND_FLOW_DISPLAY_LIMIT]:
             chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
@@ -1188,14 +1241,15 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
             else:
                 sl_str = lg_str = md_str = sm_str = ov_str = "--"
                 sig = "⚪ 中性" if abs(pct) < 5 else ("🟢 流入" if pct > 0 else "🟠 流出")
+            sub_str = _etf_sub_str(q)
             md_lines.append(
                 f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% "
-                f"| {sl_str} | {lg_str} | {md_str} | {sm_str} | {ov_str} | {sig} |"
+                f"| {sl_str} | {lg_str} | {md_str} | {sm_str} | {ov_str} | {sub_str} | {sig} |"
             )
     else:
         # 无明细数据时沿用旧格式
-        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 信号 |")
-        md_lines.append("|------|--------|-----------|---------|------|")
+        md_lines.append("| 标的 | 涨跌幅 | 主力净流入 | 占成交额 | 净申购额 | 信号 |")
+        md_lines.append("|------|--------|-----------|---------|------|------|")
         for q, pct in scored[:FUND_FLOW_DISPLAY_LIMIT]:
             chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "--"
             inflow_str = _format_money(q.main_net_inflow)  # type: ignore[arg-type]
@@ -1209,7 +1263,8 @@ def _format_fund_flow_section(quotes: list[Quote], label: str = "自选标的") 
                 sig = "🟠 流出"
             else:
                 sig = "⚪ 中性"
-            md_lines.append(f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% | {sig} |")
+            sub_str = _etf_sub_str(q)
+            md_lines.append(f"| {q.name}({q.code}) | {chg} | {inflow_str} | {pct:.1f}% | {sub_str} | {sig} |")
 
     # 合计汇总
     if abs(total_inflow) >= 1e8:
@@ -3271,21 +3326,29 @@ def generate_evening_review(config: Config) -> Path | None:
                 ))
             data_lines.append("")
 
-    # 主力资金流向
-    fund_md_ev, fund_llm_ev = _format_fund_flow_section(quotes, label="持仓")
+    # 自选标的行情（提前 fetch，供资金流全量展示与建仓机会共用）
+    watchlist = config.watch_items
+    watch_quotes: list[Quote] = []
+    if watchlist:
+        _wl_items = [
+            WatchItem(name=w.name, code=w.code, market=w.market, type=w.type)
+            for w in watchlist
+        ]
+        watch_quotes = fetch_quotes_rich(_wl_items) or []
+
+    # 主力资金流向（持仓+自选全量）
+    from app.miaoxiang import fetch_etf_fund_flow
+    etf_flow_map_ev = fetch_etf_fund_flow(config, _get_unique_items(config))
+    _held_codes = {q.code for q in quotes}
+    fund_quotes_ev = list(quotes) + [q for q in watch_quotes if q.code not in _held_codes]
+    fund_md_ev, fund_llm_ev = _format_fund_flow_section(fund_quotes_ev, label="全部标的", etf_flow_map=etf_flow_map_ev)
     if fund_md_ev:
         data_lines.append(f"\n## 十三、💰 主力资金动向（全天）")
         data_lines.append(fund_md_ev)
 
     # 自选标的建仓机会分析
-    watchlist = config.watch_items
     entry_suggestions = []  # type: list[dict]
     if watchlist:
-        watchlist_items = [
-            WatchItem(name=w.name, code=w.code, market=w.market, type=w.type)
-            for w in watchlist
-        ]
-        watch_quotes = fetch_quotes_rich(watchlist_items)
         watch_tech = _get_holdings_tech_analysis(
             [Holding(name=w.name, code=w.code, market=w.market, amount=0, cost=0.0)
              for w in watchlist], watch_quotes
@@ -3349,7 +3412,7 @@ def generate_evening_review(config: Config) -> Path | None:
         data_lines.append("*注：仅普通 A 股为两融标的，ETF/基金/港股无个股两融数据；融资净买入为最新日相对前一日的余额变化。*")
         data_lines.append("")
 
-    # 妙想增强：持仓消息 + 智能选股 + 持仓体检 + 评级/事件（盘中快讯已在"一"用妙想）
+    # 妙想增强：标的消息 + 智能选股 + 标的体检 + 评级/事件（持仓+自选全量）
     from app.miaoxiang import (
         fetch_stock_screen_for_report,
         fetch_holdings_news,
@@ -3357,9 +3420,11 @@ def generate_evening_review(config: Config) -> Path | None:
         fetch_holdings_events,
     )
 
-    mx_holdings_news = fetch_holdings_news(config, holdings, quotes)
+    mx_items = _get_unique_items(config)
+
+    mx_holdings_news = fetch_holdings_news(config, mx_items, fund_quotes_ev)
     if mx_holdings_news:
-        data_lines.append(f"\n## 十六、📌 持仓消息面（妙想逐个检索）")
+        data_lines.append(f"\n## 十六、📌 标的消息面（妙想逐个检索）")
         data_lines.append(mx_holdings_news)
 
     mx_screen = fetch_stock_screen_for_report(config, "今日涨幅超过3%且主力资金净流入的股票")
@@ -3367,14 +3432,14 @@ def generate_evening_review(config: Config) -> Path | None:
         data_lines.append(f"\n## 十七、🧠 妙想智能选股（建仓参考）")
         data_lines.append(mx_screen)
 
-    mx_fundamental = fetch_holdings_fundamental(config, holdings)
+    mx_fundamental = fetch_holdings_fundamental(config, mx_items)
     if mx_fundamental:
-        data_lines.append(f"\n## 十八、📊 持仓体检（资金面+筹码+基本面）")
+        data_lines.append(f"\n## 十八、📊 标的体检（资金面+筹码+基本面）")
         data_lines.append(mx_fundamental)
 
-    mx_events = fetch_holdings_events(config, holdings)
+    mx_events = fetch_holdings_events(config, mx_items)
     if mx_events:
-        data_lines.append(f"\n## 十九、🚨 持仓评级与事件监控")
+        data_lines.append(f"\n## 十九、🚨 标的评级与事件监控")
         data_lines.append(mx_events)
 
     data_section = "\n".join(data_lines) if data_lines else "暂无数据"
@@ -3387,16 +3452,16 @@ def generate_evening_review(config: Config) -> Path | None:
 
     # 妙想消息面注入 LLM
     if mx_holdings_news:
-        llm_lines.append("\n[持仓消息面（妙想）]")
+        llm_lines.append("\n[标的消息面（妙想）]")
         llm_lines.append(mx_holdings_news[:2500])
     if mx_screen:
         llm_lines.append("\n[妙想智能选股]")
         llm_lines.append(mx_screen[:1000])
     if mx_fundamental:
-        llm_lines.append("\n[持仓体检（资金面+筹码+基本面）]")
+        llm_lines.append("\n[标的体检（资金面+筹码+基本面）]")
         llm_lines.append(mx_fundamental[:2500])
     if mx_events:
-        llm_lines.append("\n[持仓评级与事件（减持/增持/回购/解禁/评级）]")
+        llm_lines.append("\n[标的评级与事件（减持/增持/回购/解禁/评级）]")
         llm_lines.append(mx_events[:2000])
 
     if mx_day_news:
@@ -3568,7 +3633,7 @@ def generate_evening_review(config: Config) -> Path | None:
 - 抄底：是否有抄底信号？什么价位可以试探性建仓/加仓？仓位多少？置信度[高/中/低]
 - 网格：按照预计算的网格区间和间距，给出买卖挂单建议（买单挂在支撑位下方，卖单挂在压力位上方）
 - 止损/止盈：硬止损位（跌破即走），硬止盈位（触及即减仓）
-- 基本面/事件：结合[持仓体检]的净利润增速/机构持股变化，及[评级与事件]的减持/回购/评级变化，判断是否需要因基本面恶化而减仓/清仓，或因增持/回购/评级上调而加仓
+- 基本面/事件：结合[标的体检]的净利润增速/机构持股变化，及[标的评级与事件]的减持/回购/评级变化，判断是否需要因基本面恶化而减仓/清仓，或因增持/回购/评级上调而加仓
 
 ### 五、🔍 自选标的建仓机会
 根据预计算的建仓评分，分析自选标的的建仓机会。请对评分最高的 2-3 只给出：
@@ -3618,6 +3683,338 @@ def generate_evening_review(config: Config) -> Path | None:
     _save_morning_cache(quotes, holdings, tech_data_evening, sector_boards_ev, major_indices_ev)
 
     log.info(f"Evening review generated: {filepath}")
+    return filepath
+
+
+# ============================================================
+# Weekly Review（周报）
+# ============================================================
+
+WEEKLY_WINDOW_DAYS = 5  # 周报统计口径：最近 5 个交易日
+WEEKLY_BENCHMARK_CODE = "510500"  # 中证500ETF，作为超额收益基准
+
+
+def _weekly_return_pct(klines: list) -> float | None:
+    """近 5 个交易日涨跌幅（%）"""
+    from app.technical import calc_period_returns
+    returns = calc_period_returns(klines, [(WEEKLY_WINDOW_DAYS, "近5日")])
+    if returns and returns[0].return_pct is not None:
+        return returns[0].return_pct
+    return None
+
+
+def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: float | None) -> dict | None:
+    """计算单个标的的周度数据，返回 dict 或 None（K线/行情缺失）"""
+    from app.technical import (
+        fetch_historical_kline,
+        get_technical_summary,
+        calc_support_resistance,
+        calc_composite_score,
+        detect_market_regime,
+        MarketRegime,
+    )
+
+    klines = fetch_historical_kline(item.code, item.market, days=60)
+    if not klines:
+        return None
+
+    week_return = _weekly_return_pct(klines)
+    excess = None
+    if week_return is not None and benchmark_return is not None:
+        excess = round(week_return - benchmark_return, 2)
+
+    sr = calc_support_resistance(klines)
+
+    tech = None
+    if quote is not None:
+        try:
+            tech = get_technical_summary(quote, klines)
+        except Exception:
+            tech = None
+
+    composite = {"score": 0, "label": "", "signals": [], "breakdown": {}}
+    regime = MarketRegime()
+    if tech is not None and quote is not None:
+        try:
+            flow_pct = None
+            if quote.main_net_inflow and quote.amount and quote.amount > 0:
+                flow_pct = quote.main_net_inflow / quote.amount * 100
+            composite = calc_composite_score(tech, quote.price or 0, flow_pct=flow_pct)
+            regime = detect_market_regime(tech, quote.price or 0, sr.atr)
+        except Exception:
+            pass
+
+    return {
+        "name": item.name,
+        "code": item.code,
+        "type": item.type,
+        "price": quote.price if quote else None,
+        "week_return": week_return,
+        "excess_return": excess,
+        "support": sr.support,
+        "resistance": sr.resistance,
+        "ma_alignment": tech.ma_alignment if tech else "数据不足",
+        "rsi": tech.rsi if tech else None,
+        "rsi_signal": tech.rsi_signal if tech else "数据不足",
+        "macd_signal": tech.macd_signal if tech else "数据不足",
+        "kdj_signal": tech.kdj_signal if tech else "数据不足",
+        "obv_signal": tech.obv_signal if tech else "数据不足",
+        "composite_score": composite["score"],
+        "composite_label": composite["label"],
+        "composite_signals": composite.get("signals", []),
+        "market_regime": regime.regime,
+        "crowd_label": "",
+    }
+
+
+def generate_weekly_review(config: Config) -> Path | None:
+    """周报：最近 5 个交易日的持仓 + 自选全量分析
+
+    数据区（Markdown）+ LLM 一次调用生成下周展望，仅落盘 md，不推送微信。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from app.data_fetcher import (
+        fetch_quotes_rich,
+        fetch_global_markets,
+        fetch_margin_data,
+        fetch_stock_margin_detail,
+    )
+    from app.helpers import is_a_share_stock
+    from app.technical import fetch_historical_kline
+
+    log.info("Generating weekly review...")
+
+    all_items = _get_unique_items(config)
+    if not all_items:
+        log.warning("Weekly review: 无标的（持仓+自选均为空）")
+        return None
+
+    quotes = fetch_quotes_rich(all_items)
+    quote_map = {q.code: q for q in quotes}
+
+    index_items = [i for i in all_items if i.type == "指数"]
+    tradable_items = [i for i in all_items if i.type != "指数"]
+
+    # 基准：中证500ETF；缺失时回退到第一个可用的指数
+    benchmark_item = next((i for i in all_items if i.code == WEEKLY_BENCHMARK_CODE), None)
+    benchmark_return = None
+    if benchmark_item:
+        benchmark_return = _weekly_return_pct(
+            fetch_historical_kline(benchmark_item.code, benchmark_item.market, days=60))
+    if benchmark_return is None:
+        for idx in index_items:
+            ik = fetch_historical_kline(idx.code, idx.market, days=60)
+            if ik:
+                wr = _weekly_return_pct(ik)
+                if wr is not None:
+                    benchmark_item, benchmark_return = idx, wr
+                    break
+
+    # 并行计算各可交易标的周度数据
+    def _one(item: WatchItem) -> dict | None:
+        return _build_weekly_item(item, quote_map.get(item.code), benchmark_return)
+
+    weekly_data: list[dict] = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(_one, tradable_items):
+            if r:
+                weekly_data.append(r)
+
+    weekly_data.sort(
+        key=lambda x: x["week_return"] if x["week_return"] is not None else -999.0,
+        reverse=True,
+    )
+
+    # ===== 数据区（Markdown）=====
+    data_lines: list[str] = []
+
+    # 一、大盘周度复盘
+    data_lines.append("## 一、大盘周度复盘")
+    data_lines.append("")
+    if benchmark_item is not None and benchmark_return is not None:
+        data_lines.append(f"- **基准: {benchmark_item.name} 近5日 {benchmark_return:+.2f}%**")
+    for idx in index_items:
+        ik = fetch_historical_kline(idx.code, idx.market, days=60)
+        wr = _weekly_return_pct(ik)
+        if wr is not None:
+            data_lines.append(f"- {idx.name}({idx.code}): 近5日 {wr:+.2f}%")
+    global_data = fetch_global_markets()
+    if global_data:
+        data_lines.append("\n### 外盘参考")
+        for k, v in global_data.items():
+            data_lines.append(f"- {k}: {v}")
+
+    # 全市场两融（杠杆资金面，替代已停止披露的北向资金）
+    margin_data = fetch_margin_data()
+    margin_llm_brief = ""
+    if margin_data and margin_data.financing_balance > 0:
+        data_lines.append("\n### 全市场两融（杠杆资金面）")
+        data_lines.append(f"- 融资余额：{margin_data.financing_balance:.1f}亿")
+        data_lines.append(f"- 融资净买入：{margin_data.financing_net_buy:+.1f}亿（{margin_data.financing_change_direction}）")
+        data_lines.append(f"- 融券余额：{margin_data.securities_lending_balance:.1f}亿")
+        data_lines.append(f"- 两融总余额：{margin_data.total_balance:.1f}亿（数据日期 {margin_data.date}）")
+        margin_llm_brief = (
+            f"全市场两融：融资余额{margin_data.financing_balance:.0f}亿，"
+            f"融资净买入{margin_data.financing_net_buy:+.1f}亿（{margin_data.financing_change_direction}），"
+            f"两融总余额{margin_data.total_balance:.0f}亿"
+        )
+
+    # 二、周度强弱榜
+    data_lines.append("\n## 二、列表标的周度强弱榜（超额 vs 基准）")
+    data_lines.append("")
+    data_lines.append("| 标的 | 类型 | 近5日 | 超额 | 最新价 | 复合评分 |")
+    data_lines.append("|------|------|-------|------|--------|---------|")
+    for d in weekly_data:
+        wr = f"{d['week_return']:+.2f}%" if d["week_return"] is not None else "--"
+        ex = f"{d['excess_return']:+.2f}%" if d["excess_return"] is not None else "--"
+        price = f"{d['price']:.3f}" if d["price"] else "--"
+        score = str(d["composite_score"]) if d["composite_score"] else "--"
+        data_lines.append(f"| {d['name']}({d['code']}) | {d['type']} | {wr} | {ex} | {price} | {score} |")
+
+    # 三、技术面趋势
+    data_lines.append("\n## 三、技术面趋势")
+    data_lines.append("")
+    data_lines.append("| 标的 | 均线 | RSI | MACD | KDJ | OBV | 支撑 | 压力 |")
+    data_lines.append("|------|------|-----|------|-----|-----|------|------|")
+    for d in weekly_data:
+        sup = f"{d['support']:.3f}" if d["support"] else "--"
+        res = f"{d['resistance']:.3f}" if d["resistance"] else "--"
+        rsi = f"{d['rsi']:.1f}({d['rsi_signal']})" if d["rsi"] is not None else "--"
+        data_lines.append(
+            f"| {d['name']} | {d['ma_alignment']} | {rsi} | {d['macd_signal']} "
+            f"| {d['kdj_signal']} | {d['obv_signal']} | {sup} | {res} |")
+
+    # 四、个股两融（杠杆资金，仅普通 A 股；ETF/指数/基金/港股无个股两融明细）
+    stock_margin = fetch_stock_margin_detail()
+    margin_targets = []  # [(name, code, StockMarginData)]
+    margin_llm_lines = []
+    seen_codes = set()
+    for item in all_items:
+        if item.code in seen_codes:
+            continue
+        seen_codes.add(item.code)
+        # 指数无个股两融，且上证指数 000001 与深市个股号段冲突，必须先排除
+        if item.type == "指数":
+            continue
+        # 仅普通 A 股股票可能有两融；ETF/基金/港股由号段排除
+        if not is_a_share_stock(item.code, item.market):
+            continue
+        md = stock_margin.get(item.code)
+        if md is None:
+            continue
+        name = item.name or md.name
+        margin_targets.append((name, item.code, md))
+        margin_llm_lines.append(
+            f"{name}({item.code}): 融资余额{md.financing_balance/1e8:.2f}亿，"
+            f"融资净买入{md.financing_net_buy/1e8:+.2f}亿（{md.financing_change_direction}）"
+        )
+
+    if margin_targets:
+        data_lines.append("\n## 四、个股两融（杠杆资金，仅普通 A 股）")
+        data_lines.append("")
+        data_lines.append("| 标的 | 融资余额 | 融资净买入 | 融券余额 | 数据日期 |")
+        data_lines.append("|------|---------|-----------|---------|---------|")
+        for name, code, md in margin_targets:
+            data_lines.append(
+                f"| {name}({code}) | {md.financing_balance/1e8:.2f}亿 | "
+                f"{md.financing_net_buy/1e8:+.2f}亿（{md.financing_change_direction}） | "
+                f"{md.securities_lending_balance/1e8:.2f}亿 | {md.date} |"
+            )
+        data_lines.append("")
+        data_lines.append("*注：仅普通 A 股为两融标的，ETF/指数/基金/港股无个股两融数据；融资净买入为最新日相对前一日的余额变化（T+1 披露）。*")
+
+    # 五、标的体检（妙想：资金面+筹码+基本面）
+    mx_fundamental = ""
+    try:
+        from app.miaoxiang import fetch_holdings_fundamental
+        mx_fundamental = fetch_holdings_fundamental(config, all_items)
+    except Exception:
+        mx_fundamental = ""
+    if mx_fundamental:
+        data_lines.append("\n## 五、标的体检（资金面+筹码+基本面）")
+        data_lines.append(mx_fundamental)
+
+    # 六、消息面
+    data_lines.append("\n## 六、消息面/本周事件")
+    data_lines.append("")
+    try:
+        from app.miaoxiang import fetch_data_for_report
+        mx_events = fetch_data_for_report(config, "本周A股重要政策 板块热点 利好利空")
+        if mx_events:
+            data_lines.append(mx_events)
+        else:
+            data_lines.append("（妙想消息面数据暂不可用）")
+    except Exception:
+        data_lines.append("（消息面数据获取失败）")
+
+    data_section = "\n".join(data_lines)
+
+    # ===== LLM prompt（一次调用，覆盖所有标的）=====
+    llm_lines: list[str] = [
+        f"请生成一份周度复盘报告（最近 5 个交易日，截至 {datetime.now().strftime('%Y-%m-%d')}）。"
+    ]
+    if benchmark_item is not None and benchmark_return is not None:
+        llm_lines.append(f"\n[基准] {benchmark_item.name} 近5日 {benchmark_return:+.2f}%")
+    if margin_llm_brief:
+        llm_lines.append(f"\n[全市场两融（杠杆资金面）] {margin_llm_brief}")
+    llm_lines.append("\n[标的周度数据（每个都要分析）]")
+    for d in weekly_data:
+        wr = f"{d['week_return']:+.2f}%" if d["week_return"] is not None else "--"
+        ex = f"{d['excess_return']:+.2f}%" if d["excess_return"] is not None else "--"
+        sup = f"{d['support']:.3f}" if d["support"] else "--"
+        res = f"{d['resistance']:.3f}" if d["resistance"] else "--"
+        llm_lines.append(
+            f"  {d['name']}({d['code']})[{d['type']}]: 近5日{wr} 超额{ex} "
+            f"评分{d['composite_score']} 均线{d['ma_alignment']} RSI{d['rsi_signal']} "
+            f"MACD{d['macd_signal']} 支撑{sup} 压力{res}")
+    if margin_llm_lines:
+        llm_lines.append("\n[个股两融（杠杆资金，仅普通 A 股）]")
+        llm_lines.append("  " + "；".join(margin_llm_lines))
+    if mx_fundamental:
+        llm_lines.append("\n[标的体检（资金面+筹码+基本面，妙想）]")
+        llm_lines.append(mx_fundamental[:2500])
+    llm_lines.append(f"""
+
+请按以下结构输出周报分析（Markdown，关键判断标注置信度）：
+
+### 一、本周市场综述
+- 大盘（三大指数 + 基准）本周走势定性，与上周相比的变化方向
+- 列表标的整体涨跌分布（几只上涨/几只下跌，领涨领跌板块）
+- 结合全市场两融（融资余额/融资净买入）判断市场杠杆资金情绪
+
+### 二、标的强弱点评
+- 对每个标的逐一给出 1-2 句点评：本周表现、相对基准强弱、技术面趋势、资金面态度
+- 重点标注：逆势流入（主力买、价格跌/滞涨）与逢高流出（主力卖、价格涨）的背离信号
+- 结合个股两融的融资净买入方向，判断杠杆资金对普通 A 股是否在加/减仓
+
+### 三、行业/风格轮动
+- 宽基 / 行业 ETF / 港股 ETF 三类本周谁强谁弱
+- 本周主线板块与退潮板块
+
+### 四、下周展望
+- 下周最值得关注的风险点（1-2 个）
+- 重点关注的标的（2-4 个）及其关键支撑/压力位
+- 操作建议（仓位/加减仓方向，避免给出具体买卖指令）
+
+要求：每个判断性结论标注置信度 [高/中/低]；数据不足时如实说"数据不足"。""")
+
+    llm_content = _call_llm("\n".join(llm_lines), config, role="analyst", temperature=0.4, max_tokens=3500)
+    if not llm_content:
+        log.warning("Weekly review: LLM generation failed")
+
+    report = _build_report(data_section, llm_content)
+
+    # 落盘（不推送微信），同日重复生成覆盖旧文件
+    report_dir = Path(config.report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    filepath = report_dir / f"Weekly_{datetime.now().strftime('%Y-%m-%d')}.md"
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(f"# 周度复盘报告\n\n")
+        f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("---\n\n")
+        f.write(report)
+
+    log.info(f"Weekly review generated: {filepath}")
     return filepath
 
 

@@ -29,7 +29,14 @@
       "Bash(echo \"py_exit=$?\")",
       "Bash(echo \"py_hi_exit=$?\")",
       "Bash(git fetch *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(git pull *)",
+      "mcp__ccs-websearch__WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(pip show *)",
+      "Bash(ruff check *)",
+      "Bash(black --check app/miaoxiang.py app/reporter.py)",
+      "Bash(echo \"grep-exit=$?\")"
     ]
   }
 }

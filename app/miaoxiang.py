@@ -1016,17 +1016,17 @@ def fetch_opportunity_screen(config) -> str:
         return ""
 
 
-def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str:
-    """报告用：并发搜索每个持仓的消息面
+def fetch_holdings_news(config, items, quotes, max_holdings: Optional[int] = None) -> str:
+    """报告用：并发搜索列表标的（持仓+自选）的消息面
 
     Args:
         config: 配置对象
-        holdings: 持仓列表
+        items: 标的列表（Holding 或 WatchItem，需含 name/code）
         quotes: 行情列表（用于识别异动股，优先搜索）
-        max_holdings: 最多搜索的持仓数（保护调用限额）
+        max_holdings: 最多搜索的标的数（None=全量，保护调用限额用）
 
     Returns:
-        格式化的持仓消息面汇总，失败返回空串
+        格式化的标的消息面汇总，失败返回空串
     """
     if not config.mx_apikeys:
         return ""
@@ -1035,20 +1035,18 @@ def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str
 
     client = get_mx_client(config)
 
-    # 构建持仓名称列表，异动股（涨跌幅>2%）优先
+    # 构建标的名称列表，异动股（涨跌幅>2%）优先
     quote_map = {q.code: q for q in quotes}
-    items = []
-    for h in holdings:
-        q = quote_map.get(h.code)
+    items_out = []
+    for it in items:
+        q = quote_map.get(it.code)
         chg = q.change_pct if q and q.change_pct is not None else 0
-        # 只搜有持仓数量（amount>0）或有行情的
-        if h.amount <= 0 and not q:
-            continue
-        items.append((h.name, h.code, chg))
+        items_out.append((it.name, it.code, chg))
 
     # 按异动幅度排序，异动大的优先
-    items.sort(key=lambda x: abs(x[2]), reverse=True)
-    items = items[:max_holdings]
+    items_out.sort(key=lambda x: abs(x[2]), reverse=True)
+    if max_holdings:
+        items_out = items_out[:max_holdings]
 
     def _search_one(name_code_chg):
         name, code, chg = name_code_chg
@@ -1067,7 +1065,7 @@ def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str
     results = []
     # 并发度降为 2，配合重试退避，避免触发妙想限频(112)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {pool.submit(_search_one, item): item for item in items}
+        futures = {pool.submit(_search_one, item): item for item in items_out}
         for fut in futures:
             try:
                 r = fut.result(timeout=30)
@@ -1079,7 +1077,7 @@ def fetch_holdings_news(config, holdings, quotes, max_holdings: int = 20) -> str
     if not results:
         return ""
 
-    lines = ["**持仓消息面（妙想）**\n"]
+    lines = ["**标的消息面（妙想）**\n"]
     for name, code, chg, news_lines in results:
         chg_str = f" ({chg:+.1f}%)" if chg else ""
         lines.append(f"### {name}({code}){chg_str}")
@@ -1148,23 +1146,25 @@ def _belongs_to(item: dict, name: str, code: str) -> bool:
     return name in hay
 
 
-def fetch_holdings_fundamental(config, holdings, max_holdings: int = 8) -> str:
-    """报告用：并发查询持仓的资金面+筹码+基本面（妙想 query_structured）
+def fetch_holdings_fundamental(config, items, max_holdings: Optional[int] = None) -> str:
+    """报告用：并发查询列表标的（持仓+自选）的资金面+筹码+基本面（妙想 query_structured）
 
-    每个持仓 3 个维度（自然语言 → 结构化表格 → 压缩摘要）：
+    每个标的 3 个维度（自然语言 → 结构化表格 → 压缩摘要）：
       1. 资金面：近5日主力资金净流入趋势
       2. 筹码：机构持股比例合计（按报告期，看机构进出）
       3. 基本面：最新财报净利润同比/营收/ROE/负债率
 
     返回格式化文本，失败或无 key 返回空串。
     """
-    if not config.mx_apikeys or not holdings:
+    if not config.mx_apikeys or not items:
         return ""
 
     from concurrent.futures import ThreadPoolExecutor
 
     client = get_mx_client(config)
-    items = [h for h in holdings if getattr(h, "amount", 0) > 0][:max_holdings]
+    items = list(items)
+    if max_holdings:
+        items = items[:max_holdings]
     if not items:
         return ""
 
@@ -1215,25 +1215,27 @@ def fetch_holdings_fundamental(config, holdings, max_holdings: int = 8) -> str:
 
     if not results:
         return ""
-    return "**持仓体检（资金面+筹码+基本面）**\n\n" + "\n\n".join(results)
+    return "**标的体检（资金面+筹码+基本面）**\n\n" + "\n\n".join(results)
 
 
-def fetch_holdings_events(config, holdings, max_holdings: int = 8) -> str:
-    """报告用：并发检索持仓的研报评级 + 减持/增持/回购/解禁事件（妙想 fin_search_structured）
+def fetch_holdings_events(config, items, max_holdings: Optional[int] = None) -> str:
+    """报告用：并发检索列表标的（持仓+自选）的研报评级 + 减持/增持/回购/解禁事件（妙想 fin_search_structured）
 
-    每个持仓 2 个维度：
+    每个标的 2 个维度：
       1. 研报评级：最新研报的评级（买入/增持/中性/减持/卖出）+ 机构
       2. 事件监控：减持/增持/回购/解禁/业绩预告/质押
 
     返回格式化文本，失败或无 key 返回空串。
     """
-    if not config.mx_apikeys or not holdings:
+    if not config.mx_apikeys or not items:
         return ""
 
     from concurrent.futures import ThreadPoolExecutor
 
     client = get_mx_client(config)
-    items = [h for h in holdings if getattr(h, "amount", 0) > 0][:max_holdings]
+    items = list(items)
+    if max_holdings:
+        items = items[:max_holdings]
     if not items:
         return ""
 
@@ -1287,7 +1289,84 @@ def fetch_holdings_events(config, holdings, max_holdings: int = 8) -> str:
 
     if not results:
         return ""
-    return "**持仓评级与事件监控**\n\n" + "\n\n".join(results)
+    return "**标的评级与事件监控**\n\n" + "\n\n".join(results)
+
+
+def fetch_etf_fund_flow(config, items) -> dict:
+    """盯盘/报告用：查询 ETF 资金流（主力净流入 + 净申购额，申赎口径）
+
+    妙想对 ETF 额外返回「净申购额估算值」（申赎口径），这是东财 fflow 接口给不了、
+    且更贴合 ETF 真实资金进出的指标。本函数从传入的标的列表里过滤出 ETF，
+    并发查询每只 ETF 的最新主力净流入与净申购额。
+
+    Args:
+        config: 配置对象
+        items: 标的列表（Holding 或 WatchItem，需含 name/code/type）
+
+    Returns:
+        {code: {"name": str, "main_net": float|None, "net_subscribe": float|None}}
+        失败/无 ETF/无数据返回空 dict
+    """
+    if not config.mx_apikeys:
+        return {}
+
+    # 过滤出 ETF：优先 A股 ETF 代码号段，type/name 兜底（holdings 里的 ETF 常无 type 且名不带"ETF"）
+    _ETF_PREFIXES = ("51", "56", "58", "159")
+    etfs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for it in items:
+        code = str(getattr(it, "code", "") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        itype = str(getattr(it, "type", "") or "")
+        name = str(getattr(it, "name", "") or "")
+        if code.startswith(_ETF_PREFIXES) or "ETF" in itype or "ETF" in name:
+            etfs.append((name.strip(), code))
+    if not etfs:
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    client = get_mx_client(config)
+
+    def _query_one(name: str, code: str):
+        try:
+            tables = client.query_structured(f"{name} {code} 主力资金净流入 净申购额")
+            main_net = None
+            net_subscribe = None
+            for t in tables:
+                cols = t.get("columns") or []
+                # 字段名不统一：沪深300ETF 用「区间主力净流入资金」，半导体ETF 用「主力净流入资金」，
+                # 净申购额列名「区间净申购额估算值(区间净流入额)」含「净申购」。按子串匹配，取最新一行。
+                main_col = next((c for c in cols if "主力净流入" in c), None)
+                sub_col = next((c for c in cols if "净申购" in c or "申赎" in c), None)
+                rows = t.get("rows") or []
+                if not rows:
+                    continue
+                row = rows[0]  # 最新交易日/区间在前
+                if main_col and main_net is None:
+                    main_net = MXClient._parse_amount(row.get(main_col))
+                if sub_col and net_subscribe is None:
+                    net_subscribe = MXClient._parse_amount(row.get(sub_col))
+            if main_net is None and net_subscribe is None:
+                return None
+            return (code, {"name": name, "main_net": main_net, "net_subscribe": net_subscribe})
+        except Exception as e:
+            log.debug(f"ETF资金流查询失败 {name}: {e}")
+            return None
+
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_query_one, n, c) for n, c in etfs]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=30)
+                if r:
+                    results[r[0]] = r[1]
+            except Exception:
+                pass
+    return results
 
 
 _mx_client: Optional[MXClient] = None

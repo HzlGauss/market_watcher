@@ -653,20 +653,11 @@ def _score_accumulation(
         if not c.industry and industry_map.get(c.code):
             c.industry = industry_map[c.code]
 
-    # 4a. 资金流：优先用妙想选股自带的多日主力净额（省去东财 daykline 取数，稳定且不耗配额），
-    #     不足 3 日时回退东财（对并发极敏感，串行 + sleep 规避）
-    from app import data_fetcher
+    # 4a. 资金流：直接使用妙想选股自带的多日主力净额（东财 daykline 历史接口已失效，不再回退；
+    #      flow_days 不足的票由 analyze_accumulation 自动降级到估值维度）
     flow_map: dict[str, list] = {}
     for c in kept:
-        if len(c.flow_days) >= 3:
-            flow_map[c.code] = c.flow_days
-            continue
-        c.market = c.market or _detect_market(c.code)
-        try:
-            flow_map[c.code] = data_fetcher.fetch_fund_flow_history(c.code, c.market, days=days)
-        except Exception:
-            flow_map[c.code] = []
-        time.sleep(0.5)
+        flow_map[c.code] = c.flow_days
 
     # 4b. 串行拉K线（AKShare 个股限流约 1 次/秒）+ 计算背离度 + 综合评分
     from app import technical
