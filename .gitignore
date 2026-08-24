@@ -75,7 +75,11 @@ state/*.json
 monitoring_briefs/*.md
 investment_reports/*.md
 smart_screening/*.md
+analysis_reports/*.md
 *.log
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
 
 # Keep .gitkeep files
 !.gitkeep

@@ -85,7 +85,7 @@ def _format_compact_flow(value: Optional[float]) -> str:
     if abs_v >= 1e8:
         return f"{sign}{abs_v/1e8:.2f}亿"
     elif abs_v >= 1e6:
-        return f"{sign}{abs_v/1e6:.0f}万"
+        return f"{sign}{abs_v/1e4:.0f}万"
     elif abs_v >= 1e4:
         return f"{sign}{abs_v/1e4:.1f}万"
     else:

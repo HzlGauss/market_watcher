@@ -22,6 +22,11 @@ SINA_API = "https://hq.sinajs.cn/list="
 NORTH_FLOW_API = "https://push2.eastmoney.com/api/qt/kamt.kline/get"
 STOCK_FLOW_API = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
 STOCK_FLOW_DAILY_API = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+# 实时资金流子域：push2 常被反爬断连(RemoteDisconnected)，优先 push2delay，失败回退 push2
+STOCK_FLOW_HOSTS = (
+    "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get",
+    "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+)
 TENCENT_API = "https://qt.gtimg.cn/q="
 
 
@@ -307,11 +312,92 @@ def fetch_main_net_inflow(code: str, market: str = "SH") -> Optional[float]:
     return sina_flow.main_net if sina_flow else None
 
 
+def _fetch_fund_flow_minute(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
+    """获取个股当日实时资金流向明细（分钟级 klt=1）
+
+    复用 STOCK_FLOW_API（fflow/kline/get，klt=1 分钟级），取最新一根分钟 K 线，
+    其 f52-f56 为当日累计的主力/小单/中单/大单/超大单净流入。
+    交易时段返回当日实时累计值，收盘后返回当日完整数据（含全部 4 档分类）。
+
+    相比日线 daykline（klt=101 只含已收盘交易日，交易时段会返回上一交易日数据），
+    分钟级接口是「当日实时资金流」的正确数据源。
+
+    实时子域 push2 常被反爬断连（RemoteDisconnected），故优先 push2delay、失败回退 push2；
+    并校验返回的分钟 K 线日期为当日，避免非交易日误返回上一交易日数据。
+
+    Args:
+        code: 股票代码
+        market: 市场标识 (SH/SZ)
+
+    Returns:
+        FundFlowDetail 或 None（静默失败）
+    """
+    secid = _get_secid(code, market)
+    import requests
+    fields2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://data.eastmoney.com/",
+    }
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for host in STOCK_FLOW_HOSTS:
+        url = (f"{host}?secid={secid}"
+               f"&fields1=f1,f2,f3&fields2={fields2}"
+               f"&lmt=1&klt=1")
+        try:
+            # 东财资金流接口易触发限频(RemoteDisconnected)，退避重试 3 次
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = requests.get(url, timeout=5, headers=headers)
+                    break
+                except requests.exceptions.RequestException:
+                    if attempt == 2:
+                        raise
+                    time.sleep(1.5 * (attempt + 1))
+            if resp is None or resp.status_code != 200:
+                continue
+            data = resp.json().get("data")
+            if not data:
+                continue
+
+            klines = data.get("klines")
+            if not klines or len(klines) == 0:
+                continue
+
+            # 最新一分钟 K 线：时间,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单)
+            parts = klines[-1].split(",")
+            if len(parts) < 6:
+                continue
+            # 日期校验：非交易日时分钟接口可能返回上一交易日数据，仅接受当日
+            if not parts[0].startswith(today):
+                return None
+            main_net = _parse_float(parts[1]) if len(parts) > 1 else None
+            super_large_net = _parse_float(parts[5]) if len(parts) > 5 else None
+            if main_net is None and super_large_net is None:
+                return None
+            return FundFlowDetail(
+                main_net=main_net,                                             # f52 主力净流入
+                small_net=_parse_float(parts[2]) if len(parts) > 2 else None,  # f53 小单（散户）
+                medium_net=_parse_float(parts[3]) if len(parts) > 3 else None, # f54 中单
+                large_net=_parse_float(parts[4]) if len(parts) > 4 else None,  # f55 大单
+                super_large_net=super_large_net,                               # f56 超大单
+            )
+        except Exception:
+            continue  # 该 host 失败，尝试下一个
+
+    return None  # 静默失败，调用方按空处理
+
+
 def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
     """获取个股当日资金流向明细（超大单/大单/中单/小单）
 
-    使用东方财富 fflow/daykline/get 接口，klt=101（日线）+ lmt=1 取最新一天。
-    交易时段内返回当日实时累计值，收盘后返回当日完整数据。
+    数据源优先级：
+    1. 分钟级 fflow/kline/get（klt=1）—— 当日实时累计值，交易时段/收盘后均返回当日数据；
+    2. 日线 fflow/daykline/get（klt=101）—— 仅含已收盘交易日，作为分钟级失败时的兜底；
+    3. 新浪资金流（带日期校验，拒绝非当日数据）。
+
     每条格式：日期,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单),
               f57(主力占比),f58(小单占比),f59(中单占比),f60(大单占比),f61(超大单占比)
 
@@ -322,6 +408,12 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
     Returns:
         FundFlowDetail 或 None（静默失败）
     """
+    # 优先分钟级实时接口（当日累计，交易时段/收盘后均返回当日数据）
+    minute_flow = _fetch_fund_flow_minute(code, market)
+    if minute_flow is not None:
+        return minute_flow
+
+    # 分钟级接口失败（如限频）时，回退到日线接口（仅已收盘交易日）
     secid = _get_secid(code, market)
     import requests
     url = (f"{STOCK_FLOW_DAILY_API}?secid={secid}"
@@ -356,6 +448,11 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
         # 解析最后一条 kline: 日期,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61
         parts = klines[-1].split(",")
         if len(parts) < 6:
+            return None
+
+        # 日期校验：日线接口只含已收盘交易日，交易时段会返回上一交易日数据。
+        # 仅接受当日数据，避免把过期数据当成「今日」展示（否则会误判主力流入/流出方向）。
+        if parts[0] != datetime.now().strftime("%Y-%m-%d"):
             return None
 
         def _pct(i: int) -> Optional[float]:
@@ -413,6 +510,11 @@ def _fetch_fund_flow_sina(code: str, market: str = "SH") -> Optional[FundFlowDet
         if not data or not isinstance(data, list) or not data:
             return None
         item = data[0]
+        # 日期校验：新浪 zjlrqs 为历史资金流接口，交易时段内 data[0] 是上一交易日数据。
+        # 仅接受当日数据，避免把过期数据当成「今日」展示（否则会误判主力流入/流出方向）。
+        opendate = str(item.get("opendate") or "")
+        if opendate != datetime.now().strftime("%Y-%m-%d"):
+            return None
         main_net = _parse_float(item.get("netamount"))
         super_large_net = _parse_float(item.get("r0_net"))
         if main_net is None and super_large_net is None:
@@ -428,10 +530,36 @@ def _fetch_fund_flow_sina(code: str, market: str = "SH") -> Optional[FundFlowDet
         return None  # 静默失败
 
 
+def fetch_fund_flow_miaoxiang(code: str, market: str = "SZ", name: str = "") -> Optional[FundFlowDetail]:
+    """妙想（东方财富 Miaoxiang）兜底：查询个股当日实时资金流向（4 档分类）
+
+    作为东方财富 fflow 接口之外的独立数据源，通过自然语言 query 接口返回
+    主力/超大单/大单/中单/小单净流入，可用于交叉验证或替换限频的 fflow 接口。
+    需在 .env 配置 MX_APIKEY（可选 MX_APIKEY_2）。
+
+    Args:
+        code: 6 位 A 股代码
+        market: 市场标识 (SH/SZ)，本接口实际不依赖该字段，保留以对齐其他函数签名
+        name: 股票名称（可选，提升查询精度）
+
+    Returns:
+        FundFlowDetail 或 None（无 key / 查询失败 / 无数据）
+    """
+    import os
+    from app.miaoxiang import MXClient
+
+    keys = [k for k in (os.environ.get("MX_APIKEY"), os.environ.get("MX_APIKEY_2")) if k]
+    if not keys:
+        return None
+    client = MXClient(keys)
+    return client.stock_fund_flow(code, name)
+
+
 def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
     """为 Quote 列表批量补充资金流向明细（原地修改）
 
     使用线程池并发请求，每只股票独立请求东方财富资金流接口。
+    东财 fflow 全部失败（限频/断连）时回退到妙想（Miaoxiang，需 .env 配置 MX_APIKEY）。
     同时填充 main_net_inflow（向后兼容）和 fund_flow（资金明细）两个字段。
     """
     if not quotes:
@@ -439,7 +567,11 @@ def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
 
     def _fetch_one(q: Quote) -> tuple[str, Optional[FundFlowDetail]]:
         time.sleep(0.3)  # 降低并发请求频率，避免触发东财限频
-        flow = fetch_fund_flow_detail(q.code, q.code.startswith(("6", "9")) and "SH" or "SZ")
+        market = "SH" if q.code.startswith(("6", "9")) else "SZ"
+        flow = fetch_fund_flow_detail(q.code, market)
+        # 东财 fflow 全部失败时，用妙想兜底（独立数据源，可交叉验证）
+        if flow is None:
+            flow = fetch_fund_flow_miaoxiang(q.code, market, q.name)
         return (q.code, flow)
 
     try:

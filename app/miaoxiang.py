@@ -153,6 +153,80 @@ class MXClient:
             log.debug(f"妙想查询结构化解析失败: {e}")
             return []
 
+    # ---- 1.5 个股资金流 ----
+
+    def stock_fund_flow(self, code: str, name: str = "") -> Optional["FundFlowDetail"]:
+        """查询个股当日实时资金流向（4 档分类），返回 FundFlowDetail
+
+        通过自然语言 query 接口查询，解析 rawTable 中的主力/超大单/大单/中单/小单净流入。
+        字段码前缀映射：ZLJE=主力、CDDJE=超大单、DDJE=大单、ZDJE=中单、XDJE=小单。
+
+        Args:
+            code: 6 位 A 股代码
+            name: 股票名称（可选，提升查询精度）
+
+        Returns:
+            FundFlowDetail 或 None（无 key / 查询失败 / 无数据）
+        """
+        from app.models import FundFlowDetail
+
+        query_text = f"{code} {name} 今日资金流向 主力 超大单 大单 中单 小单".strip()
+        result = self.query(query_text)
+        if not result or result.get("status") != 0:
+            return None
+        try:
+            dto_list = (
+                (result.get("data") or {}).get("data", {})
+                .get("searchDataResultDTO", {})
+                .get("dataTableDTOList") or []
+            )
+            if not dto_list:
+                return None
+            raw = dto_list[0].get("rawTable") or {}
+            if not isinstance(raw, dict) or not raw:
+                return None
+
+            head = raw.get("headName") or []
+            # 定位目标证券所在列：headName 含代码（如 "沃尔核材(002130.SZ)"）时精确匹配，
+            # 否则取最后一列（单证券时 headName 为日期，仅一列）。
+            col = 0
+            for i, h in enumerate(head):
+                if code in str(h):
+                    col = i
+                    break
+            else:
+                col = len(head) - 1 if head else 0
+
+            def _val(prefix: str) -> Optional[float]:
+                """按字段码前缀取目标列数值（元）"""
+                for k, vals in raw.items():
+                    if k == "headName" or not str(k).startswith(prefix):
+                        continue
+                    if isinstance(vals, list) and vals:
+                        idx = col if col < len(vals) else len(vals) - 1
+                        return self._parse_amount(vals[idx])
+                    return self._parse_amount(vals)
+                return None
+
+            main_net = _val("ZLJE")          # 主力净流入
+            super_large_net = _val("CDDJE")  # 超大单净流入
+            large_net = _val("DDJE")         # 大单净流入
+            medium_net = _val("ZDJE")        # 中单净流入
+            small_net = _val("XDJE")         # 小单净流入
+
+            if main_net is None and super_large_net is None:
+                return None
+            return FundFlowDetail(
+                main_net=main_net,
+                super_large_net=super_large_net,
+                large_net=large_net,
+                medium_net=medium_net,
+                small_net=small_net,
+            )
+        except Exception as e:
+            log.debug(f"妙想个股资金流解析失败 {code}: {e}")
+            return None
+
     # ---- 2. 智能选股 ----
 
     def stock_screen(self, keyword: str, page_no: int = 1, page_size: int = 20) -> Optional[dict]:

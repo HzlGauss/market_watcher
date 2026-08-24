@@ -351,9 +351,10 @@ class TestFetchQuotesRich:
 # ============================================================
 
 def _mock_news_resp(items: list[dict]):
-    """构造模拟的东方财富快讯响应"""
+    """构造模拟的新浪财经快讯响应（fetch_market_news 用 requests.get 直连新浪）"""
     resp = MagicMock()
-    resp.json.return_value = {"data": items}
+    resp.status_code = 200
+    resp.json.return_value = {"result": {"data": items}}
     return resp
 
 
@@ -361,8 +362,8 @@ def _make_news_item(title: str, ctime: str, content: str = "", category: str = "
     return {
         "title": title,
         "ctime": ctime,
-        "content": content,
-        "category": category,
+        "intro": content,        # fetch_market_news 读 intro 作为正文
+        "media_name": category,  # fetch_market_news 读 media_name 作为来源/分类
         "url": f"http://example.com/{title}",
     }
 
@@ -378,7 +379,7 @@ class TestFetchMarketNews:
             _make_news_item("新闻C", "2026-05-16 09:05:00", "内容C"),
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9, max_count=15)
 
         assert len(result) == 2
@@ -396,7 +397,7 @@ class TestFetchMarketNews:
             _make_news_item("晚间新闻", "2026-05-16 15:00:00", ""),
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=9, end_hour=12, max_count=15)
 
         assert len(result) == 1
@@ -404,7 +405,7 @@ class TestFetchMarketNews:
 
     def test_api_returns_none(self):
         """API 返回 None 时返回空列表"""
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=None):
+        with patch("requests.get", return_value=None):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert result == []
@@ -412,9 +413,10 @@ class TestFetchMarketNews:
     def test_api_returns_invalid_json(self):
         """API 返回非 JSON 时返回空列表"""
         resp = MagicMock()
+        resp.status_code = 200
         resp.json.side_effect = Exception("Invalid JSON")
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=resp):
+        with patch("requests.get", return_value=resp):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert result == []
@@ -426,7 +428,7 @@ class TestFetchMarketNews:
             _make_news_item("晚间新闻", "2026-05-16 20:00:00", ""),
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=9, end_hour=12, max_count=15)
 
         assert result == []
@@ -438,7 +440,7 @@ class TestFetchMarketNews:
             for i in range(20)
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9, max_count=5)
 
         assert len(result) == 5
@@ -448,7 +450,7 @@ class TestFetchMarketNews:
         long_content = "A" * 500
         items = [_make_news_item("长新闻", "2026-05-16 08:00:00", long_content)]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert len(result) == 1
@@ -458,7 +460,7 @@ class TestFetchMarketNews:
         """返回的是 MarketNews 对象"""
         items = [_make_news_item("测试", "2026-05-16 08:00:00", "内容", "测试")]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert len(result) == 1
@@ -471,7 +473,7 @@ class TestFetchMarketNews:
             _make_news_item("有标题", "2026-05-16 08:05:00", "内容"),
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert len(result) == 1
@@ -480,9 +482,10 @@ class TestFetchMarketNews:
     def test_empty_data_response(self):
         """data 字段为空时返回空列表"""
         resp = MagicMock()
-        resp.json.return_value = {"data": None}
+        resp.status_code = 200
+        resp.json.return_value = {"result": {"data": None}}
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=resp):
+        with patch("requests.get", return_value=resp):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert result == []
@@ -494,7 +497,7 @@ class TestFetchMarketNews:
             _make_news_item("有时间", "2026-05-16 08:00:00", "内容"),
         ]
 
-        with patch("app.data_fetcher.eastmoney_client.get", return_value=_mock_news_resp(items)):
+        with patch("requests.get", return_value=_mock_news_resp(items)):
             result = fetch_market_news(start_hour=0, end_hour=9)
 
         assert len(result) == 1

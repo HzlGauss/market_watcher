@@ -24,7 +24,22 @@ mypy app/
 # Run tests
 pytest                                    # all tests with coverage
 pytest tests/test_config.py -v            # single test file
+
+# Query a symbol's daily fund flow (via Miaoxiang / 妙想)
+py .claude/skills/fund-flow/query_fund_flow.py <代码> [名称]
+
+# Analyze a single stock (fundamental + K-line + fund flow + news data package)
+py .claude/skills/stock-analysis/analyze_stock.py <代码> [名称] [天数]
+
+# Analyze an ETF for grid trading (box range + volatility + grid params)
+py .claude/skills/etf-grid/analyze_etf_grid.py <代码> [名称] [天数]
 ```
+
+## Skills
+
+- **`fund-flow`** — 查询单标的当日主力资金流入（主力/超大单/大单/中单/小单净流入，妙想 Miaoxiang）。用户问「某股票/ETF 今日资金流入」时使用，也可 `/fund-flow <代码>` 调用。需 `.env` 配置 `MX_APIKEY`。详见 `.claude/skills/fund-flow/SKILL.md`。
+- **`stock-analysis`** — 个股诊股：用妙想拉取个股基本信息、近N日K线、近5日资金流、近7日资讯，算技术位（MA/高低点），再由 AI 生成走势预测与买卖参考。用户问「分析/诊断某只股票」「预测走势」「值不值得买」「给个买入价」时使用。详见 `.claude/skills/stock-analysis/SKILL.md`。
+- **`etf-grid`** — ETF 网格交易分析：拉取 ETF 实时行情 + 日K线，诊断是否箱体震荡、是否适合自动网格，并给出网格区间/间距/格数/底仓/止损。用户问「某 ETF 值不值得买」「能不能网格」「网格怎么设」「是否箱体震荡」时使用。详见 `.claude/skills/etf-grid/SKILL.md`。
 
 ## Configuration
 
