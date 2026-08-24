@@ -33,6 +33,12 @@ py .claude/skills/stock-analysis/analyze_stock.py <代码> [名称] [天数]
 
 # Analyze an ETF for grid trading (box range + volatility + grid params)
 py .claude/skills/etf-grid/analyze_etf_grid.py <代码> [名称] [天数]
+
+# Query sector fund-flow ranking (行业/概念/地域板块资金流，今日/5日/10日)
+py .claude/skills/sector-flow/query_sector_flow.py [周期] [板块类型]
+
+# Intraday decision (盘中决策：仓位 + 做T挂单)
+py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]
 ```
 
 ## Skills
@@ -40,6 +46,8 @@ py .claude/skills/etf-grid/analyze_etf_grid.py <代码> [名称] [天数]
 - **`fund-flow`** — 查询单标的当日主力资金流入（主力/超大单/大单/中单/小单净流入，妙想 Miaoxiang）。用户问「某股票/ETF 今日资金流入」时使用，也可 `/fund-flow <代码>` 调用。需 `.env` 配置 `MX_APIKEY`。详见 `.claude/skills/fund-flow/SKILL.md`。
 - **`stock-analysis`** — 个股诊股：用妙想拉取个股基本信息、近N日K线、近5日资金流、近7日资讯，算技术位（MA/高低点），再由 AI 生成走势预测与买卖参考。用户问「分析/诊断某只股票」「预测走势」「值不值得买」「给个买入价」时使用。详见 `.claude/skills/stock-analysis/SKILL.md`。
 - **`etf-grid`** — ETF 网格交易分析：拉取 ETF 实时行情 + 日K线，诊断是否箱体震荡、是否适合自动网格，并给出网格区间/间距/格数/底仓/止损。用户问「某 ETF 值不值得买」「能不能网格」「网格怎么设」「是否箱体震荡」时使用。详见 `.claude/skills/etf-grid/SKILL.md`。
+- **`sector-flow`** — 查询 A 股行业/概念/地域板块资金流排名（今日/5日/10日主力净流入，东方财富数据中心直连，无需妙想/`.env`）。用户问「各行业板块资金流向」「哪些板块主力流入最多」「板块资金排名」时使用。详见 `.claude/skills/sector-flow/SKILL.md`。
+- **`intraday-signal`** — 盘中决策：输入单个标的（个股/ETF），拉实时快照 + 当日资金流 + 近N日K线趋势 + 近5日资金流 + 5分钟K线支撑压力，再由 AI 判断今天建仓/加仓/减仓/清仓/不动，以及是否适合做T、买卖挂单价。用户问「今天该买还是卖」「要不要加仓/减仓」「能不能做T」「做T挂多少钱」时使用。核心功能不依赖 `MX_APIKEY`。详见 `.claude/skills/intraday-signal/SKILL.md`。
 
 ## Configuration
 

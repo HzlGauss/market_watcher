@@ -233,13 +233,14 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
             code = items[i].code
 
             # 换手率在 fields[38]，量比在 fields[49]
-            # 外盘（主动买入）在 fields[6]，内盘（主动卖出）在 fields[7]
-            # 委比在 fields[33]（百分比形式）
+            # 外盘（主动买入）在 fields[7]，内盘（主动卖出）在 fields[8]
+            # （fields[6] 是成交量，外盘+内盘=成交量，已交叉验证）
+            # 委比在 fields[74]（百分比，五档盘口委买-委卖占比）
             turnover = _parse_float(fields[38]) if len(fields) > 38 else None
             volume_ratio = _parse_float(fields[49]) if len(fields) > 49 else None
-            bid_volume = _parse_float(fields[6]) if len(fields) > 6 else None
-            ask_volume = _parse_float(fields[7]) if len(fields) > 7 else None
-            bid_ask_ratio = _parse_float(fields[33]) if len(fields) > 33 and fields[33] else None
+            bid_volume = _parse_float(fields[7]) if len(fields) > 7 else None
+            ask_volume = _parse_float(fields[8]) if len(fields) > 8 else None
+            bid_ask_ratio = _parse_float(fields[74]) if len(fields) > 74 and fields[74] else None
 
             result[code] = {
                 "volume_ratio": volume_ratio,
@@ -1627,7 +1628,6 @@ def fetch_sector_fund_flow_rank(
     fid0, stat, change_key, net_key, pct_key, top_key = _SECTOR_FLOW_KEYS[indicator]
     fields = _SECTOR_FLOW_FIELDS[indicator]
 
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
         "pn": "1",
         "pz": "100",
@@ -1644,30 +1644,38 @@ def fetch_sector_fund_flow_rank(
     }
 
     all_items: list[dict] = []
-    try:
-        resp = eastmoney_client.get(url, params=params, timeout=15)
-        if resp is None:
-            return []
-        data = resp.json().get("data") or {}
-        total = int(data.get("total") or 0)
-        diff = data.get("diff") or []
-        if isinstance(diff, dict):
-            diff = list(diff.values())
-        all_items.extend(diff)
-
-        for page in range(2, (total + 99) // 100 + 1):
-            params["pn"] = str(page)
-            resp = eastmoney_client.get(url, params=params, timeout=15)
+    # 实时子域 push2 易被反爬断连(RemoteDisconnected)，优先 push2delay、失败回退 push2
+    for host in _EM_CLIST_HOSTS:
+        all_items = []
+        try:
+            resp = eastmoney_client.get(host, params=params, timeout=15)
             if resp is None:
-                break
+                continue
             data = resp.json().get("data") or {}
+            total = int(data.get("total") or 0)
             diff = data.get("diff") or []
             if isinstance(diff, dict):
                 diff = list(diff.values())
             all_items.extend(diff)
-    except Exception as e:
-        # 东财 push2 易触发 RemoteDisconnected/限频，安静失败即可，避免重试风暴
-        log.warning(f"东财板块资金流不可达，跳过（回退 LLM 热点判断）: {type(e).__name__}")
+
+            for page in range(2, (total + 99) // 100 + 1):
+                params["pn"] = str(page)
+                resp = eastmoney_client.get(host, params=params, timeout=15)
+                if resp is None:
+                    break
+                data = resp.json().get("data") or {}
+                diff = data.get("diff") or []
+                if isinstance(diff, dict):
+                    diff = list(diff.values())
+                all_items.extend(diff)
+        except Exception as e:
+            log.warning(f"东财板块资金流不可达（{host}）: {type(e).__name__}")
+            continue
+        if all_items:
+            break
+
+    if not all_items:
+        log.warning("东财板块资金流不可达（push2delay/push2 均失败），返回空")
         return []
 
     flows: list[SectorFundFlow] = []
