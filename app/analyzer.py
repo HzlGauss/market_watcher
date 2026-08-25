@@ -512,6 +512,38 @@ def detect_split_order(ff, amount: float, change_pct: Optional[float]) -> Option
     return None
 
 
+def _detect_flow_anomaly(
+    inflow_pct: float,
+    history: Optional[list[float]],
+    window: int,
+    z_threshold: float,
+    min_days: int,
+) -> Optional[str]:
+    """纵向资金异动：今日主力净流入占成交额%是否异于该标的自身近 N 日常态。
+
+    用 z-score（(今日 - 均值) / 标准差）比较，只依赖标的自身历史，天然适配盘子大小。
+    冷启动（历史不足 min_days）返回 None，由调用方回退到方案 A 的占比阈值。
+    """
+    if not history or inflow_pct is None:
+        return None
+    recent = history[-window:]
+    if len(recent) < min_days:
+        return None
+    mean = sum(recent) / len(recent)
+    var = sum((x - mean) ** 2 for x in recent) / len(recent)
+    std = var ** 0.5
+    if std < 1e-6:
+        return None  # 历史几乎无波动，无法判断偏离
+    z = (inflow_pct - mean) / std
+    if z >= z_threshold:
+        return (f"📊 资金异动(纵向)：今日主力净流入占成交额{inflow_pct:+.1f}%，"
+                f"显著高于自身近{len(recent)}日均值{mean:+.1f}%(z={z:.1f})")
+    if z <= -z_threshold:
+        return (f"📊 资金异动(纵向)：今日主力净流入占成交额{inflow_pct:+.1f}%，"
+                f"显著低于自身近{len(recent)}日均值{mean:+.1f}%(z={z:.1f})")
+    return None
+
+
 def analyze(
     quotes: list[Quote],
     prev_state: dict,
@@ -519,6 +551,7 @@ def analyze(
     tech_summaries: dict[str, TechnicalSummary] | None = None,
     north_data: Optional["NorthFlowData"] = None,
     market_breadth: Optional["MarketBreadth"] = None,
+    flow_history: Optional[dict[str, list[float]]] = None,
 ) -> tuple[list[Alert], AnalysisStats]:
     """执行全部分析，返回异动列表和统计结果"""
     base = config.thresholds
@@ -655,7 +688,6 @@ def analyze(
             # 获取历史流强（从 prev_state 读取上轮数据做趋势对比）
             prev_flow = prev_state.get(q.code, {}).get("main_net_inflow") if isinstance(prev_state.get(q.code, {}), dict) else None
             prev_flow_pct = prev_state.get(q.code, {}).get("flow_pct") if isinstance(prev_state.get(q.code, {}), dict) else None
-            prev_total_net = prev_state.get(q.code, {}).get("total_net") if isinstance(prev_state.get(q.code, {}), dict) else None
             flow_trend = ""  # 趋势标注
             flow_intensity = ""  # 强度标注
             if prev_flow_pct is not None and prev_flow is not None:
@@ -686,22 +718,17 @@ def analyze(
                     elif intensity_ratio >= 1.5:
                         flow_intensity = "[偏强]"
 
-            # ---- 资金流转向提醒（主力 / 总体，跨周期符号反转） ----
-            # 过滤微小波动导致的假转向：当前净额需达到阈值以上才算有效转向
-            reversal_min = config.flow_reversal_min
+            # ---- 资金流转向提醒（主力，跨扫描符号反转） ----
+            # 口径改为「占成交额%」相对阈值：绝对净额(0.1亿)对小盘/大盘标的不公平，
+            # 小盘股一笔 0.1 亿就是巨量、大盘股却无感，故用占比过滤假转向。
+            # 总资金转向已废弃：主力(超大+大)与散户(小单)天然反向，总资金≈0 是噪音。
+            reversal_pct = config.flow_reversal_pct
             if prev_flow is not None and inflow is not None:
-                if inflow > 0 and prev_flow < 0 and abs(inflow) >= reversal_min:
-                    priority_items.append("🔄 主力资金由流出转流入")
+                if inflow > 0 and prev_flow < 0 and inflow_pct >= reversal_pct:
+                    priority_items.append(f"🔄 主力资金由流出转流入(净{inflow/1e8:.2f}亿,占{inflow_pct:.1f}%)")
                     alert_count += 1
-                elif inflow < 0 and prev_flow > 0 and abs(inflow) >= reversal_min:
-                    priority_items.append("🔄 主力资金由流入转流出")
-                    alert_count += 1
-            if prev_total_net is not None and total_net is not None:
-                if total_net > 0 and prev_total_net < 0 and abs(total_net) >= reversal_min:
-                    priority_items.append("🔄 总资金由流出转流入")
-                    alert_count += 1
-                elif total_net < 0 and prev_total_net > 0 and abs(total_net) >= reversal_min:
-                    priority_items.append("🔄 总资金由流入转流出")
+                elif inflow < 0 and prev_flow > 0 and abs(inflow_pct) >= reversal_pct:
+                    priority_items.append(f"🔄 主力资金由流入转流出(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.1f}%)")
                     alert_count += 1
 
             # 主力大幅买入
@@ -740,28 +767,37 @@ def analyze(
                     items.append(f"🔴 主力卖出{context}{trend_str}(净{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
                 alert_count += 1
 
-            # 量价背离：价升但资金流出 / 价跌但资金流入（主力或总体口径）
+            # 量价背离：价升但资金流出 / 价跌但资金流入（仅主力口径，占成交额%）
             # 回测结论：价升+资金流出若仅要求「任意净流出」会频繁「喊跌却涨」
             # （日线回测 5 日反向 +1.67%、5 日胜率仅 41.7%），属普通获利了结而非顶部派发。
-            # 故此处收紧：净流出需达到显著幅度（主力占比达标 或 总资金净流出≥转向阈值）才算有效。
+            # 故收紧：主力净流出/净流入占比需达标才算有效。
+            # 总资金口径已废弃：主力与散户反向，总资金≈0 会造出「价跌资金流入+0.00亿」假信号。
             diverge_price = config.flow_diverge_pct
             main_outflow = inflow < 0 and abs(inflow_pct) >= sell_threshold  # 主力净流出占比达标
-            total_outflow = total_net is not None and total_net < 0 and abs(total_net) >= reversal_min  # 总资金净流出达阈值
-            if cp is not None and cp > diverge_price and (main_outflow or total_outflow):
-                if ff and ff.super_large_net is not None and ff.super_large_net < 0 and abs(ff.super_large_net) >= reversal_min:
+            main_inflow = inflow > 0 and inflow_pct >= diverge_threshold  # 主力净流入占比达标
+            if cp is not None and cp > diverge_price and main_outflow:
+                if ff and ff.super_large_net is not None and ff.super_large_net < 0:
                     priority_items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但超大单净流出{abs(ff.super_large_net)/1e8:.2f}亿)")
-                elif total_outflow:
-                    priority_items.append(f"⚠️ 价升资金流出(涨{cp:+.1f}%但总资金净流出{abs(total_net)/1e8:.2f}亿)")
                 else:
-                    priority_items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿)")
+                    priority_items.append(f"⚠️ 拉升出货(涨{cp:+.1f}%但主力净流出{inflow/1e8:.2f}亿,占{abs(inflow_pct):.0f}%)")
                 alert_count += 1
-            elif cp is not None and cp < -diverge_price and ((inflow > 0 and inflow_pct >= diverge_threshold) or (total_net is not None and total_net > 0)):
+            elif cp is not None and cp < -diverge_price and main_inflow:
                 if ff and ff.is_institution_driven:
                     priority_items.append(f"💎 打压吸筹(跌{cp:+.1f}%但超大单流入+{ff.super_large_net/1e8:.2f}亿)")
-                elif total_net is not None and total_net > 0:
-                    priority_items.append(f"💎 价跌资金流入(跌{cp:+.1f}%但总资金净流入{total_net/1e8:+.2f}亿)")
                 else:
-                    priority_items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿)")
+                    priority_items.append(f"💎 打压吸筹(跌{cp:+.1f}%但主力净流入{inflow/1e8:.2f}亿,占{inflow_pct:.0f}%)")
+                alert_count += 1
+
+            # 纵向异动：今日主力净流入强度是否异于自身近N日常态（方案B，z-score）
+            hist = flow_history.get(q.code) if flow_history else None
+            longitudinal_signal = _detect_flow_anomaly(
+                inflow_pct, hist,
+                window=config.flow_longitudinal_window,
+                z_threshold=config.flow_longitudinal_z,
+                min_days=config.flow_longitudinal_min_days,
+            )
+            if longitudinal_signal:
+                items.append(longitudinal_signal)
                 alert_count += 1
 
             # 散户主导上涨（追高风险）
@@ -1155,3 +1191,78 @@ def _save_scan_history(scan_history: list["ScanRecord"]) -> None:
     except Exception as e:
         from app.utils import log
         log.warning(f"保存扫描历史失败: {e}")
+
+
+# ============================================================
+# 资金流纵向历史持久化（方案B：每标的每日主力净流入占成交额%）
+# ============================================================
+
+# 每个标的最多保留的交易日数
+MAX_FLOW_HISTORY_DAYS = 60
+
+
+def _load_flow_history(today: str) -> dict[str, list[float]]:
+    """加载每标的每日「主力净流入占成交额%」历史，返回 code -> 按日期升序的占比列表。
+
+    Args:
+        today: 今日日期字符串（YYYY-MM-DD），加载时排除今日，避免盘中本日数值污染基线。
+    """
+    import json
+    from pathlib import Path
+
+    state_dir = Path(__file__).resolve().parent.parent / "state"
+    history_file = state_dir / "fund_flow_history.json"
+    if not history_file.exists():
+        return {}
+
+    try:
+        with open(history_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        result: dict[str, list[float]] = {}
+        for code, days in data.items():
+            if not isinstance(days, dict):
+                continue
+            vals = [float(days[d]) for d in sorted(days)
+                    if d != today and isinstance(days[d], (int, float))]
+            if vals:
+                result[code] = vals
+        return result
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"加载资金流历史失败: {e}")
+        return {}
+
+
+def _update_flow_history(today: str, today_flow_pcts: dict[str, float]) -> None:
+    """把今日各标的的主力净流入占成交额%写入历史（按日期去重，当日覆盖），滚动保留近N日。
+
+    Args:
+        today: 今日日期字符串（YYYY-MM-DD）。
+        today_flow_pcts: code -> 今日主力净流入占成交额%（盘中随扫描更新）。
+    """
+    import json
+    from pathlib import Path
+
+    state_dir = Path(__file__).resolve().parent.parent / "state"
+    history_file = state_dir / "fund_flow_history.json"
+
+    try:
+        data: dict[str, dict[str, float]] = {}
+        if history_file.exists():
+            with open(history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        for code, pct in today_flow_pcts.items():
+            if pct is None:
+                continue
+            days = data.setdefault(code, {})
+            days[today] = round(float(pct), 2)
+            # 只保留最近 N 个交易日，防止文件无限增长
+            if len(days) > MAX_FLOW_HISTORY_DAYS:
+                keep = sorted(days)[-MAX_FLOW_HISTORY_DAYS:]
+                data[code] = {d: days[d] for d in keep}
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with open(history_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        from app.utils import log
+        log.warning(f"保存资金流历史失败: {e}")

@@ -55,6 +55,10 @@ class Config:
     DEFAULT_SCREENING_SUB_NEW_DAYS = 60
     DEFAULT_FLOW_REVERSAL_MIN = 1e7  # 资金流转向最小净额（元），默认 1000 万
     DEFAULT_FLOW_DIVERGE_PCT = 2.0   # 资金背离价格阈值（%）
+    DEFAULT_FLOW_REVERSAL_PCT = 2.0  # 资金流转向最小占比（%），主力净流入占成交额低于此值不计转向
+    DEFAULT_FLOW_LONG_WINDOW = 20    # 纵向异动历史窗口（交易日数）
+    DEFAULT_FLOW_LONG_Z = 2.0        # 纵向异动 z-score 阈值（偏离自身均值多少个标准差）
+    DEFAULT_FLOW_LONG_MIN_DAYS = 5   # 纵向异动最少历史天数（冷启动保护）
 
     def __init__(self, config_path: Path) -> None:
         """
@@ -282,11 +286,43 @@ class Config:
 
     @property
     def flow_diverge_pct(self) -> float:
-        """资金背离价格阈值（%），涨跌幅超过此幅度才检查主力/总资金背离"""
+        """资金背离价格阈值（%），涨跌幅超过此幅度才检查主力资金背离"""
         value = self._raw.get("提醒阈值", {}).get(
             "资金背离价格阈值", self.DEFAULT_FLOW_DIVERGE_PCT
         )
         return max(0.0, safe_float(value, self.DEFAULT_FLOW_DIVERGE_PCT))
+
+    @property
+    def flow_reversal_pct(self) -> float:
+        """资金流转向最小占比（%），主力净流入占成交额低于此值不计转向"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金流转向最小占比", self.DEFAULT_FLOW_REVERSAL_PCT
+        )
+        return max(0.0, safe_float(value, self.DEFAULT_FLOW_REVERSAL_PCT))
+
+    @property
+    def flow_longitudinal_window(self) -> int:
+        """纵向异动历史窗口（交易日数），用于计算自身常态基线"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金纵向窗口", self.DEFAULT_FLOW_LONG_WINDOW
+        )
+        return max(1, int(safe_float(value, self.DEFAULT_FLOW_LONG_WINDOW)))
+
+    @property
+    def flow_longitudinal_z(self) -> float:
+        """纵向异动 z-score 阈值，今日占比偏离自身均值多少个标准差算异动"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金纵向Z阈值", self.DEFAULT_FLOW_LONG_Z
+        )
+        return max(0.0, safe_float(value, self.DEFAULT_FLOW_LONG_Z))
+
+    @property
+    def flow_longitudinal_min_days(self) -> int:
+        """纵向异动最少历史天数，历史不足则不触发（冷启动回退方案A占比阈值）"""
+        value = self._raw.get("提醒阈值", {}).get(
+            "资金纵向最少天数", self.DEFAULT_FLOW_LONG_MIN_DAYS
+        )
+        return max(1, int(safe_float(value, self.DEFAULT_FLOW_LONG_MIN_DAYS)))
 
     # ---- 标的列表 ----
 

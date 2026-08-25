@@ -17,7 +17,6 @@
 
 输出: 分 6 段——基本信息 / 技术位 / 箱体与波动率诊断 / 支撑阻力 / 市场状态 / 网格参数参考。
 """
-import re
 import sys
 from pathlib import Path
 
@@ -124,21 +123,24 @@ def main():
     except Exception:
         quote = None
 
-    if quote is None or quote.price is None:
-        # 实时行情失败时，用妙想兜底名称/价格（尽力而为）
-        price, live_name, change_pct, amplitude, amount = None, name, None, None, None
+    if quote is None:
+        # 实时行情完全失败时，用妙想兜底名称（尽力而为）。
+        # 注意：这里绝不抓价格——对自由文本做「首个数字」正则极不可靠
+        # （如把「中证500」的 500 当成现价），价格统一交给下方 K 线收盘价兜底。
+        price, change_pct, amplitude, amount = None, None, None, None
+        live_name = name
         try:
             from app.miaoxiang import MXClient
             api_keys = config.mx_apikeys
             if api_keys:
                 mx = MXClient(api_keys)
-                txt = mx.query_as_text(f"{code} {name} 最新价 涨跌幅 振幅 成交额".strip())
-                m = re.search(r"(-?\d+\.?\d*)", txt or "")
-                if m:
-                    price = float(m.group())
+                _nm = (mx.query_as_text(f"{code} {name} 证券简称".strip()) or "").strip()
+                live_name = _nm or name
         except Exception:
             pass
     else:
+        # quote 存在但 price 为 None（盘前集合竞价/停牌时新浪现价返回 0.000）：
+        # 名称照用新浪返回，价格保持 None 走 K 线收盘价兜底，避免拿错误价格算指标。
         live_name = quote.name or name
         price = quote.price
         change_pct = quote.change_pct

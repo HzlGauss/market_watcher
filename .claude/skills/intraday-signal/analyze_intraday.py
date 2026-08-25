@@ -43,7 +43,15 @@ from app.utils import load_env
 from app.models import WatchItem, Quote, FundFlowDetail, KlineData
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_quotes, fetch_fund_flow_detail
-from app.technical import fetch_historical_kline, calc_support_resistance, get_technical_summary, detect_market_regime
+from app.technical import (
+    fetch_historical_kline,
+    calc_support_resistance,
+    get_technical_summary,
+    detect_market_regime,
+    analyze_volume_price,
+    is_low_volume,
+    is_stagflation,
+)
 from app.t0_monitor import _compute_suggested_prices
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
@@ -183,7 +191,7 @@ def _print_fund_flow(code: str, market: str, ff: FundFlowDetail | None):
         print(f"  净占比: {'  '.join(pcts)}")
 
 
-def _print_daily_trend(code: str, market: str, days: int, q: Quote):
+def _print_daily_trend(code: str, market: str, days: int, q: Quote) -> list[KlineData] | None:
     print()
     print("=" * 72)
     print(f"【3. 近 {days} 日 K 线 + 趋势】")
@@ -191,7 +199,7 @@ def _print_daily_trend(code: str, market: str, days: int, q: Quote):
     klines = _fetch_daily_klines(code, market, days)
     if not klines:
         print("  ⚠️ 未查到日 K 线数据")
-        return
+        return None
     closes = [k.close for k in klines if k.close is not None]
     tech = get_technical_summary(q, klines)
     if closes:
@@ -212,6 +220,14 @@ def _print_daily_trend(code: str, market: str, days: int, q: Quote):
         print(f"  关键位: 支撑 {_f(sr.support)} / 压力 {_f(sr.resistance)}")
         regime = detect_market_regime(tech, closes[-1], sr.atr)
         print(f"  市场状态: {regime.regime}（置信度 {regime.confidence}）→ {regime.suggestion}")
+
+        # ---- 量能分析（量价关系 + OBV 能量潮 + 地量/滞涨）----
+        print(f"  量价关系: {analyze_volume_price(q, klines)}")
+        print(f"  OBV能量潮: {tech.obv_signal or '中性'}")
+        if is_low_volume(klines):
+            print("  ⚠️ 地量: 成交量创近20日新低（交投清淡，变盘前兆）")
+        if is_stagflation(q, klines):
+            print("  ⚠️ 滞涨: 涨幅小但明显放量（上方抛压/主力出货嫌疑）")
     print(f"  日期        开      高      低      收      涨跌幅")
     tail = klines[-min(10, len(klines)):]
     start_idx = len(klines) - len(tail)
@@ -220,6 +236,7 @@ def _print_daily_trend(code: str, market: str, days: int, q: Quote):
         pct = (k.close - prev) / prev * 100 if (prev and k.close is not None) else None
         print(f"    {k.date}  {_f(k.open)} {_f(k.high)} {_f(k.low)} {_f(k.close)} "
               f"{_f(pct, 2)}%")
+    return klines
 
 
 def _print_flow_trend(code: str, name: str, mx):
@@ -229,7 +246,7 @@ def _print_flow_trend(code: str, name: str, mx):
     print("=" * 72)
     if mx is None or not mx.available:
         print("  ⚠️ 未配置 MX_APIKEY，跳过近 5 日资金流趋势（当日资金流见【2】）")
-        return
+        return None
     window = max(5, int(5 * 1.5) + 3)
     q = (f"{code} {name} 近{window}日 资金流向 "
          f"主力净流入 超大单净流入 大单净流入 中单净流入 小单净流入").strip()
@@ -247,7 +264,7 @@ def _print_flow_trend(code: str, name: str, mx):
         rows = []
     if not rows:
         print("  ⚠️ 未查到近 5 日资金流数据")
-        return
+        return None
     rows.sort(key=lambda x: x[0], reverse=True)
     print("  日期          主力     超大单   大单     中单     小单")
     for d, r in rows[:5]:
@@ -256,6 +273,7 @@ def _print_flow_trend(code: str, name: str, mx):
         print(f"  {d}  " + "  ".join(cells))
     tot = sum((_parse_amount(r.get("主力净流入资金")) or 0) for _, r in rows[:5])
     print(f"  → 5 日主力累计净流入: {tot / 1e8:+.2f} 亿")
+    return tot
 
 
 def _print_t0_measure(code: str, market: str, q: Quote):
@@ -314,6 +332,137 @@ def _print_t0_measure(code: str, market: str, q: Quote):
     print(f"  做 T 建议买单: {_f(suggested['buy_price'], 3)}   卖单: {_f(suggested['sell_price'], 3)}")
 
 
+# ---------------------------------------------------------------- 抄底信号
+
+def _ema(values: list[float], n: int) -> list[float]:
+    """指数移动平均（首值用序列首值初始化），返回与输入等长的序列。"""
+    if not values:
+        return []
+    k = 2.0 / (n + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _macd_hist_series(closes: list[float]) -> list[float]:
+    """MACD 柱状图序列（(DIF - DEA) * 2），与 closes 对齐；数据不足返回 []。"""
+    if len(closes) < 26 + 9:
+        return []
+    dif = [a - b for a, b in zip(_ema(closes, 12), _ema(closes, 26))]
+    dea = _ema(dif, 9)
+    return [2.0 * (d - e) for d, e in zip(dif, dea)]
+
+
+def _detect_bottom_divergence(closes: list[float]) -> tuple[bool, str]:
+    """MACD 底背离：最近一段价格创出新低，但 MACD 柱底部抬升。
+
+    分段对比：后段最近 5 根 vs 前段（约前 25~5 根）。
+    """
+    if len(closes) < 30:
+        return False, "数据不足"
+    hist = _macd_hist_series(closes)
+    if len(hist) < 30:
+        return False, "数据不足"
+    price_new_low = min(closes[-5:]) < min(closes[-25:-5])
+    hist_risen = min(hist[-5:]) > min(hist[-25:-5])
+    if price_new_low and hist_risen:
+        return True, "价创新低但 MACD 柱未创新低（底背离）"
+    return False, "无底背离"
+
+
+def _detect_reversal_pattern(klines: list[KlineData]) -> tuple[bool, str]:
+    """止跌 K 线形态：长下影/锤子线，或看涨吞没。"""
+    if len(klines) < 2:
+        return False, "数据不足"
+    last, prev = klines[-1], klines[-2]
+    if None in (last.open, last.high, last.low, last.close):
+        return False, "数据不足"
+    o, h, l, c = last.open, last.high, last.low, last.close
+    rng = h - l
+    if rng <= 0:
+        return False, "无"
+    body = abs(c - o)
+    lower_shadow = min(o, c) - l
+    upper_shadow = h - max(o, c)
+    if lower_shadow >= 2 * body and lower_shadow >= 0.4 * rng and upper_shadow <= 0.3 * rng:
+        return True, f"长下影/锤子线（下影占区间 {lower_shadow / rng * 100:.0f}%）"
+    if None not in (prev.open, prev.close):
+        if (prev.close < prev.open and c > o
+                and o <= min(prev.open, prev.close) and c >= max(prev.open, prev.close)):
+            return True, "看涨吞没（阳线吞没前日阴线）"
+    return False, "无"
+
+
+def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
+                         ff: FundFlowDetail | None, flow_sum: float | None,
+                         klines: list[KlineData] | None):
+    print()
+    print("=" * 72)
+    print("【6. 抄底信号测算（超跌 + 背离 + 止跌确认）】")
+    print("=" * 72)
+    if not klines:
+        print("  ⚠️ 无日 K 线数据，无法测算抄底信号")
+        return
+    closes = [k.close for k in klines if k.close is not None]
+    if len(closes) < 20:
+        print("  ⚠️ 日 K 线不足 20 根，无法测算抄底信号")
+        return
+
+    tech = get_technical_summary(q, klines)
+    is_etf = code.startswith(("51", "56", "58", "15", "16", "18"))
+    deep_drop_threshold = -10.0 if is_etf else -15.0
+
+    pct20 = (closes[-1] - closes[-20]) / closes[-20] * 100
+    pct5 = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
+
+    # ---- 超跌类 ----
+    oversold = (tech.rsi is not None and tech.rsi < 30) or (tech.kdj_j is not None and tech.kdj_j < 0)
+    deep_drop = pct20 <= deep_drop_threshold
+
+    # ---- 确认类 ----
+    div, div_detail = _detect_bottom_divergence(closes)
+    pattern, pattern_detail = _detect_reversal_pattern(klines)
+    intraday_flow_div = (q.change_pct is not None and q.change_pct < 0
+                         and ff is not None and ff.is_valid
+                         and ff.main_net is not None and ff.main_net > 0)
+    flow_div = intraday_flow_div or (pct5 is not None and pct5 < 0
+                                     and flow_sum is not None and flow_sum > 0)
+    near_support = False
+    if tech.support and q.price:
+        if tech.atr and tech.atr > 0:
+            near_support = (q.price - tech.support) / tech.atr <= 1.5
+        else:
+            near_support = (q.price - tech.support) / tech.support <= 0.03
+
+    def _chk(v: bool) -> str:
+        return "✅" if v else "❌"
+
+    print(f"  近20日跌幅 {_f(pct20, 2)}%  近5日跌幅 {_f(pct5, 2)}%  现价 {_f(q.price, 3)}")
+    print(f"  超卖(RSI<30/KDJ J<0): {_chk(oversold)}  RSI {_f(tech.rsi, 0)}  KDJ J {_f(tech.kdj_j, 0)}")
+    print(f"  深度回撤(≤{deep_drop_threshold:.0f}%{'ETF' if is_etf else '个股'}): {_chk(deep_drop)}")
+    print(f"  底背离(MACD): {_chk(div)}  {div_detail}")
+    print(f"  止跌形态: {_chk(pattern)}  {pattern_detail}")
+    flow_txt = f"近5日主力 {flow_sum / 1e8:+.2f} 亿" if flow_sum is not None else "无数据"
+    print(f"  资金背离吸筹(价跌主力流入): {_chk(flow_div)}  {flow_txt}")
+    print(f"  靠近强支撑(支撑 {_f(tech.support, 3)}): {_chk(near_support)}")
+
+    # ---- 聚合判定（稳健优先）----
+    has_oversold = oversold or deep_drop
+    # 主动反转确认：底背离 / 止跌K线形态 / 资金背离吸筹
+    # （靠近强支撑仅作加分，不算独立确认——超跌本就近支撑，避免误判「还在跌」为「可抄底」）
+    confirm_count = sum(1 for v in (div, pattern, flow_div) if v)
+    if not has_oversold:
+        verdict = "❌ 无抄底信号（未超跌/跌得不够，仍在半山腰），不接飞刀"
+    elif confirm_count == 0:
+        verdict = "⚠️ 超跌但未企稳（无底背离/止跌形态/资金吸筹），左侧观望，等止跌信号"
+    else:
+        verdict = f"✅ 超跌 + {confirm_count} 项止跌确认，可尝试左侧轻仓抄底（设好止损）"
+        if near_support:
+            verdict += "，且靠近强支撑，胜率加分"
+    print(f"  → 判定: {verdict}")
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]")
@@ -341,7 +490,7 @@ def main():
     _print_fund_flow(code, market, ff)
 
     # ---- 近 N 日 K 线 + 趋势 ----
-    _print_daily_trend(code, market, days, q)
+    klines = _print_daily_trend(code, market, days, q)
 
     # ---- 近 5 日资金流趋势（妙想，可选）----
     mx = None
@@ -351,10 +500,13 @@ def main():
             mx = MXClient(config.mx_apikeys)
         except Exception:
             mx = None
-    _print_flow_trend(code, name, mx)
+    flow_sum = _print_flow_trend(code, name, mx)
 
     # ---- 做 T 测算（5 分钟 K 线）----
     _print_t0_measure(code, market, q)
+
+    # ---- 抄底信号测算（超跌 + 背离 + 止跌确认）----
+    _print_bottom_signal(code, market, days, q, ff, flow_sum, klines)
 
     return 0
 

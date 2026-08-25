@@ -120,7 +120,7 @@ class DataFetcherThread(threading.Thread):
 
         for item in self._watch_items:
             try:
-                klines_data = fetch_historical_kline(item.code, item.market, days=60, scale=60)
+                klines_data = fetch_historical_kline(item.code, item.market, days=60, scale=240)
                 if klines_data:
                     klines[item.code] = [
                     KLine(

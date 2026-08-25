@@ -30,6 +30,7 @@ from app.models import WatchItem
 BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 STATE_PATH = STATE_DIR / "market_state.json"
+FLOW_HISTORY_PATH = STATE_DIR / "fund_flow_history.json"
 BRIEF_DIR = BASE_DIR / "monitoring_briefs"
 
 CONFIG_PATH = BASE_DIR / "watchlist_config.json"
@@ -582,7 +583,10 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                   call_llm: bool = False, scan_count: int = 0) -> None:
     """Run one scan cycle using shared data pool"""
     global _last_llm_call_time
-    from app.analyzer import analyze, _load_scan_history, _save_scan_history
+    from app.analyzer import (
+        analyze, _load_scan_history, _save_scan_history,
+        _load_flow_history, _update_flow_history,
+    )
     from app.ai_analyzer import analyze as analyze_with_llm
     from app.notifier import push_alert, send_desktop_notification
     from app.presenter import (
@@ -838,7 +842,13 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             for code, info in deviating[:5]:
                 q = next((x for x in quotes if x.code == code), None)
                 if q:
-                    emoji = "🔥" if info.get("relative_strength", 0) > 0 else "❄️"
+                    rs = info.get("relative_strength")
+                    if rs is None:
+                        emoji = "•"  # 无板块基准，中性
+                    elif rs > 0:
+                        emoji = "🔥"
+                    else:
+                        emoji = "❄️"
                     print(f"  {emoji} {q.name}({q.code}): {info['label']} [{info.get('sector', '')}]")
         print()
     elif mx_sector_fallback:
@@ -854,9 +864,12 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     # Analyze market (all quotes including watchlist for full coverage)
     north_data = north_fetcher.fetch()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    flow_history = _load_flow_history(today_str)  # 纵向异动基线（排除今日，避免盘中污染）
     alerts, stats = analyze(quotes, prev_state, config, tech_summaries,
                             north_data=north_data,
-                            market_breadth=breadth)
+                            market_breadth=breadth,
+                            flow_history=flow_history)
 
     # 落盘北向资金轨迹（仅当有有效日期，即API成功返回）
     if north_data is not None and getattr(north_data, "date", ""):
@@ -992,6 +1005,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # 保存当前成交量和资金流状态，供下一轮对比（趋势检测用）
     try:
         cur_state = {}
+        today_flow_pcts: dict[str, float] = {}
         for q in quotes:
             if q.volume is not None:
                 entry: dict = {"volume": q.volume}
@@ -999,8 +1013,11 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
                         entry["flow_pct"] = round(q.main_net_inflow / q.amount * 100, 2)
+                        today_flow_pcts[q.code] = entry["flow_pct"]
                 cur_state[q.code] = entry
         STATE_PATH.write_text(json.dumps(cur_state, ensure_ascii=False), encoding="utf-8")
+        # 落盘今日主力净流入占成交额%（供次日及以后纵向异动基线使用）
+        _update_flow_history(today_str, today_flow_pcts)
     except Exception:
         pass
 

@@ -177,6 +177,16 @@ def main():
             print(f"  中单净流入:     {_fmt_amount(detail.medium_net)}")
             print(f"  小单净流入:     {_fmt_amount(detail.small_net)}")
             return 0
+        # 回退 2：东方财富实时通道（妙想结构化 + 单日接口均无数据时的兜底）
+        em_row = _today_row_from_eastmoney(code)
+        if em_row is not None:
+            d, r = em_row
+            print(f"{code} {name} 主力资金流向 · 今日/最近1个交易日（东方财富兜底，单位：亿元，+净流入 / -净流出）".replace("  ", " ").strip())
+            print("  日期          主力     超大单   大单     中单     小单")
+            tag = " (今日·实时)" if d == date.today().strftime("%Y-%m-%d") else ""
+            cells = [_fmt_amount(_parse_amount(r.get(key))) for _, key in _TIERS]
+            print(f"  {d}{tag:<9}  " + "  ".join(cells))
+            return 0
         print("⚠️ 未查到资金流向数据（非交易时间 / 无数据 / 代码无效）\n")
         print(mx.query_as_text(query) or "❌ 无返回")
         return 0

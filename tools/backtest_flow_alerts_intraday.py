@@ -1,12 +1,15 @@
-"""盘中分钟级回测：主力/总资金「转向」提醒（3 分钟扫描口径）
+"""盘中分钟级回测：主力「转向」提醒（3 分钟扫描口径）
 
-信号口径对齐 app/analyzer.py 的 analyze()（第 689~705 行）：
+信号口径对齐 app/analyzer.py 的 analyze()（2026-08 起改为「占成交额%」相对口径）：
   - 主力由流入转流出 / 由流出转流入：累计主力净流入(超大+大)在两个相邻扫描(3 分钟)间符号反转
-  - 总资金由流入转流出 / 由流出转流入：累计总资金(超大+大+中+小)同理
-  - 仅当当前净额绝对值 ≥ flow_reversal_min（默认 1000 万）才算有效转向，过滤微小波动
+  - 生产口径：|主力净流入占成交额%| ≥ flow_reversal_pct 才算有效转向（相对口径，适配盘子）
+
+⚠️ 口径偏差（本脚本仍用绝对净额 flow_reversal_min）：
+  东财分钟资金流 fflow/kline klt=1 只返回各档净额，不含「成交额」，无法算占成交额%；
+  故本脚本沿用旧的绝对净额阈值（≥ flow_reversal_min）。已废弃的「总资金转向」一并移除。
 
 数据源：
-  - 分钟级累计资金流：东方财富 fflow/kline/get?klt=1（f52=主力累计；f56+f55+f54+f53=总资金累计）
+  - 分钟级累计资金流：东方财富 fflow/kline/get?klt=1（f52=主力累计）
   - 分钟级价格：新浪 CN_MarketData.getKLineData?scale=5（用于计算信号后收益）
 
 ⚠️ 已知限制（重要）：
@@ -129,10 +132,9 @@ def fetch_minute_prices(code: str, market: str, scale: int = 5) -> dict[str, flo
 
 
 def detect_reversals(flow: list[dict], reversal_min: float, scan_min: int = 3) -> list[dict]:
-    """按 3 分钟扫描间隔检测累计资金流符号反转
+    """按 3 分钟扫描间隔检测主力资金流符号反转（总资金转向已废弃）
 
-    返回 [{idx, kind, side}]
-      kind: 'main' | 'total'
+    返回 [{idx, side}]
       side: 'in'（由流出转流入，看多）| 'out'（由流入转流出，看空）
     """
     # 按 scan_min 抽样（生产环境每 scan_min 分钟扫一次，与上一档对比）
@@ -141,14 +143,13 @@ def detect_reversals(flow: list[dict], reversal_min: float, scan_min: int = 3) -
     idxs = list(range(0, len(flow), step))
     for j in range(1, len(idxs)):
         prev, cur = flow[idxs[j - 1]], flow[idxs[j]]
-        for kind in ("main", "total"):
-            pv, cv = prev[kind], cur[kind]
-            if pv is None or cv is None:
-                continue
-            if cv > 0 and pv < 0 and abs(cv) >= reversal_min:
-                signals.append({"idx": idxs[j], "kind": kind, "side": "in"})
-            elif cv < 0 and pv > 0 and abs(cv) >= reversal_min:
-                signals.append({"idx": idxs[j], "kind": kind, "side": "out"})
+        pv, cv = prev["main"], cur["main"]
+        if pv is None or cv is None:
+            continue
+        if cv > 0 and pv < 0 and abs(cv) >= reversal_min:
+            signals.append({"idx": idxs[j], "side": "in"})
+        elif cv < 0 and pv > 0 and abs(cv) >= reversal_min:
+            signals.append({"idx": idxs[j], "side": "out"})
     return signals
 
 
@@ -160,7 +161,7 @@ def main() -> None:
     config = Config(ROOT / "watchlist_config.json")
     reversal_min = config.flow_reversal_min
     scan_min = config.scan_interval
-    print(f"当前设置: 转向最小净额={reversal_min/1e4:.0f}万, 扫描间隔={scan_min}分钟")
+    print(f"当前设置: 转向最小净额={reversal_min/1e4:.0f}万(旧绝对口径, 分钟数据缺成交额), 扫描间隔={scan_min}分钟")
     print("数据源: 东财分钟资金流(当日) + 新浪5分钟价格\n")
 
     agg = {}  # signal_name -> {side, count, fwd: {15:[],30:[],60:[]}}
@@ -174,7 +175,7 @@ def main() -> None:
         # 信号后收益：用分钟价格序列近似（flow 的 time 是 HH:MM，与 prices 对齐）
         sigs = detect_reversals(flow, reversal_min, scan_min)
         for s in sigs:
-            label = f"{'主力' if s['kind']=='main' else '总资金'}{'由流出转流入' if s['side']=='in' else '由流入转流出'}"
+            label = f"主力{'由流出转流入' if s['side']=='in' else '由流入转流出'}"
             key = (label, s["side"])
             if key not in agg:
                 agg[key] = {"count": 0, "fwd": {15: [], 30: [], 60: []}}

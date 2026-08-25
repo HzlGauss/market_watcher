@@ -1,10 +1,11 @@
-"""回测资金流提醒信号：主力/总资金转向 + 价量背离，在近期日线数据上的表现
+"""回测资金流提醒信号：主力转向 + 价量背离，在近期日线数据上的表现
 
-信号口径对齐 app/analyzer.py 的 analyze()：
-  1. 主力资金由流入转流出 / 由流出转流入（跨日符号反转，净额 ≥ flow_reversal_min）
-  2. 总资金由流入转流出 / 由流出转流入（total_net = 超大+大+中+小）
-  3. 价升资金流出（涨幅 > flow_diverge_pct 且 主力或总资金净流出）
-  4. 价跌资金流入（跌幅 > flow_diverge_pct 且 主力净流入达标 或 总资金净流入）
+信号口径对齐 app/analyzer.py 的 analyze()（2026-08 起改为「占成交额%」相对口径）：
+  1. 主力资金由流入转流出 / 由流出转流入（跨日符号反转，|主力占成交额%| ≥ flow_reversal_pct）
+  2. 价升资金流出（涨幅 > flow_diverge_pct 且 主力净流出占比 ≥ 卖出阈值）
+  3. 价跌资金流入（跌幅 > flow_diverge_pct 且 主力净流入占比 ≥ 背离阈值）
+
+已废弃口径（总资金转向/总资金背离）：主力(超大+大)与散户(小单)天然反向，总资金≈0 是噪音。
 
 数据源：新浪 MoneyFlow.ssl_qsfx_lscjfb（东方财富 fflow 历史接口当日被限频，
 新浪提供 超大/大/中/小单 完整分类，且自带收盘价与涨跌幅，无需二次取价）。
@@ -57,6 +58,7 @@ SYMBOLS = [
 ]
 
 DIVERGE_THRESHOLD = {"stock": 5, "etf": 4, "index": 3}  # 价跌+主力流入的净占比阈值，对齐 analyze()
+SELL_THRESHOLD = {"stock": 10, "etf": 7, "index": 5}  # 价升+主力流出的净占比阈值，对齐 analyze()
 
 
 def _pf(v):
@@ -90,9 +92,9 @@ def fetch_flow(code: str, market: str, days: int = 100) -> list[dict]:
 
 def main() -> None:
     config = Config(ROOT / "watchlist_config.json")
-    reversal_min = config.flow_reversal_min
+    reversal_pct = config.flow_reversal_pct
     diverge_price = config.flow_diverge_pct
-    print(f"当前设置: 资金流转向最小净额={reversal_min/1e4:.0f}万, 资金背离价格阈值={diverge_price:.1f}%")
+    print(f"当前设置: 资金流转向最小占比={reversal_pct:.1f}%, 资金背离价格阈值={diverge_price:.1f}%")
     print(f"数据源: 新浪 MoneyFlow 历史成交分布（超大/大/中/小单）\n")
 
     # 信号聚合: name -> {bull, count, fwd: {1:[],3:[],5:[]}}
@@ -140,38 +142,32 @@ def main() -> None:
             })
 
         div_thr = DIVERGE_THRESHOLD.get(typ, 5)
+        sell_thr = SELL_THRESHOLD.get(typ, 10)
         for i in range(1, len(days_list)):
             prev, cur = days_list[i - 1], days_list[i]
             # 基准（无筛选）
             for k, bucket in ((1, base1), (5, base5)):
                 if i + k < len(days_list) and cur["close"]:
                     bucket.append((days_list[i + k]["close"] - cur["close"]) / cur["close"] * 100)
-            # 主力转向
-            if prev["main"] is not None and cur["main"] is not None:
-                if cur["main"] > 0 and prev["main"] < 0 and abs(cur["main"]) >= reversal_min:
+            # 主力转向（相对口径：|主力占成交额%| ≥ reversal_pct）
+            if prev["main"] is not None and cur["main"] is not None and cur["main_pct"] is not None:
+                if cur["main"] > 0 and prev["main"] < 0 and cur["main_pct"] >= reversal_pct:
                     record("主力由流出转流入", True, i, days_list)
-                elif cur["main"] < 0 and prev["main"] > 0 and abs(cur["main"]) >= reversal_min:
+                elif cur["main"] < 0 and prev["main"] > 0 and abs(cur["main_pct"]) >= reversal_pct:
                     record("主力由流入转流出", False, i, days_list)
-            # 总资金转向
-            if prev["total"] is not None and cur["total"] is not None:
-                if cur["total"] > 0 and prev["total"] < 0 and abs(cur["total"]) >= reversal_min:
-                    record("总资金由流出转流入", True, i, days_list)
-                elif cur["total"] < 0 and prev["total"] > 0 and abs(cur["total"]) >= reversal_min:
-                    record("总资金由流入转流出", False, i, days_list)
-            # 价量背离
+            # 价量背离（仅主力口径，占成交额%）
             chg = cur["chg"]
             if chg is None:
                 continue
             if chg > diverge_price:
-                out = (cur["main"] is not None and cur["main"] < 0) or \
-                      (cur["total"] is not None and cur["total"] < 0)
+                out = (cur["main"] is not None and cur["main"] < 0
+                       and cur["main_pct"] is not None and abs(cur["main_pct"]) >= sell_thr)
                 if out:
                     record("价升资金流出", False, i, days_list)
             elif chg < -diverge_price:
                 main_in = (cur["main"] is not None and cur["main"] > 0
                            and cur["main_pct"] is not None and cur["main_pct"] >= div_thr)
-                total_in = (cur["total"] is not None and cur["total"] > 0)
-                if main_in or total_in:
+                if main_in:
                     record("价跌资金流入", True, i, days_list)
 
         time.sleep(0.3)
@@ -184,7 +180,6 @@ def main() -> None:
     print(f"{'信号':<14} {'方向':<4} {'次数':>4} {'1日均':>8} {'3日均':>8} {'5日均':>8} {'胜率(1日)':>10} {'胜率(5日)':>10}")
     print("-" * 92)
     order = ["主力由流入转流出", "主力由流出转流入",
-             "总资金由流入转流出", "总资金由流出转流入",
              "价升资金流出", "价跌资金流入"]
     for name in order:
         a = agg.get(name)
