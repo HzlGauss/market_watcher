@@ -8,7 +8,7 @@ import os
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
-from app.http_client import llm_client as http_client
+from app.http_client import HttpClient, DEFAULT_HEADERS
 from app.config import Config
 from app.utils import log
 
@@ -44,15 +44,22 @@ class LLMClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "deepseek-chat",
+        model: Optional[str] = None,
         base_url: Optional[str] = None,
         verify_ssl: bool = True,
     ):
         self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-        self._model = model
+        self._model = model or os.environ.get("LLM_MODEL", "deepseek-chat")
         self._base_url = base_url or os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
         self._verify_ssl = verify_ssl
         self._enabled = bool(self._api_key) and bool(self._base_url)
+        self._http = HttpClient(
+            base_url=self._base_url,
+            headers={**DEFAULT_HEADERS, "Content-Type": "application/json"},
+            timeout=30,
+            max_retries=2,
+            verify_ssl=self._verify_ssl,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -130,12 +137,11 @@ class LLMClient:
         }
 
         try:
-            resp = http_client.post(
+            resp = self._http.post(
                 "/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=timeout,
-                verify=self._verify_ssl,
             )
             if resp and resp.status_code == 200:
                 result = resp.json()
@@ -194,12 +200,11 @@ class LLMClient:
             payload["stop"] = stop
 
         try:
-            resp = http_client.post(
+            resp = self._http.post(
                 "/chat/completions",
                 json=payload,
                 headers=headers,
                 timeout=timeout,
-                verify=self._verify_ssl,
             )
             if resp and resp.status_code == 200:
                 result = resp.json()
@@ -237,7 +242,7 @@ def get_llm_client(config: Optional[Config] = None) -> LLMClient:
             verify_ssl = config.llm_verify_ssl
             api_key = config.llm_api_key
         else:
-            model = "deepseek-chat"
+            model = os.environ.get("LLM_MODEL", "deepseek-chat")
             base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
             verify_ssl = os.environ.get("LLM_VERIFY_SSL", "true").lower() != "false"
             api_key = None

@@ -366,8 +366,10 @@ class Config:
 
     @property
     def llm_model(self) -> str:
-        """大模型模型名称"""
-        return self._raw.get("大模型分析", {}).get("模型", self.DEFAULT_LLM_MODEL)
+        """大模型模型名称（JSON 模型 > 环境变量 LLM_MODEL > 默认）"""
+        return self._raw.get("大模型分析", {}).get(
+            "模型", os.environ.get("LLM_MODEL", self.DEFAULT_LLM_MODEL)
+        )
 
     @property
     def llm_base_url(self) -> str:
