@@ -577,7 +577,7 @@ def _push_report(title: str, content: str, config: Config) -> bool:
         return False
 
 
-def _call_llm(prompt: str, config: Config, role: str = "analyst", temperature: float = 0.3, max_tokens: int = 2000) -> str | None:
+def _call_llm(prompt: str, config: Config, role: str = "analyst", temperature: float = 0.3, max_tokens: int = 2000, timeout: int = 120) -> str | None:
     """Call LLM to generate analysis content
 
     Args:
@@ -586,6 +586,7 @@ def _call_llm(prompt: str, config: Config, role: str = "analyst", temperature: f
         role: System prompt role key (analyst/morning_brief/midday_review/evening_review)
         temperature: Temperature parameter (0.3 default, 0.4 for morning_brief)
         max_tokens: Max tokens for response
+        timeout: Request timeout in seconds
     """
     if not config.llm_enabled or not config.deepseek_key:
         return None
@@ -593,7 +594,7 @@ def _call_llm(prompt: str, config: Config, role: str = "analyst", temperature: f
     try:
         llm = get_llm_client(config)
         system_prompt = SYSTEM_PROMPTS.get(role, "")
-        response = llm.chat(prompt, system_prompt=system_prompt, max_tokens=max_tokens, temperature=temperature, timeout=120)
+        response = llm.chat(prompt, system_prompt=system_prompt, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
         return response
     except Exception as e:
         log.error(f"LLM call failed: {e}")
@@ -3776,7 +3777,7 @@ def generate_evening_review(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 4. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=4000)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="evening_review", temperature=0.3, max_tokens=8000, timeout=300)
     if not llm_content:
         log.warning("Evening review: LLM generation failed")
 
