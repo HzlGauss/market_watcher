@@ -274,6 +274,7 @@ def _get_holdings_tech_analysis(
         get_technical_summary,
         calc_composite_score,
         detect_market_regime,
+        detect_box_regime,
         MarketRegime,
         rsi_signal,
         detect_gap,
@@ -332,6 +333,9 @@ def _get_holdings_tech_analysis(
         obv = calc_obv(klines)
         ma = calc_ma_alignment(klines)
         bb = calc_bollinger(closes)
+
+        # 箱体震荡 + 网格适用性诊断（代码确定性判定）
+        box = detect_box_regime(klines, quote.price or 0)
 
         # 复合评分 + 市场状态（独立 try，不影响其他数据返回）
         try:
@@ -439,6 +443,17 @@ def _get_holdings_tech_analysis(
             "regime_suggestion": regime.suggestion,
             "crowd_score": crowd_score,
             "crowd_label": crowd_label,
+            # 箱体震荡 + 网格适用性（代码确定性判定）
+            "box_regime": box.regime,
+            "box_score": box.score,
+            "box_reasons": box.reasons or [],
+            "box_lower": box.lower,
+            "box_upper": box.upper,
+            "box_pos_pct": box.pos_pct,
+            "avg_amp": box.avg_amp,
+            "is_box": box.is_box,
+            "grid_verdict": box.grid_verdict,
+            "grid_verdict_reason": box.grid_verdict_reason,
         }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -452,6 +467,51 @@ def _get_holdings_tech_analysis(
                 log.warning(f"技术分析获取失败 [{futures[future]}]: {e}")
 
     return results
+
+
+def _format_box_grid_section(tech_data: list[dict]) -> tuple[str, str]:
+    """箱体震荡 + 网格判定数据表（代码确定性判定）
+
+    Returns:
+        (markdown, llm紧凑文本)；两者均为 "" 表示无有效数据。
+    """
+    rows = [t for t in tech_data if t.get("box_regime") and t["box_regime"] != "数据不足"]
+    if not rows:
+        return "", ""
+
+    lines = ["## 📦 箱体震荡与网格判定（代码判定）", ""]
+    lines.append("| 标的 | 箱体震荡 | 箱体区间 | 现价位置 | 日均振幅 | 代码判定(网格) |")
+    lines.append("|------|---------|---------|---------|---------|---------------|")
+
+    llm_parts = []
+    verdict_icon = {"开启": "🟢", "观望": "🟡", "关闭": "🔴"}
+    for t in rows:
+        name = t.get("name") or t.get("code", "")
+        code = t.get("code", "")
+        regime = t.get("box_regime", "")
+        score = t.get("box_score", 0)
+        lo = t.get("box_lower")
+        hi = t.get("box_upper")
+        pos = t.get("box_pos_pct")
+        amp = t.get("avg_amp")
+        verdict = t.get("grid_verdict", "")
+        reason = t.get("grid_verdict_reason", "")
+
+        box_range = f"{lo:.3f}~{hi:.3f}" if lo is not None and hi is not None else "--"
+        pos_s = f"{pos:.0f}%" if pos is not None else "--"
+        amp_s = f"{amp:.2f}%" if amp is not None else "--"
+        icon = verdict_icon.get(verdict, "⚪")
+        verdict_s = f"{icon} {verdict}" + (f"（{reason}）" if reason else "")
+
+        lines.append(
+            f"| {name}({code}) | {regime} | {box_range} | {pos_s} | {amp_s} | {verdict_s} |"
+        )
+        llm_parts.append(
+            f"{name}: 箱体={regime}(评分{score}) 区间[{box_range}] 位置{pos_s} "
+            f"日均振幅{amp_s} → 代码判定:{verdict}"
+        )
+
+    return "\n".join(lines), "  " + "\n  ".join(llm_parts)
 
 
 # ============================================================
@@ -631,6 +691,13 @@ def generate_morning_brief(config: Config) -> Path | None:
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings and quotes else []
     strategy_signals = _get_holdings_strategy_signals(holdings, quotes) if holdings and quotes else []
 
+    # 自选标的技术分析（早报 quotes 已含自选，复用同一份行情）
+    watch_tech = _get_holdings_tech_analysis(
+        [Holding(name=w.name, code=w.code, market=w.market, amount=0, cost=0.0)
+         for w in config.watch_items], quotes
+    ) if config.watch_items and quotes else []
+    box_md, box_llm = _format_box_grid_section(tech_data + watch_tech)
+
     if strategy_signals:
         data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振）")
         for s in strategy_signals:
@@ -665,6 +732,10 @@ def generate_morning_brief(config: Config) -> Path | None:
     if pos_md:
         data_lines.append(f"\n## 七、📊 仓位操作建议")
         data_lines.append(pos_md)
+
+    # 箱体震荡与网格判定（代码判定，覆盖自选+持仓）
+    if box_md:
+        data_lines.append("\n" + box_md)
 
     # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
     _append_mx_analysis(data_lines, config, all_items, quotes)
@@ -775,6 +846,10 @@ def generate_morning_brief(config: Config) -> Path | None:
         llm_lines.append(f"\n[关键位动态行为（昨日收盘）]")
         llm_lines.append(key_level_llm)
 
+    if box_llm:
+        llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
+        llm_lines.append(box_llm)
+
     llm_lines.append(f"""
 
 请按以下结构生成早盘简报（约 600 字，关键判断标注置信度）：
@@ -796,6 +871,9 @@ def generate_morning_brief(config: Config) -> Path | None:
 
 ### 四、风险预警
 今日最需要关注的 1-2 个风险点。
+
+### 五、网格交易建议（逐标的：代码判定 vs 你的判定）
+结合[箱体与网格]数据，对每个标的给出你自己的「网格开启/观望/关闭」判定，并说明与代码判定是否一致及理由（一句话）。
 
 要求：每一个判断都必须标注置信度。如果数据不足以支撑判断，如实说"数据不足"。使用 Markdown 格式增强可读性。
 
@@ -920,6 +998,13 @@ def generate_midday_review(config: Config) -> Path | None:
     # Technical analysis for holdings
     tech_data = _get_holdings_tech_analysis(holdings, quotes) if holdings else []
     strategy_signals = _get_holdings_strategy_signals(holdings, quotes) if holdings else []
+
+    # 自选标的技术分析（午评 quotes 已含自选，复用同一份行情）
+    watch_tech = _get_holdings_tech_analysis(
+        [Holding(name=w.name, code=w.code, market=w.market, amount=0, cost=0.0)
+         for w in config.watch_items], quotes
+    ) if config.watch_items and quotes else []
+    box_md, box_llm = _format_box_grid_section(tech_data + watch_tech)
     if tech_data:
         data_lines.append("\n## 六、持仓技术分析")
         data_lines.append("")
@@ -987,6 +1072,10 @@ def generate_midday_review(config: Config) -> Path | None:
     if intraday_mid_md:
         data_lines.append(f"\n## 十二、📈 盘中复盘（上午）")
         data_lines.append(intraday_mid_md)
+
+    # 箱体震荡与网格判定（代码判定，覆盖自选+持仓）
+    if box_md:
+        data_lines.append("\n" + box_md)
 
     # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
     _append_mx_analysis(data_lines, config, all_items, quotes)
@@ -1102,6 +1191,10 @@ def generate_midday_review(config: Config) -> Path | None:
         llm_lines.append(f"\n[关键位动态行为（上午盘中）]")
         llm_lines.append(key_level_mid_llm)
 
+    if box_llm:
+        llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
+        llm_lines.append(box_llm)
+
     llm_lines.append(f"""
 
 请作为资深策略分析师，基于以上午盘数据，生成一份结构清晰的午评报告（约500字）：
@@ -1111,6 +1204,8 @@ def generate_midday_review(config: Config) -> Path | None:
 3️⃣ **持仓午间扫描**: 针对个人持仓（Holdings），简述其上午的表现，是否出现风险信号
 4️⃣ **下午走势预测**: 基于上午的情绪和资金流向，预测下午的可能走势
 5️⃣ **午间操作建议**: 下午是否需要进行调仓（补仓/减仓），给出具体的触发条件
+
+6️⃣ **网格交易建议（逐标的：代码判定 vs 你的判定）**: 结合[箱体与网格]数据，对每个标的给出你自己的「网格开启/观望/关闭」判定，并说明与代码判定是否一致及理由（一句话）
 
 要求：
 - 视角：专业、敏锐，重点在于"预测下午"和"给出建议"。
@@ -3372,6 +3467,13 @@ def generate_evening_review(config: Config) -> Path | None:
                 )
             data_lines.append("")
 
+    # 箱体震荡与网格判定（代码判定，覆盖自选+持仓）
+    box_md, box_llm = _format_box_grid_section(
+        tech_data_evening + (watch_tech if watchlist else [])
+    )
+    if box_md:
+        data_lines.append("\n" + box_md)
+
     # 个股两融数据（融资融券，逐标的：持仓 + 自选，仅普通 A 股）
     from app.data_fetcher import fetch_stock_margin_detail
     from app.helpers import is_a_share_stock
@@ -3603,6 +3705,10 @@ def generate_evening_review(config: Config) -> Path | None:
     if nearby_parts:
         llm_lines.append("\n[📌 附近关键位] " + "; ".join(nearby_parts[:8]))
 
+    if box_llm:
+        llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
+        llm_lines.append(box_llm)
+
     llm_lines.append(f"""
 
 请按以下结构生成晚报（约 800 字）：
@@ -3651,6 +3757,9 @@ def generate_evening_review(config: Config) -> Path | None:
 
 ### 七、风控红线
 明日每只持仓的硬止损位和硬止盈位（具体价格，可直接引用预计算数据中的支撑/压力位）。
+
+### 八、网格交易建议（逐标的：代码判定 vs 你的判定）
+结合[箱体与网格]数据，对每个标的给出你自己的「网格开启/观望/关闭」判定，并说明与代码判定是否一致及理由（一句话）。
 
 要求：必须使用条件格式（if-then），标注置信度。交易建议必须给出具体的仓位比例和触发价格，不写"适当减仓"这种模糊表述。
 

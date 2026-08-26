@@ -1942,6 +1942,186 @@ def detect_market_regime(
     return result
 
 
+@dataclass
+class BoxRegime:
+    """箱体震荡 + 网格适用性诊断结果
+
+    由 detect_box_regime() 计算，供报告与 etf-grid skill 共用。
+    """
+    regime: str = ""               # 强箱体震荡 / 箱体震荡（偏中性）/ 弱箱体/方向未明 / 趋势市（不利网格）
+    score: int = 0                 # 箱体震荡加权评分
+    reasons: list[str] = None      # 命中理由（供展示/LLM）
+    lower: Optional[float] = None  # 近60日低（箱体下沿）
+    upper: Optional[float] = None  # 近60日高（箱体上沿）
+    pos_pct: float = 50.0          # 现价在箱体中的百分位（0%下沿 / 100%上沿）
+    avg_amp: Optional[float] = None  # 近20日平均日振幅 %
+    atr_pct: Optional[float] = None
+    is_box: bool = False           # 是否箱体震荡阶段（score >= 3）
+    grid_verdict: str = ""         # 开启 / 观望 / 关闭
+    grid_verdict_reason: str = ""
+    grid_step: Optional[float] = None
+    grid_step_pct: Optional[float] = None
+    grid_grids: Optional[int] = None
+    grid_base_pct: Optional[int] = None
+    grid_stop: Optional[float] = None
+
+
+def detect_box_regime(klines: list[KlineData], price: Optional[float] = None) -> BoxRegime:
+    """诊断箱体震荡阶段 + 网格适用性（单一事实来源）
+
+    与 .claude/skills/etf-grid/analyze_etf_grid.py 的箱体评分逻辑一致：
+    加权评分 = 均线排列 + 区间涨跌幅 + 布林带宽 + 趋势斜率，映射为箱体档位；
+    再结合近20日平均日振幅给出确定性网格判定（开启/观望/关闭）。
+
+    Args:
+        klines: 日 K 线（按时间升序，建议 >= 60 根）
+        price: 现价，缺省时用最后一根 K 线收盘价
+
+    Returns:
+        BoxRegime 诊断结果
+    """
+    result = BoxRegime()
+    if not klines:
+        result.regime = "数据不足"
+        return result
+
+    closes = [k.close for k in klines if k.close is not None]
+    highs = [k.high for k in klines if k.high is not None]
+    lows = [k.low for k in klines if k.low is not None]
+    if not closes:
+        result.regime = "数据不足"
+        return result
+
+    # 现价兜底
+    if price is None or price <= 0:
+        price = closes[-1]
+
+    ma_align = calc_ma_alignment(klines)
+    bb = calc_bollinger(closes)
+    sr = calc_support_resistance(klines, lookback=20)
+    atr = sr.atr
+
+    # 箱体上下沿（近60日高低）
+    hi60 = max(highs[-60:]) if highs else None
+    lo60 = min(lows[-60:]) if lows else None
+
+    ret60 = (closes[-1] / closes[0] - 1) * 100 if closes[0] else None
+    ret20 = (closes[-1] / closes[-21] - 1) * 100 if len(closes) >= 21 and closes[-21] else None
+
+    atr_pct = atr / price * 100 if atr and price else None
+
+    # 近20日平均日振幅
+    amps = [
+        (k.high - k.low) / k.close * 100
+        for k in klines[-20:]
+        if k.high and k.low and k.close and k.close > 0
+    ]
+    avg_amp = sum(amps) / len(amps) if amps else None
+
+    # 趋势斜率（近60日，%/日）
+    seg = closes[-60:] if len(closes) >= 60 else closes
+    slope60 = _calc_linear_slope(seg) / seg[0] * 100 if seg and seg[0] else 0.0
+
+    # 现价在箱体中的位置
+    pos_pct = (price - lo60) / (hi60 - lo60) * 100 if hi60 is not None and lo60 is not None and hi60 > lo60 and price else 50.0
+
+    # ---- 箱体震荡评分 ----
+    score, reasons = 0, []
+    if ma_align.alignment == "缠绕":
+        score += 2
+        reasons.append("均线缠绕（无明确趋势）")
+    elif ma_align.alignment in ("多头排列", "空头排列"):
+        score -= 2
+        reasons.append(f"均线{ma_align.alignment}（趋势市，不利网格）")
+    if ret60 is not None:
+        if abs(ret60) < 5:
+            score += 2
+            reasons.append(f"近60日涨跌幅仅{ret60:+.2f}%（窄幅）")
+        elif abs(ret60) < 10:
+            score += 1
+            reasons.append(f"近60日涨跌幅{ret60:+.2f}%（较窄）")
+        elif abs(ret60) >= 20:
+            score -= 2
+            reasons.append(f"近60日涨跌幅{ret60:+.2f}%（单边趋势）")
+    if bb.width is not None:
+        if bb.width < 8:
+            score += 1
+            reasons.append(f"布林带宽{bb.width:.1f}%（收窄震荡）")
+    if ret20 is not None and abs(ret20) < 4:
+        score += 1
+        reasons.append(f"近20日涨跌幅{ret20:+.2f}%（近期走平）")
+    if abs(slope60) < 0.03:
+        score += 1
+        reasons.append(f"趋势斜率{slope60:+.3f}%/日（近水平）")
+
+    if score >= 5:
+        regime = "强箱体震荡"
+    elif score >= 3:
+        regime = "箱体震荡（偏中性）"
+    elif score >= 1:
+        regime = "弱箱体/方向未明"
+    else:
+        regime = "趋势市（不利网格）"
+
+    # ---- 确定性网格判定（对应 etf-grid 三前提：箱体 + 波动率1%~4% + 非趋势）----
+    is_box = score >= 3
+    if score < 1:
+        grid_verdict = "关闭"
+        grid_verdict_reason = "趋势市，不利于网格"
+    elif score < 3:
+        grid_verdict = "观望"
+        grid_verdict_reason = "弱箱体/方向未明"
+    elif avg_amp is None:
+        grid_verdict = "观望"
+        grid_verdict_reason = "波动率数据不足"
+    elif avg_amp < 1.0:
+        grid_verdict = "观望"
+        grid_verdict_reason = f"日均振幅{avg_amp:.2f}%过低，吃不到价差"
+    elif avg_amp > 4.0:
+        grid_verdict = "观望"
+        grid_verdict_reason = f"日均振幅{avg_amp:.2f}%过高，破位风险大"
+    else:
+        grid_verdict = "开启"
+        grid_verdict_reason = f"箱体震荡+日均振幅{avg_amp:.2f}%适中"
+
+    # ---- 网格参数参考值 ----
+    grid_step = grid_step_pct = grid_grids = grid_base_pct = grid_stop = None
+    if hi60 is not None and lo60 is not None and hi60 > lo60 and price and price > 0:
+        step_pct = max(1.2, min(3.0, (atr_pct or 1.5) * 1.5))
+        step = round(price * step_pct / 100, 3)
+        grids = max(1, round((hi60 - lo60) / step))
+        if pos_pct < 33:
+            base_pct = 60
+        elif pos_pct <= 67:
+            base_pct = 50
+        else:
+            base_pct = 40
+        grid_step = step
+        grid_step_pct = round(step_pct, 2)
+        grid_grids = grids
+        grid_base_pct = base_pct
+        grid_stop = round(lo60 - step, 3)
+
+    result.regime = regime
+    result.score = score
+    result.reasons = reasons
+    result.lower = round(lo60, 3) if lo60 is not None else None
+    result.upper = round(hi60, 3) if hi60 is not None else None
+    result.pos_pct = round(pos_pct, 1)
+    result.avg_amp = round(avg_amp, 2) if avg_amp is not None else None
+    result.atr_pct = round(atr_pct, 2) if atr_pct is not None else None
+    result.is_box = is_box
+    result.grid_verdict = grid_verdict
+    result.grid_verdict_reason = grid_verdict_reason
+    result.grid_step = grid_step
+    result.grid_step_pct = grid_step_pct
+    result.grid_grids = grid_grids
+    result.grid_base_pct = grid_base_pct
+    result.grid_stop = grid_stop
+
+    return result
+
+
 def calc_composite_score(tech: TechnicalSummary, price: float, flow_pct: Optional[float] = None) -> dict:
     """多信号共振加权评分（0-100）
 

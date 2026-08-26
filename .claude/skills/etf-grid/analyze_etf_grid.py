@@ -43,6 +43,7 @@ from app.technical import (
     calc_support_resistance,
     calc_bollinger,
     calc_rsi,
+    detect_box_regime,
 )
 
 # 场内 ETF 代码号段（上海：51/56/58，深圳：15/16/18）
@@ -76,10 +77,6 @@ def _slope_pct(series: list[float]) -> float:
     den = sum((i - x_mean) ** 2 for i in range(n))
     slope = num / den if den > 0 else 0.0
     return slope / series[0] * 100 if series[0] else 0.0
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
 
 
 # ---------------------------------------------------------------- 解析参数
@@ -196,63 +193,15 @@ def main():
     # 当前价在近60日箱体中的位置（百分位）
     pos_pct = (price - lo60) / (hi60 - lo60) * 100 if hi60 > lo60 else 50.0
 
-    # ---- 箱体震荡评分 ----
-    score, reasons = 0, []
-    if ma_align.alignment == "缠绕":
-        score += 2
-        reasons.append("均线缠绕（无明确趋势）")
-    elif ma_align.alignment in ("多头排列", "空头排列"):
-        score -= 2
-        reasons.append(f"均线{ma_align.alignment}（趋势市，不利网格）")
-    if ret60 is not None:
-        if abs(ret60) < 5:
-            score += 2
-            reasons.append(f"近60日涨跌幅仅{ret60:+.2f}%（窄幅）")
-        elif abs(ret60) < 10:
-            score += 1
-            reasons.append(f"近60日涨跌幅{ret60:+.2f}%（较窄）")
-        elif abs(ret60) >= 20:
-            score -= 2
-            reasons.append(f"近60日涨跌幅{ret60:+.2f}%（单边趋势）")
-    if bb.width is not None:
-        if bb.width < 8:
-            score += 1
-            reasons.append(f"布林带宽{bb.width:.1f}%（收窄震荡）")
-    if ret20 is not None and abs(ret20) < 4:
-        score += 1
-        reasons.append(f"近20日涨跌幅{ret20:+.2f}%（近期走平）")
-    if abs(slope60) < 0.03:
-        score += 1
-        reasons.append(f"趋势斜率{slope60:+.3f}%/日（近水平）")
-
-    if score >= 5:
-        regime = "强箱体震荡"
-    elif score >= 3:
-        regime = "箱体震荡（偏中性）"
-    elif score >= 1:
-        regime = "弱箱体/方向未明"
-    else:
-        regime = "趋势市（不利网格）"
-
-    # 网格参数参考值
+    # ---- 箱体震荡评分 + 网格参数（下沉到共享函数 detect_box_regime）----
+    box = detect_box_regime(klines, price)
+    score, reasons, regime = box.score, box.reasons or [], box.regime
     grid = None
-    if hi60 > lo60 and price and price > 0:
-        # 间距：以 ATR% 自适应，夹在 1.2% ~ 3.0%
-        step_pct = _clamp((atr_pct or 1.5) * 1.5, 1.2, 3.0)
-        step = round(price * step_pct / 100, 3)
-        lower = round(lo60, 3)
-        upper = round(hi60, 3)
-        grids = max(1, round((upper - lower) / step))
-        if pos_pct < 33:
-            base_pct = 60
-        elif pos_pct <= 67:
-            base_pct = 50
-        else:
-            base_pct = 40
+    if box.grid_step is not None and box.lower is not None and box.upper is not None:
         grid = {
-            "lower": lower, "upper": upper, "step": step,
-            "step_pct": round(step_pct, 2), "grids": grids,
-            "base_pct": base_pct, "stop": round(lower - step, 3),
+            "lower": box.lower, "upper": box.upper, "step": box.grid_step,
+            "step_pct": box.grid_step_pct, "grids": box.grid_grids,
+            "base_pct": box.grid_base_pct, "stop": box.grid_stop,
         }
 
     # ============================================================ 输出
