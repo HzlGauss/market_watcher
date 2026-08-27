@@ -63,6 +63,7 @@ def _main_pct_rising(flow_history: list[FundFlowDaily]) -> bool:
 def _absorb_score(
     flow_history: list[FundFlowDaily],
     price_change_pct: Optional[float],
+    circulation_value: Optional[float],
 ) -> tuple[float, dict]:
     """持续低吸子分（0-100）+ 相关字段
 
@@ -101,8 +102,12 @@ def _absorb_score(
             divergence = max(0.0, 0.5 - (pc - 5.0) / 30.0)
         divergence = max(0.0, min(1.0, divergence))
     divergence_score = (divergence or 0.0) * 35.0
-    # 4. 累计净流入规模 0-15（每 5000 万 +1，封顶 15）
-    net_score = min(15.0, 8.0 + abs(total_net) / 5e7) if total_net > 0 else 0.0
+    # 4. 累计净流入规模 0-15（归一化：窗口累计净流入占流通市值%，消除市值规模偏差）
+    if total_net > 0 and circulation_value:
+        absorb_pct = total_net / circulation_value * 100.0
+        net_score = min(15.0, absorb_pct / 0.5 * 5.0)  # 每 0.5% 给 5 分，1.5% 封顶
+    else:
+        net_score = 0.0
     # 5. 主力净占比趋势 0-10
     large_ratio_rising = _main_pct_rising(flow_history)
     large_ratio_score = 10.0 if large_ratio_rising else 0.0
@@ -116,6 +121,13 @@ def _absorb_score(
         "price_change_10d": price_change_pct,
         "divergence": divergence,
         "large_ratio_rising": large_ratio_rising,
+        "components": {
+            "inflow_score": round(inflow_score, 1),
+            "consecutive_score": round(consecutive_score, 1),
+            "divergence_score": round(divergence_score, 1),
+            "net_score": round(net_score, 1),
+            "large_ratio_score": round(large_ratio_score, 1),
+        },
     }
 
 
@@ -156,6 +168,10 @@ def _valuation_score(
         "inflow_strength_pct": inflow_strength_pct,
         "valuation_status": valuation_status,
         "valuation_percentile": valuation_percentile,
+        "components": {
+            "inflow_score": round(inflow_score, 1),
+            "val_score": round(val_score, 1),
+        },
     }
 
 
@@ -196,7 +212,7 @@ def analyze_accumulation(
             notes=["无资金流/估值数据"],
         )
 
-    absorb_score, absorb = _absorb_score(flow_history, price_change_pct) if has_absorb else (None, {})
+    absorb_score, absorb = _absorb_score(flow_history, price_change_pct, circulation_value) if has_absorb else (None, {})
     val_score, val = _valuation_score(
         main_net, circulation_value, valuation_status, valuation_percentile,
     ) if has_val else (None, {})
@@ -247,6 +263,25 @@ def analyze_accumulation(
             notes.append(f"估值: {valuation_status}")
         if valuation_percentile is not None:
             notes.append(f"PE-TTM 历史分位 {valuation_percentile:.0f}%")
+
+    # 打印关键评价中间信息（子分拆解），便于复盘调参
+    absorb_comp = absorb.get("components", {})
+    val_comp = val.get("components", {})
+    segs = [f"{name}({code}) 综合={score:.1f} {label}"]
+    if absorb_score is not None:
+        segs.append(
+            f"低吸={absorb_score:.1f}[净流入{absorb_comp.get('inflow_score', 0.0):.1f}/"
+            f"连续{absorb_comp.get('consecutive_score', 0.0):.1f}/"
+            f"背离{absorb_comp.get('divergence_score', 0.0):.1f}/"
+            f"规模{absorb_comp.get('net_score', 0.0):.1f}/"
+            f"占比{absorb_comp.get('large_ratio_score', 0.0):.1f}]"
+        )
+    if val_score is not None:
+        segs.append(
+            f"估值={val_score:.1f}[强度{val_comp.get('inflow_score', 0.0):.1f}/"
+            f"分位{val_comp.get('val_score', 0.0):.1f}]"
+        )
+    log.info("[吸筹评分] " + " | ".join(segs))
 
     return AccumulationScore(
         code=code, name=name, score=score, label=label,
