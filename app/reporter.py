@@ -887,7 +887,7 @@ def generate_morning_brief(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 6. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="morning_brief", temperature=0.4, max_tokens=2500)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="morning_brief", temperature=0.4, max_tokens=8000, timeout=300)
     if not llm_content:
         log.warning("Morning brief: LLM generation failed")
 
@@ -1222,7 +1222,7 @@ def generate_midday_review(config: Config) -> Path | None:
 **关键位动态解读**：受压回落→上方压力沉重注意减仓；支撑确认→回调可低吸；跌破支撑→注意止损减仓；突破回踩确认→突破有效可适当加仓；位级强度→强级别更可信。""")
 
     # 4. Call LLM
-    llm_content = _call_llm("\n".join(llm_lines), config, role="midday_review", temperature=0.3, max_tokens=2000)
+    llm_content = _call_llm("\n".join(llm_lines), config, role="midday_review", temperature=0.3, max_tokens=8000, timeout=300)
     if not llm_content:
         log.warning("Midday review: LLM generation failed")
 
