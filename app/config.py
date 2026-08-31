@@ -53,6 +53,11 @@ class Config:
     DEFAULT_SCREENING_BLACKLIST_CONCEPTS = []
     DEFAULT_SCREENING_EXCLUDE_ST = True
     DEFAULT_SCREENING_SUB_NEW_DAYS = 60
+    DEFAULT_STRONG_SECTOR_COUNT = 10   # 资金强势选股：热门板块数
+    DEFAULT_STRONG_STOCK_PCT = 20      # 资金强势选股：每板块内个股前 N%
+    DEFAULT_STRONG_STOCK_MIN = 3       # 资金强势选股：每板块最少个股数
+    DEFAULT_STRONG_FLOW_PERIOD = "10日"  # 资金强势选股：资金流入周期
+    DEFAULT_STRONG_CANDIDATE_LIMIT = 30  # 资金强势选股：候选总数上限
     DEFAULT_FLOW_REVERSAL_MIN = 1e7  # 资金流转向最小净额（元），默认 1000 万
     DEFAULT_FLOW_DIVERGE_PCT = 2.0   # 资金背离价格阈值（%）
     DEFAULT_FLOW_REVERSAL_PCT = 2.0  # 资金流转向最小占比（%），主力净流入占成交额低于此值不计转向
@@ -506,6 +511,48 @@ class Config:
             "次新股天数", self.DEFAULT_SCREENING_SUB_NEW_DAYS
         )
         return max(0, safe_int(value, self.DEFAULT_SCREENING_SUB_NEW_DAYS))
+
+    # ---- 资金强势选股 ----
+
+    @property
+    def strong_sector_count(self) -> int:
+        """资金强势选股：热门板块数（主力净流入最多的前 K 个板块）"""
+        value = self._raw.get("强势选股", {}).get(
+            "热门板块数", self.DEFAULT_STRONG_SECTOR_COUNT
+        )
+        return max(1, safe_int(value, self.DEFAULT_STRONG_SECTOR_COUNT))
+
+    @property
+    def strong_stock_pct(self) -> int:
+        """资金强势选股：每板块内取资金流入前 N% 个股（1-100）"""
+        value = self._raw.get("强势选股", {}).get(
+            "个股比例", self.DEFAULT_STRONG_STOCK_PCT
+        )
+        return max(1, min(100, safe_int(value, self.DEFAULT_STRONG_STOCK_PCT)))
+
+    @property
+    def strong_stock_min(self) -> int:
+        """资金强势选股：每板块最少个股数（不足则全选）"""
+        value = self._raw.get("强势选股", {}).get(
+            "每板块最少个股", self.DEFAULT_STRONG_STOCK_MIN
+        )
+        return max(1, safe_int(value, self.DEFAULT_STRONG_STOCK_MIN))
+
+    @property
+    def strong_flow_period(self) -> str:
+        """资金强势选股：资金流入周期（今日/5日/10日）"""
+        value = str(self._raw.get("强势选股", {}).get(
+            "资金周期", self.DEFAULT_STRONG_FLOW_PERIOD
+        )).strip()
+        return value if value in ("今日", "5日", "10日") else self.DEFAULT_STRONG_FLOW_PERIOD
+
+    @property
+    def strong_candidate_limit(self) -> int:
+        """资金强势选股：候选总数上限（逐股深查前截断）"""
+        value = self._raw.get("强势选股", {}).get(
+            "候选数上限", self.DEFAULT_STRONG_CANDIDATE_LIMIT
+        )
+        return max(3, safe_int(value, self.DEFAULT_STRONG_CANDIDATE_LIMIT))
 
     # ---- Investment Reports ----
 

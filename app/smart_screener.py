@@ -15,7 +15,7 @@
   Stage 0  数据驱动板块选择：东财板块资金流排名（5日）→ 筛「主力净流入多 + 涨幅小」潜伏板块
            （东财失败时回退 LLM 热点板块判断 + 妙想新闻题材/龙虎榜背景）
   Stage 1  妙想 stock_screen 执行 → 候选池（跨条件去重 + 共振加分，同时带出 flow_days 与估值字段）
-  Stage 2  综合评分（持续低吸 + 估值分位）+ 多维过滤（黑名单板块/概念 + ST/退市 + 新股/次新股，核心）
+  Stage 2  综合评分（持续低吸 + 估值分位）+ 多维过滤（黑名单板块/概念 + ST/退市 + 新股/次新股 + 走势弱于板块，核心）
   Stage 3  LLM 综合排序解读 → 强关注/关注/风险分级
   Stage 4  报告生成 + 保存 + ServerChan 推送
 
@@ -42,23 +42,13 @@ from app.models import (
 from app.utils import log
 
 NEWS_WINDOW_HOURS = 24  # 背景新闻回看窗口（小时）
+SECTOR_RELATIVE_DAYS = 5  # 个股相对板块走势对比窗口（与板块资金流「5日」周期对齐）
+SECTOR_RELATIVE_BUFFER = 2.0  # 个股相对板块「显著弱于」缓冲带（%），落后超过此值才剔除
 
 
 # ============================================================
 # 吸筹评分器（核心信号）：持续低吸 + 估值分位
 # ============================================================
-
-def _main_pct_rising(flow_history: list[FundFlowDaily]) -> bool:
-    """主力净占比近 5 日是否较前 5 日上升（机构/大户吸筹深化）"""
-    pcts = [d.main_pct for d in flow_history if d.main_pct is not None]
-    if len(pcts) < 10:
-        return False
-    recent = pcts[-5:]
-    prior = pcts[-10:-5]
-    if len(recent) != 5 or len(prior) != 5:
-        return False
-    return (sum(recent) / 5.0) > (sum(prior) / 5.0)
-
 
 def _absorb_score(
     flow_history: list[FundFlowDaily],
@@ -90,7 +80,7 @@ def _absorb_score(
     inflow_score = (inflow_days / max(days, 1)) * 25.0
     # 2. 最近连续净流入 0-15
     consecutive_score = (min(consecutive_days, 5) / 5.0) * 15.0
-    # 3. 背离度（灵魂）0-35：资金净流入 + 股价滞涨
+    # 3. 背离度（灵魂）0-45：资金净流入 + 股价滞涨
     divergence: Optional[float] = None
     if total_net > 0 and price_change_pct is not None:
         pc = price_change_pct
@@ -101,32 +91,27 @@ def _absorb_score(
         else:
             divergence = max(0.0, 0.5 - (pc - 5.0) / 30.0)
         divergence = max(0.0, min(1.0, divergence))
-    divergence_score = (divergence or 0.0) * 35.0
+    divergence_score = (divergence or 0.0) * 45.0
     # 4. 累计净流入规模 0-15（归一化：窗口累计净流入占流通市值%，消除市值规模偏差）
     if total_net > 0 and circulation_value:
         absorb_pct = total_net / circulation_value * 100.0
         net_score = min(15.0, absorb_pct / 0.5 * 5.0)  # 每 0.5% 给 5 分，1.5% 封顶
     else:
         net_score = 0.0
-    # 5. 主力净占比趋势 0-10
-    large_ratio_rising = _main_pct_rising(flow_history)
-    large_ratio_score = 10.0 if large_ratio_rising else 0.0
 
-    score = inflow_score + consecutive_score + divergence_score + net_score + large_ratio_score
+    score = inflow_score + consecutive_score + divergence_score + net_score
     score = max(0.0, min(100.0, score))
     return score, {
         "inflow_days": inflow_days,
         "consecutive_days": consecutive_days,
         "total_net": total_net,
-        "price_change_10d": price_change_pct,
+        "price_change_window_pct": price_change_pct,
         "divergence": divergence,
-        "large_ratio_rising": large_ratio_rising,
         "components": {
             "inflow_score": round(inflow_score, 1),
             "consecutive_score": round(consecutive_score, 1),
             "divergence_score": round(divergence_score, 1),
             "net_score": round(net_score, 1),
-            "large_ratio_score": round(large_ratio_score, 1),
         },
     }
 
@@ -139,29 +124,29 @@ def _valuation_score(
 ) -> tuple[float, dict]:
     """估值分位子分（0-100）+ 相关字段
 
-    首要：资金流入强度 —— 主力净流入占流通市值比例（0-60）
-    次要：估值分位 —— PE-TTM 历史百分位 / 估值状态（0-40，分位越低越便宜分越高）
+    首要：估值分位 —— PE-TTM 历史百分位 / 估值状态（0-60，分位越低越便宜分越高）
+    次要：资金流入强度 —— 主力净流入占流通市值比例（0-40，避免与低吸子分重复计分）
     """
-    # 1. 流入强度（0-60）
+    # 1. 流入强度（0-40）
     inflow_strength_pct: Optional[float] = None
     if main_net is not None and circulation_value:
         inflow_strength_pct = main_net / circulation_value * 100.0
-    inflow_score = min(60.0, inflow_strength_pct * 30.0) if (
+    inflow_score = min(40.0, inflow_strength_pct * 20.0) if (
         inflow_strength_pct is not None and inflow_strength_pct > 0) else 0.0
 
-    # 2. 估值分位（0-40）
-    val_score = 20.0  # 默认中性
+    # 2. 估值分位（0-60）
+    val_score = 30.0  # 默认中性
     if valuation_percentile is not None:
         p = max(0.0, min(100.0, valuation_percentile))
-        val_score = (100.0 - p) / 100.0 * 40.0
+        val_score = (100.0 - p) / 100.0 * 60.0
     elif valuation_status:
         s = str(valuation_status)
         if "较低" in s or "低估" in s or "偏低" in s:
-            val_score = 40.0
+            val_score = 60.0
         elif "较高" in s or "高估" in s or "偏高" in s:
             val_score = 0.0
         else:
-            val_score = 20.0
+            val_score = 30.0
 
     score = max(0.0, min(100.0, inflow_score + val_score))
     return score, {
@@ -248,12 +233,10 @@ def analyze_accumulation(
                 notes.append(f"累计净流入 {absorb['total_net'] / 1e8:.2f} 亿")
             else:
                 notes.append(f"累计净流出 {abs(absorb['total_net']) / 1e8:.2f} 亿")
-        if absorb["price_change_10d"] is not None:
-            notes.append(f"窗口涨幅 {absorb['price_change_10d']:+.1f}%")
+        if absorb["price_change_window_pct"] is not None:
+            notes.append(f"窗口涨幅 {absorb['price_change_window_pct']:+.1f}%")
         if absorb["divergence"] is not None:
             notes.append(f"背离度 {absorb['divergence']:.2f}")
-        if absorb["large_ratio_rising"]:
-            notes.append("主力占比近5日上升")
     if has_val:
         if main_net is not None:
             notes.append(f"主力净流入 {main_net / 1e8:.2f} 亿")
@@ -273,8 +256,7 @@ def analyze_accumulation(
             f"低吸={absorb_score:.1f}[净流入{absorb_comp.get('inflow_score', 0.0):.1f}/"
             f"连续{absorb_comp.get('consecutive_score', 0.0):.1f}/"
             f"背离{absorb_comp.get('divergence_score', 0.0):.1f}/"
-            f"规模{absorb_comp.get('net_score', 0.0):.1f}/"
-            f"占比{absorb_comp.get('large_ratio_score', 0.0):.1f}]"
+            f"规模{absorb_comp.get('net_score', 0.0):.1f}]"
         )
     if val_score is not None:
         segs.append(
@@ -288,9 +270,8 @@ def analyze_accumulation(
         inflow_days=absorb.get("inflow_days", 0),
         consecutive_days=absorb.get("consecutive_days", 0),
         total_net=total_net,
-        price_change_10d=absorb.get("price_change_10d"),
+        price_change_window_pct=absorb.get("price_change_window_pct"),
         divergence=absorb.get("divergence"),
-        large_ratio_rising=absorb.get("large_ratio_rising", False),
         inflow_strength_pct=val.get("inflow_strength_pct"),
         valuation_status=val.get("valuation_status", ""),
         valuation_percentile=val.get("valuation_percentile"),
@@ -353,8 +334,9 @@ def _find_accumulating_sectors(config: Config, limit: int) -> list[SectorFundFlo
     """东财板块资金流排名 → 筛「主力资金净流入为正」的板块
 
     条件：板块5日主力净流入 > 0（资金流入为正），排除黑名单板块，
-    按净流入金额降序取前 limit 个。东财行业板块约 86 个、正常交易日净流入为正的
-    常有 40+ 个，故必须截断，否则妙想逐板块查询会过慢且易触发限流。
+    按「净流入 / 涨幅比值」降序取前 limit 个 —— 优先高净流入、低涨幅的
+    「资金潜伏待启动」板块（涨太多则比值变小，被排在后面）。东财行业板块约 86 个、
+    正常交易日净流入为正的常有 40+ 个，故必须截断，否则妙想逐板块查询会过慢且易触发限流。
     """
     from app.data_fetcher import fetch_sector_fund_flow_rank
 
@@ -368,7 +350,13 @@ def _find_accumulating_sectors(config: Config, limit: int) -> list[SectorFundFlo
             continue
         picked.append(s)
 
-    picked.sort(key=lambda s: (s.main_net or 0.0), reverse=True)
+    def ratio_key(s: SectorFundFlow) -> float:
+        net = s.main_net or 0.0
+        chg = s.change_pct if s.change_pct is not None else 0.0
+        # 0.5 为涨幅下界：跌/微涨板块 denominator 取 0.5，大涨板块 denominator 变大 → 比值变小
+        return net / max(chg, 0.5)
+
+    picked.sort(key=ratio_key, reverse=True)
     return picked[:limit]
 
 
@@ -597,6 +585,25 @@ def _is_sub_new(list_date: Optional[str], days: int) -> bool:
     return (datetime.now() - ld).days < days
 
 
+def _weaker_than_sector(
+    cand: ScreeningCandidate,
+    stock_chg: Optional[float],
+    sector_chg_map: dict[str, Optional[float]],
+) -> bool:
+    """个股筛选周期涨幅是否显著弱于它命中的任一板块（无板块涨幅数据则不判弱）
+
+    候选命中多个板块时，只要有一个板块涨幅比个股高出缓冲带以上即视为「显著弱于板块」被剔除；
+    软化处理：落后 SECTOR_RELATIVE_BUFFER 个点以内不剔除（容忍板块噪音），仅剔除显著落后者。
+    板块名与东财板块资金流排名一致，直接按名精确匹配。
+    """
+    if stock_chg is None:
+        return False
+    matched = [s for s in cand.hot_sectors if sector_chg_map.get(s) is not None]
+    if not matched:
+        return False
+    return any(stock_chg <= sector_chg_map[s] - SECTOR_RELATIVE_BUFFER for s in matched)
+
+
 def _exclusion_reason(
     cand: ScreeningCandidate,
     industry_map: dict[str, str],
@@ -633,10 +640,80 @@ def _exclusion_reason(
     return None
 
 
+def _fetch_pe_percentile(config: Config, code: str, name: str, mx) -> Optional[float]:
+    """补查 PE-TTM 历史分位（0-100，越小越便宜）
+
+    优先妙想 query_structured（市盈率/市净率 历史分位），取含「百分位」的列
+    （优先含 PE/市盈率），解析成 0-100；妙想取不到再用 AKShare 百度估值历史序列兜底。
+    任一失败返回 None（估值维度缺失，由 _valuation_score 中性处理）。
+    """
+    if mx is not None:
+        try:
+            for t in mx.query_structured(f"{code} {name} 市盈率 市净率 历史分位".strip()):
+                cols = t.get("columns") or []
+                rows = t.get("rows") or []
+                if not rows:
+                    continue
+                r = rows[0]
+                pct_cols = [c for c in cols if "百分位" in c]
+                if not pct_cols:
+                    continue
+                col = next((c for c in pct_cols if "PE" in c or "市盈率" in c), pct_cols[0])
+                val = mx._parse_amount(r.get(col))
+                if val is not None:
+                    return max(0.0, min(100.0, val))
+        except Exception as e:
+            log.debug(f"妙想估值分位查询失败 {code}: {e}")
+
+    # AKShare 兜底（百度市盈率历史序列）
+    try:
+        import akshare as ak
+        df = ak.stock_zh_valuation_baidu(symbol=code, indicator="市盈率(TTM)", period="近三年")
+        if df is not None and "value" in df.columns and len(df):
+            vals: list[float] = []
+            for v in df["value"]:
+                try:
+                    vals.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            if vals:
+                cur = vals[-1]
+                if cur > 0:  # 亏损股 PE 为负/无意义，规避
+                    return round((sum(1 for v in vals if v <= cur) / len(vals)) * 100.0, 1)
+    except Exception as e:
+        log.debug(f"AKShare 估值分位兜底失败 {code}: {e}")
+
+    return None
+
+
+def _fetch_circulation_value(code: str, name: str, mx) -> Optional[float]:
+    """妙想补查流通市值（元），供 circulation_value 缺失时兜底"""
+    if mx is None:
+        return None
+    try:
+        for t in mx.query_structured(f"{code} {name} 流通市值".strip()):
+            cols = t.get("columns") or []
+            rows = t.get("rows") or []
+            if not rows:
+                continue
+            r = rows[0]
+            col = next((c for c in cols if "流通市值" in c), None)
+            if not col:
+                continue
+            val = mx._parse_amount(r.get(col))
+            if val is not None and val > 0:
+                return val
+    except Exception as e:
+        log.debug(f"妙想流通市值查询失败 {code}: {e}")
+    return None
+
+
 def _score_accumulation(
-    config: Config, candidates: list[ScreeningCandidate]
+    config: Config,
+    candidates: list[ScreeningCandidate],
+    acc_sectors: Optional[list[SectorFundFlow]] = None,
 ) -> list[ScreeningCandidate]:
-    """对候选做「持续低吸 + 估值分位」综合评分，并执行多维排除过滤 + 截断到上限"""
+    """对候选做「持续低吸 + 估值分位」综合评分，并执行多维排除过滤 + 走势强于板块过滤 + 截断到上限"""
     if not candidates:
         return []
 
@@ -646,6 +723,13 @@ def _score_accumulation(
     blacklist_concepts = config.screening_blacklist_concepts
     exclude_st = config.screening_exclude_st
     sub_new_days = config.screening_sub_new_days
+
+    # 板块筛选周期涨幅映射（个股相对强弱过滤用，板块名 → 5日涨幅）
+    sector_chg_map: dict[str, Optional[float]] = {
+        s.name: s.change_pct
+        for s in (acc_sectors or [])
+        if s.name and s.change_pct is not None
+    }
 
     # 1. 行业映射 + 上市日期映射（均为批量、日级缓存，成本与候选数无关）
     industry_map: dict[str, str] = {}
@@ -679,8 +763,13 @@ def _score_accumulation(
         for reason, names in removed.items():
             log.info(f"过滤[{reason}] {len(names)} 只: {names}")
 
-    # 3. 截断到上限（先按共振分降序，减少后续 API 调用）
-    kept.sort(key=lambda c: c.resonance, reverse=True)
+    # 3. 截断到上限（先按共振分降序，同共振分下优先保留资金强度更高的单板块票，减少后续 API 调用）
+    def _strength_proxy(c: ScreeningCandidate) -> float:
+        if c.main_net is not None and c.circulation_value:
+            return c.main_net / c.circulation_value
+        return 0.0
+
+    kept.sort(key=lambda c: (c.resonance, _strength_proxy(c)), reverse=True)
     kept = kept[:limit]
 
     # 3b. 妙想未返回行业时，用 AKShare 行业映射回填（报告展示真实行业用）
@@ -694,12 +783,17 @@ def _score_accumulation(
     for c in kept:
         flow_map[c.code] = c.flow_days
 
-    # 4b. 串行拉K线（AKShare 个股限流约 1 次/秒）+ 计算背离度 + 综合评分
+    # 4b. 串行拉K线（AKShare 个股限流约 1 次/秒）+ 相对板块走势过滤 + 计算背离度 + 综合评分
     from app import technical
+    relative_removed: list[str] = []
+    scored: list[ScreeningCandidate] = []
+    mx_client = None  # 估值/流通市值补查客户端，惰性创建
     for c in kept:
+        time.sleep(0.7)  # AKShare 个股限流约 1 次/秒，逐股间隔
         flow = flow_map.get(c.code, [])
         window = len(flow) if flow else days  # 与资金流窗口对齐（妙想 5 日 / 东财 days 日）
         price_chg: Optional[float] = None
+        stock_chg_5d: Optional[float] = None
         try:
             # 取更长K线（至少60日）用于 MA20/支撑压力，背离度仍只在资金流窗口上计算
             klines = technical.fetch_historical_kline(c.code, c.market, days=max(window, 60))
@@ -709,6 +803,10 @@ def _score_accumulation(
                 base = seg[0].close
                 if base and last:
                     price_chg = (last / base - 1.0) * 100.0
+                seg5 = klines[-SECTOR_RELATIVE_DAYS:] if len(klines) >= SECTOR_RELATIVE_DAYS else klines
+                base5 = seg5[0].close
+                if base5 and last:
+                    stock_chg_5d = (last / base5 - 1.0) * 100.0
                 c.last_price = last
                 c.ma20 = technical.calc_ma_alignment(klines).ma20
                 sr = technical.calc_support_resistance(klines)
@@ -717,13 +815,41 @@ def _score_accumulation(
         except Exception as e:
             log.debug(f"K线获取失败 {c.code}: {e}")
 
+        # 4c. 软化过滤：筛选周期（5日）内个股走势显著弱于板块（落后超缓冲带）才剔除
+        if _weaker_than_sector(c, stock_chg_5d, sector_chg_map):
+            matched = [s for s in c.hot_sectors if sector_chg_map.get(s) is not None]
+            relative_removed.append(
+                f"{c.name}({stock_chg_5d:+.1f}%≪"
+                + "/".join(f"{s}{sector_chg_map[s]:+.1f}%" for s in matched)
+                + ")"
+            )
+            continue
+
+        # 4d. 估值分位补查（妙想 → AKShare 兜底）+ 流通市值兜底
+        if c.valuation_percentile is None and not c.valuation_status:
+            if mx_client is None and config.mx_apikeys:
+                from app import miaoxiang
+                mx_client = miaoxiang.get_mx_client(config)
+            c.valuation_percentile = _fetch_pe_percentile(config, c.code, c.name, mx_client)
+        if c.circulation_value is None:
+            if mx_client is None and config.mx_apikeys:
+                from app import miaoxiang
+                mx_client = miaoxiang.get_mx_client(config)
+            cv = _fetch_circulation_value(c.code, c.name, mx_client)
+            if cv:
+                c.circulation_value = cv
+            else:
+                log.warning(f"[吸筹评分] {c.name}({c.code}) 流通市值缺失，归一化组件按 0 计")
+
         c.accumulation = analyze_accumulation(
             c.code, c.name, flow, price_chg,
             c.main_net, c.circulation_value, c.valuation_status, c.valuation_percentile,
         )
-        time.sleep(0.7)
+        scored.append(c)
 
-    return kept
+    if relative_removed:
+        log.info(f"过滤[走势弱于板块] {len(relative_removed)} 只: {', '.join(relative_removed)}")
+    return scored
 
 
 # ============================================================
@@ -783,7 +909,7 @@ def _build_stage4_prompt(top: list[ScreeningCandidate], sectors: list[SectorFund
         hot = "、".join(c.hot_sectors) or "—"
         industry = _industry_label(c)
         div = f"{acc.divergence:.2f}" if acc and acc.divergence is not None else "—"
-        pchg = f"{acc.price_change_10d:+.1f}%" if acc and acc.price_change_10d is not None else "—"
+        pchg = f"{acc.price_change_window_pct:+.1f}%" if acc and acc.price_change_window_pct is not None else "—"
         strength = f"{acc.inflow_strength_pct:.2f}%" if acc and acc.inflow_strength_pct is not None else "—"
         val = acc.valuation_status if acc and acc.valuation_status else (
             f"分位{acc.valuation_percentile:.0f}%" if acc and acc.valuation_percentile is not None else "—"
@@ -967,8 +1093,8 @@ def run_smart_screening(config: Config) -> ScreeningReport:
         candidates = _fallback_technical_screen(config)
         log.info(f"技术面兜底: {len(candidates)} 只候选")
 
-    # Stage 2：综合评分（持续低吸 + 估值分位）+ 黑名单过滤
-    candidates = _score_accumulation(config, candidates)
+    # Stage 2：综合评分（持续低吸 + 估值分位）+ 黑名单过滤 + 走势强于板块过滤
+    candidates = _score_accumulation(config, candidates, acc_sectors)
     candidates = _finalize_ranking(candidates)
     report.candidates = candidates
     log.info(f"Stage 2 评分完成: {len(candidates)} 只（已过滤黑名单/ST/次新股）")
