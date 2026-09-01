@@ -81,6 +81,7 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}8{Color.RESET}. ETF Bottom Reversal Screen (ETF底部反转)")
     print(f"  {Color.CYAN}9{Color.RESET}. Stock Bottom Reversal Screen (A股底部反转)")
     print(f"  {Color.CYAN}S{Color.RESET}. Smart Screening (智能选股·热点板块低位吸筹)")
+    print(f"  {Color.CYAN}G{Color.RESET}. Strong-Flow Screening (资金强势选股·热门板块资金流入前N%)")
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
     print(f"  {Color.CYAN}W{Color.RESET}. Weekly Review (周报·持仓+自选)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
@@ -89,10 +90,10 @@ def _show_menu() -> str:
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M/S/W]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W"):
+            choice = input(f" Enter option [0-9/D/M/S/W/G]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S or W{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W or G{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -1369,6 +1370,37 @@ def main() -> None:
             except Exception as e:
                 log.error(f"智能选股失败: {e}")
                 print(f"{Color.RED}❌ 智能选股失败: {e}{Color.RESET}")
+        elif choice == "G":
+            log.info("Starting strong-flow screening...")
+            print(f"\n{Color.BOLD}{Color.CYAN}🚀 资金强势选股（热门板块 · 资金流入前N%）{Color.RESET}")
+            print(f"{Color.DIM}正在采集板块资金流并逐股深查（约需 1-3 分钟），请耐心等待...{Color.RESET}")
+            try:
+                from app.strong_screener import run_strong_screening
+                import time as _time
+                _start = _time.time()
+                report = run_strong_screening(config)
+                elapsed = _time.time() - _start
+
+                print(f"\n{Color.GREEN}✅ 资金强势选股完成 ({elapsed:.0f}秒){Color.RESET}")
+                if report.hot_sectors:
+                    print(f"   {Color.CYAN}🔥 热门板块: {'、'.join(s.name for s in report.hot_sectors)}{Color.RESET}")
+                print(f"   {Color.DIM}候选标的: {len(report.candidates)} 只{Color.RESET}")
+                if report.candidates:
+                    print(f"\n{Color.BOLD}📈 候选标的（按综合评分排序）:{Color.RESET}")
+                    for c in report.candidates[:10]:
+                        strength = f"{c.main_net/c.float_mcap*100:.2f}%" if c.main_net and c.float_mcap else "—"
+                        net = f"{c.main_net/1e8:+.2f}亿" if c.main_net else "—"
+                        print(f"  {Color.BOLD}{c.name}({c.code}){Color.RESET} [{c.sector}] "
+                              f"评分 {c.score:.1f} | 占流通 {strength} | 净流入 {net}")
+                if report.llm_analysis:
+                    print(f"\n{Color.BOLD}{Color.PURPLE}🤖 AI 综合评价:{Color.RESET}")
+                    print(report.llm_analysis)
+                if report.error:
+                    print(f"  {Color.YELLOW}⚠️ {report.error}{Color.RESET}")
+                print(f"   {Color.DIM}完整报告已保存至 strong_screening/ 目录" + ("并推送微信" if config.push_enabled else "") + f"{Color.RESET}")
+            except Exception as e:
+                log.error(f"资金强势选股失败: {e}")
+                print(f"{Color.RED}❌ 资金强势选股失败: {e}{Color.RESET}")
         elif choice == "D":
             log.info("Starting dragon tiger deep analysis...")
             print(f"\n{Color.BOLD}{Color.RED}🐉 龙虎榜深度分析{Color.RESET}")

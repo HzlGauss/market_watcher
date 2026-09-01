@@ -37,7 +37,8 @@ def setup_logger(
         return logger  # 避免重复配置
 
     logger.setLevel(level)
-    
+    logger.propagate = False  # 已有独立 handler，避免与 root/basicConfig 重复打印
+
     # 控制台处理器
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(

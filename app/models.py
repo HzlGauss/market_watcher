@@ -442,12 +442,14 @@ class SectorFundFlow:
     """板块资金流排名快照（东财数据中心-资金流向-板块资金流）
 
     Attributes:
+        code: 板块代码（如 BK0477，用于查询板块成分股）
         name: 板块名称（如 "半导体"）
         change_pct: 涨跌幅（%）
         main_net: 主力净流入（元）
         main_pct: 主力净流入净占比（%）
         top_stock: 主力净流入最大股名称
     """
+    code: str = ""
     name: str = ""
     change_pct: Optional[float] = None
     main_net: Optional[float] = None
@@ -862,9 +864,8 @@ class AccumulationScore:
         inflow_days: 窗口内主力净流入天数
         consecutive_days: 最近连续主力净流入天数
         total_net: 窗口累计主力净流入额（元），缺省回退当日口径
-        price_change_10d: 窗口股价涨跌幅（%），用于算背离度
+        price_change_window_pct: 窗口股价涨跌幅（%），用于算背离度
         divergence: 背离度（0-1），资金净流入 + 股价滞涨 → 越高越背离
-        large_ratio_rising: 大单+超大单占比近 5 日是否较前 5 日上升（机构/大户吸筹）
         inflow_strength_pct: 主力净流入占流通市值比例（%）
         valuation_status: 估值状态（估值较低/适中/较高，妙想分类）
         valuation_percentile: PE-TTM 历史百分位（0-100，越小越便宜）
@@ -877,9 +878,8 @@ class AccumulationScore:
     inflow_days: int = 0
     consecutive_days: int = 0
     total_net: Optional[float] = None
-    price_change_10d: Optional[float] = None
+    price_change_window_pct: Optional[float] = None
     divergence: Optional[float] = None
-    large_ratio_rising: bool = False
     inflow_strength_pct: Optional[float] = None
     valuation_status: str = ""
     valuation_percentile: Optional[float] = None
@@ -982,6 +982,103 @@ class ScreeningReport:
     candidates: list[ScreeningCandidate] = field(default_factory=list)
     llm_analysis: str = ""
     degraded: bool = False
+    error: str = ""
+
+
+@dataclass
+class StrongCandidate:
+    """资金强势选股候选（热门板块内资金流入前 N% 的强势标的）
+
+    与 ScreeningCandidate（低位埋伏低吸）思路相反：偏向「资金已大幅流入」的强势股，
+    逐股采集资金面/量能/股价/估值/业绩/资讯后交 LLM 综合评价。
+
+    Attributes:
+        code: 股票代码
+        name: 股票名称
+        market: 市场标识（SH/SZ）
+        sector: 所属热门板块名
+        sector_main_net: 所属板块主力净流入（元）
+        sector_change_pct: 所属板块筛选周期涨跌幅（%，用于「个股走势强于板块」过滤）
+        industry: 东财行业分类（黑名单过滤 + 报告展示用）
+        concept: 概念题材（黑名单概念过滤用，通常为空）
+        price: 现价（东财 clist f2）
+        change_pct: 当日涨跌幅（%）
+        turnover_rate: 换手率（%）
+        vol_ratio: 量比
+        amount: 成交额（元）
+        total_mcap: 总市值（元）
+        float_mcap: 流通市值（元）
+        pe: 市盈率（动态 PE）
+        pb: 市净率
+        main_net: 板块内资金流入排名用主力净流入（元，周期口径）
+        last_price: K线末尾收盘价
+        ma20: 20日均线
+        support: 支撑位
+        resistance: 压力位
+        price_change_pct: 窗口股价涨跌幅（%）
+        financial_text: 业绩/估值结构化文本（妙想 query_structured 结果）
+        news_text: 近期资讯文本（妙想 fin_search 结果）
+        business_text: 主营业务/主营构成文本（妙想 query 结果，护城河/未来发展的基础）
+        report_text: 机构研报评级摘要（妙想 fin_search_structured 的 REPORT，上下空间/权威机构观点）
+        volatility: 年化波动率（%，由 K 线算得，量化弹性大小）
+        moat: LLM 判断的护城河
+        risk: LLM 判断的风险点
+        advice: LLM 操作建议
+        score: 综合评分（可选，供展示排序）
+        rank: 排名
+        grade: LLM 评级（强关注/关注/观望/回避）
+    """
+    code: str = ""
+    name: str = ""
+    market: str = ""
+    sector: str = ""
+    sector_main_net: Optional[float] = None
+    sector_change_pct: Optional[float] = None
+    industry: str = ""
+    concept: str = ""
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    turnover_rate: Optional[float] = None
+    vol_ratio: Optional[float] = None
+    amount: Optional[float] = None
+    total_mcap: Optional[float] = None
+    float_mcap: Optional[float] = None
+    pe: Optional[float] = None
+    pb: Optional[float] = None
+    main_net: Optional[float] = None
+    last_price: Optional[float] = None
+    ma20: Optional[float] = None
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    price_change_pct: Optional[float] = None
+    financial_text: str = ""
+    news_text: str = ""
+    business_text: str = ""
+    report_text: str = ""
+    volatility: Optional[float] = None
+    moat: str = ""
+    risk: str = ""
+    advice: str = ""
+    score: float = 0.0
+    rank: int = 0
+    grade: str = ""
+
+
+@dataclass
+class StrongScreeningReport:
+    """资金强势选股最终报告
+
+    Attributes:
+        date: 报告日期
+        hot_sectors: 选中的热门板块（含净流入/代码）
+        candidates: 候选列表（已按综合评分排序、过滤黑名单）
+        llm_analysis: LLM 综合评价
+        error: 错误信息（若有）
+    """
+    date: str = ""
+    hot_sectors: list[SectorFundFlow] = field(default_factory=list)
+    candidates: list[StrongCandidate] = field(default_factory=list)
+    llm_analysis: str = ""
     error: str = ""
 
 

@@ -75,6 +75,7 @@ state/*.json
 monitoring_briefs/*.md
 investment_reports/*.md
 smart_screening/*.md
+strong_screening/*.md
 analysis_reports/*.md
 *.log
 

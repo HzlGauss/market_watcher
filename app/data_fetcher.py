@@ -1684,6 +1684,7 @@ def fetch_sector_fund_flow_rank(
         if not name:
             continue
         flows.append(SectorFundFlow(
+            code=str(item.get("f12", "") or "").strip(),
             name=name,
             change_pct=_safe_float(item.get(change_key)),
             main_net=_safe_float(item.get(net_key)),
@@ -1692,6 +1693,56 @@ def fetch_sector_fund_flow_rank(
         ))
     flows.sort(key=lambda s: (s.main_net or 0.0), reverse=True)
     return flows
+
+
+# 个股主力净流入字段（东财 clist）：今日 f62 / 5日 f164 / 10日 f174
+_STOCK_FLOW_NET = {"今日": "f62", "5日": "f164", "10日": "f174"}
+# 个股 clist 字段：代码/名称/现价/涨跌幅/成交额/换手率/量比/PE动/PB/总市值/流通市值
+_STOCK_FLOW_FIELDS = "f12,f14,f2,f3,f6,f8,f10,f9,f23,f20,f21"
+
+
+def fetch_board_constituent_flow(board_code: str, indicator: str = "10日") -> list[dict]:
+    """获取板块成分股按主力净流入降序的列表（东财 clist b:板块代码）
+
+    用于「资金强势选股」：在热门板块内按主力净流入取前 N% 个股。
+
+    Args:
+        board_code: 板块代码（如 BK0477，来自 SectorFundFlow.code）
+        indicator: 回看周期 {"今日", "5日", "10日"}，默认 10日
+
+    Returns:
+        dict 列表（按主力净流入降序），每项含：
+            code, name, price, change_pct, amount, turnover_rate, vol_ratio,
+            pe, pb, total_mcap, float_mcap, main_net
+        失败/无数据返回空列表
+    """
+    net_key = _STOCK_FLOW_NET.get(indicator, "f174")
+    fields = _STOCK_FLOW_FIELDS + "," + net_key
+    items = _fetch_em_clist(fs=f"b:{board_code}", fields=fields, fid=net_key, max_pages=8)
+    if not items:
+        return []
+
+    rows: list[dict] = []
+    for it in items:
+        code = str(it.get("f12", "") or "").strip()
+        if not code:
+            continue
+        rows.append({
+            "code": code,
+            "name": str(it.get("f14", "") or "").strip(),
+            "price": _safe_float(it.get("f2")),
+            "change_pct": _safe_float(it.get("f3")),
+            "amount": _safe_float(it.get("f6")),
+            "turnover_rate": _safe_float(it.get("f8")),
+            "vol_ratio": _safe_float(it.get("f10")),
+            "pe": _safe_float(it.get("f9")),
+            "pb": _safe_float(it.get("f23")),
+            "total_mcap": _safe_float(it.get("f20")),
+            "float_mcap": _safe_float(it.get("f21")),
+            "main_net": _safe_float(it.get(net_key)),
+        })
+    rows.sort(key=lambda r: (r["main_net"] or 0.0), reverse=True)
+    return rows
 
 
 def fetch_major_indices() -> list[Quote]:
