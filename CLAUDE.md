@@ -39,6 +39,21 @@ py .claude/skills/sector-flow/query_sector_flow.py [周期] [板块类型]
 
 # Intraday decision (盘中决策：仓位 + 做T挂单)
 py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]
+
+# Search financial news/announcements/reports (资讯/新闻/公告/研报搜索)
+py .claude/skills/news-search/search_news.py <关键词> [小时]
+
+# Natural-language financial data query (自然语言金融数据问答)
+py .claude/skills/financial-query/query_finance.py <自然语言问题>
+
+# Lightweight natural-language stock screening (轻量智能选股)
+py .claude/skills/stock-screen/screen_stock.py <自然语言条件> [数量]
+
+# Mock portfolio management (模拟盘：持仓/资金/委托 + 买卖/撤单)
+py .claude/skills/mock-portfolio/mock_portfolio.py [买入|卖出|撤单|持仓] [参数]
+
+# Analyze an open-end mutual fund (主动基金诊基：净值绩效 + 基准 + 评级/持仓/经理/规模)
+py .claude/skills/fund-analysis/analyze_fund.py <代码> [名称]
 ```
 
 ## Skills
@@ -48,6 +63,11 @@ py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]
 - **`etf-grid`** — ETF 网格交易分析：拉取 ETF 实时行情 + 日K线，诊断是否箱体震荡、是否适合自动网格，并给出网格区间/间距/格数/底仓/止损。用户问「某 ETF 值不值得买」「能不能网格」「网格怎么设」「是否箱体震荡」时使用。详见 `.claude/skills/etf-grid/SKILL.md`。
 - **`sector-flow`** — 查询 A 股行业/概念/地域板块资金流排名（今日/5日/10日主力净流入，东方财富数据中心直连，无需妙想/`.env`）。用户问「各行业板块资金流向」「哪些板块主力流入最多」「板块资金排名」时使用。详见 `.claude/skills/sector-flow/SKILL.md`。
 - **`intraday-signal`** — 盘中决策：输入单个标的（个股/ETF），拉实时快照 + 当日资金流 + 近N日K线趋势 + 近5日资金流 + 5分钟K线支撑压力，再由 AI 判断今天建仓/加仓/减仓/清仓/不动，以及是否适合做T、买卖挂单价。用户问「今天该买还是卖」「要不要加仓/减仓」「能不能做T」「做T挂多少钱」时使用。核心功能不依赖 `MX_APIKEY`。详见 `.claude/skills/intraday-signal/SKILL.md`。
+- **`news-search`** — 财经资讯/新闻/公告/研报搜索：输入自然语言关键词，按类型分组返回（研报/公告/新闻，含评级/机构/关联证券）。用户问「XX 有什么新闻」「搜一下 XX 的消息」「XX 板块有什么利好/利空」「XX 最新研报/公告/减持增持」时使用。详见 `.claude/skills/news-search/SKILL.md`。
+- **`financial-query`** — 自然语言金融数据问答：任意问句查行情/财务/资金流/筹码/估值分位/分红，返回结构化表格。用户问「查 XX 的市盈率/PE 历史分位」「XX 的 ROE/毛利率/负债率」「XX 的分红/股息率」「XX 近5日主力资金」时使用。详见 `.claude/skills/financial-query/SKILL.md`。
+- **`stock-screen`** — 轻量智能选股：一句式自然语言选股条件 → 结构化候选列表。用户问「帮我选股」「找满足 XX 条件的股票」「筛选连续主力净流入/低估值/放量突破」时使用。与 smart/strong 重管线不同，仅即时查询。详见 `.claude/skills/stock-screen/SKILL.md`。
+- **`mock-portfolio`** — 妙想模拟盘管理：查模拟持仓/资金/委托，模拟买卖下单、撤单。用户问「查我的模拟盘/模拟组合」「模拟盘买入/卖出 XX」「模拟盘撤单」时使用。需先绑定妙想模拟账户。详见 `.claude/skills/mock-portfolio/SKILL.md`。
+- **`fund-analysis`** — 主动基金诊基：输入场外开放式基金代码，算净值绩效（年化收益/夏普/最大回撤等）+ 业绩基准对比（Alpha/Beta），再用妙想查权威评级/持仓/经理/规模，AI 生成评价与买卖建议。用户问「分析/诊断某只基金」「这只基金怎么样/值不值得买」「基金评级/持仓/经理」时使用。ETF 走 `etf-grid`/`stock-analysis`。详见 `.claude/skills/fund-analysis/SKILL.md`。
 
 ## Configuration
 
