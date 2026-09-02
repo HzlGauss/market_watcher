@@ -304,7 +304,7 @@ def _print_t0_measure(code: str, market: str, q: Quote):
     regime = detect_market_regime(tech, price, sr.atr)
     print(f"  市场状态(5min): {regime.regime}（置信度 {regime.confidence}）")
 
-    # ---- 做 T 可行性硬门槛（稳健优先：默认不做，全部满足才给挂单价）----
+    # ---- 做 T 可行性硬门槛（稳健优先：默认不建议，全部满足才建议操作）----
     reasons = []
     # 1. 单边行情不做 T（趋势上涨/趋势下跌）
     if regime.regime in ("趋势上涨", "趋势下跌"):
@@ -322,14 +322,14 @@ def _print_t0_measure(code: str, market: str, q: Quote):
         if width_pct < 0.8:
             reasons.append(f"支撑压力区间过窄({_f(width_pct, 2)}% < 0.8%)，无利润空间")
 
-    if reasons:
-        print(f"  ❌ 不适合做 T：{'；'.join(reasons)}")
-        print(f"  → 不给出做 T 挂单价（稳健优先，宁可错过不可做错）")
-        return
-
+    # 无条件给出参考挂单价（技术位参考；是否建议操作由下方判定决定）
     suggested = _compute_suggested_prices(sr, price, q)
-    print(f"  ✅ 适合做 T（震荡 + 振幅/区间充足）")
-    print(f"  做 T 建议买单: {_f(suggested['buy_price'], 3)}   卖单: {_f(suggested['sell_price'], 3)}")
+    if reasons:
+        print(f"  ❌ 今日不适合 T+0 操作：{'；'.join(reasons)}")
+        print(f"  参考挂单价（仅技术位参考，不建议下单）: 买入 {_f(suggested['buy_price'], 3)}   卖出 {_f(suggested['sell_price'], 3)}")
+    else:
+        print(f"  ✅ 适合做 T（震荡 + 振幅/区间充足）")
+        print(f"  做 T 建议买单: {_f(suggested['buy_price'], 3)}   卖单: {_f(suggested['sell_price'], 3)}")
 
 
 # ---------------------------------------------------------------- 抄底信号
