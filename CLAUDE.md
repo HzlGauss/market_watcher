@@ -57,6 +57,12 @@ py .claude/skills/fund-analysis/analyze_fund.py <代码> [名称]
 
 # IPO subscription analysis (打新申购：新股/新债破发概率 + 申购建议)
 py .claude/skills/ipo-analysis/analyze_ipo.py <代码> [名称]
+
+# Dragon-pullback detection (龙回头：单股龙头缩量回调二次启动判断)
+py .claude/skills/dragon-pullback/analyze_dragon_pullback.py <代码> [名称] [天数]
+
+# Dragon-pullback batch scan (龙回头批量扫描：从涨停池找候选)
+py .claude/skills/dragon-pullback/scan_dragon_pullback.py [回溯天数] [输出数量]
 ```
 
 ## Skills
@@ -72,6 +78,7 @@ py .claude/skills/ipo-analysis/analyze_ipo.py <代码> [名称]
 - **`mock-portfolio`** — 妙想模拟盘管理：查模拟持仓/资金/委托，模拟买卖下单、撤单。用户问「查我的模拟盘/模拟组合」「模拟盘买入/卖出 XX」「模拟盘撤单」时使用。需先绑定妙想模拟账户。详见 `.claude/skills/mock-portfolio/SKILL.md`。
 - **`fund-analysis`** — 主动基金诊基：输入场外开放式基金代码，算净值绩效（年化收益/夏普/最大回撤等）+ 业绩基准对比（Alpha/Beta），再用妙想查权威评级/持仓/经理/规模，AI 生成评价与买卖建议。用户问「分析/诊断某只基金」「这只基金怎么样/值不值得买」「基金评级/持仓/经理」时使用。ETF 走 `etf-grid`/`stock-analysis`。详见 `.claude/skills/fund-analysis/SKILL.md`。
 - **`ipo-analysis`** — 打新申购分析：输入新股或新债代码，拉发行信息（新股：发行市盈率 vs 行业市盈率/板块；新债：转股价值/转股溢价率/信用评级/发行规模），规则引擎算破发概率区间 + 申购结论 + 综合评分（0~100），结合公司/正股质地与市场情绪给「建议/谨慎/放弃申购」结论。用户问「XX 能不能打新」「XX 值不值得申购」「XX 破发概率多大」「近期有什么可以打新」时使用。数据源 akshare（`stock_ipo_ths`/`bond_zh_cov`），需 `pip install akshare`。详见 `.claude/skills/ipo-analysis/SKILL.md`。
+- **`dragon-pullback`** — 龙回头检测：输入单只股票，按「龙头确认→首波强度→缩量浅回调不破位→企稳→二次启动」六层逻辑，判断是否构成龙回头形态、能否参与、买点与止损；另有批量扫描版从涨停股池筛候选。用户问「XX 是不是龙回头」「能不能抓龙回头」「龙头回调到位没」「XX 缩量回调能买吗」「连板后回踩能不能上」「近期哪些票在龙回头」时使用。核心不依赖 `MX_APIKEY`（龙虎榜/涨停池需 `pip install akshare`）。详见 `.claude/skills/dragon-pullback/SKILL.md`。
 
 ## Configuration
 
