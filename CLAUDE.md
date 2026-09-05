@@ -63,6 +63,15 @@ py .claude/skills/dragon-pullback/analyze_dragon_pullback.py <代码> [名称] [
 
 # Dragon-pullback batch scan (龙回头批量扫描：从涨停池找候选)
 py .claude/skills/dragon-pullback/scan_dragon_pullback.py [回溯天数] [输出数量]
+
+# Golden-pit detection (黄金坑：单股白马/蓝筹深坑缩量企稳判断)
+py .claude/skills/golden-pit/analyze_golden_pit.py <代码> [名称] [天数]
+
+# Golden-pit batch scan (黄金坑批量扫描：从白马蓝筹指数成分股找候选)
+py .claude/skills/golden-pit/scan_golden_pit.py [输出数量]
+
+# Market-heat scan (市场热度雷达：涨幅榜/跌幅榜/龙虎榜 → 热点与避坑方向)
+py .claude/skills/market-heat/scan_market_heat.py [涨幅榜数量] [跌幅榜数量]
 ```
 
 ## Skills
@@ -79,6 +88,8 @@ py .claude/skills/dragon-pullback/scan_dragon_pullback.py [回溯天数] [输出
 - **`fund-analysis`** — 主动基金诊基：输入场外开放式基金代码，算净值绩效（年化收益/夏普/最大回撤等）+ 业绩基准对比（Alpha/Beta），再用妙想查权威评级/持仓/经理/规模，AI 生成评价与买卖建议。用户问「分析/诊断某只基金」「这只基金怎么样/值不值得买」「基金评级/持仓/经理」时使用。ETF 走 `etf-grid`/`stock-analysis`。详见 `.claude/skills/fund-analysis/SKILL.md`。
 - **`ipo-analysis`** — 打新申购分析：输入新股或新债代码，拉发行信息（新股：发行市盈率 vs 行业市盈率/板块；新债：转股价值/转股溢价率/信用评级/发行规模），规则引擎算破发概率区间 + 申购结论 + 综合评分（0~100），结合公司/正股质地与市场情绪给「建议/谨慎/放弃申购」结论。用户问「XX 能不能打新」「XX 值不值得申购」「XX 破发概率多大」「近期有什么可以打新」时使用。数据源 akshare（`stock_ipo_ths`/`bond_zh_cov`），需 `pip install akshare`。详见 `.claude/skills/ipo-analysis/SKILL.md`。
 - **`dragon-pullback`** — 龙回头检测：输入单只股票，按「龙头确认→首波强度→缩量浅回调不破位→企稳→二次启动」六层逻辑，判断是否构成龙回头形态、能否参与、买点与止损；另有批量扫描版从涨停股池筛候选。用户问「XX 是不是龙回头」「能不能抓龙回头」「龙头回调到位没」「XX 缩量回调能买吗」「连板后回踩能不能上」「近期哪些票在龙回头」时使用。核心不依赖 `MX_APIKEY`（龙虎榜/涨停池需 `pip install akshare`）。详见 `.claude/skills/dragon-pullback/SKILL.md`。
+- **`golden-pit`** — 黄金坑检测：输入单只白马/蓝筹股，按「白马成色→深坑→缩量→估值低位→企稳→未破长期趋势」六层逻辑，判断是否构成黄金坑、能否参与、买点与止损；另有批量扫描版从沪深300/上证50/中证红利成分股筛候选。用户问「XX 是不是黄金坑」「有没有被错杀的白马/蓝筹」「XX 跌到位了没、能不能抄底」「哪些白马股在挖坑」「XX 深度回调能不能买」时使用。核心不依赖 `MX_APIKEY`（指数成分/估值基本面需 `pip install akshare` + `MX_APIKEY`）。详见 `.claude/skills/golden-pit/SKILL.md`。
+- **`market-heat`** — 市场热度雷达：拉取最近交易日涨幅榜、跌幅榜、龙虎榜，聚合行业与概念板块资金流，分析当前热点方向（资金在买什么板块）和避坑方向（资金在撤离什么板块），并给出市场情绪周期判断。用户问「最近热点是什么」「哪些板块在涨/在跌」「龙虎榜资金动向」「现在该关注/回避什么方向」「市场情绪怎么样」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-heat/SKILL.md`。
 
 ## Configuration
 
