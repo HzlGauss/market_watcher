@@ -247,7 +247,12 @@ def calc_sma(values: list[float], period: int) -> list[float]:
         return []
     sma_vals: list[Optional[float]] = [None] * (period - 1)
     for i in range(period - 1, len(values)):
-        sma_vals.append(sum(values[i - period + 1:i + 1]) / period)
+        window = [v for v in values[i - period + 1:i + 1] if v is not None]
+        if len(window) < period:
+            # 窗口内混入 None（如停牌缺 K），无法算满周期均线，置 None 而非抛异常
+            sma_vals.append(None)
+        else:
+            sma_vals.append(sum(window) / period)
     return sma_vals  # type: ignore[return-value]
 
 
@@ -2266,17 +2271,18 @@ def calc_composite_score(tech: TechnicalSummary, price: float, flow_pct: Optiona
         score += v
     score = max(0, min(100, score))
 
-    # 回测优化：极多(≥75)均收益1.06% vs 偏多(55-70)仅0.31%
+    # 回测校准（中证1000 × 12 日）：本评分是 5~10 日动量信号，20日档反向——
+    # ≥75 反而是最差档（-1.1%）、<35 反而 +1.2%，故标签只描述短线动量强度、不预测方向。
     if score >= 75:
-        label = "🟢 强烈看多"
+        label = "🟢 短线强势"
     elif score >= 60:
-        label = "🟢 偏多"
+        label = "🟢 短线偏强"
     elif score >= 45:
         label = "⚪ 中性"
     elif score >= 35:
-        label = "🟡 偏空"
+        label = "🟡 短线偏弱"
     else:
-        label = "🔴 强烈看空"
+        label = "🔴 短线弱势"
 
     return {"score": score, "label": label, "breakdown": breakdown, "signals": signals}
 

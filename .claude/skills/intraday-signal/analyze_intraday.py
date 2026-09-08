@@ -399,7 +399,7 @@ def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
                          klines: list[KlineData] | None):
     print()
     print("=" * 72)
-    print("【6. 抄底信号测算（超跌 + 背离 + 止跌确认）】")
+    print("【6. 抄底信号测算（深度回撤 + 止跌确认）】")
     print("=" * 72)
     if not klines:
         print("  ⚠️ 无日 K 线数据，无法测算抄底信号")
@@ -411,23 +411,32 @@ def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
 
     tech = get_technical_summary(q, klines)
     is_etf = code.startswith(("51", "56", "58", "15", "16", "18"))
-    deep_drop_threshold = -10.0 if is_etf else -15.0
+    deep_drop_threshold = -10.0 if is_etf else -15.0      # 深度回撤门槛
 
     pct20 = (closes[-1] - closes[-20]) / closes[-20] * 100
     pct5 = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
 
-    # ---- 超跌类 ----
+    # ---- 核心门槛：深度回撤（近20日跌幅，唯一被回测证实的均值回归 base）----
+    # 回测结论（中证1000 × 12 日，7692 样本）：深跌 20日 +1.2%（基准 +0.5%），
+    # 但「更深≠更好」——跌超 -20% 的票 20日 收益 0%、胜率 50%，无额外 edge，故不设高确信档。
     oversold = (tech.rsi is not None and tech.rsi < 30) or (tech.kdj_j is not None and tech.kdj_j < 0)
     deep_drop = pct20 <= deep_drop_threshold
 
-    # ---- 确认类 ----
-    div, div_detail = _detect_bottom_divergence(closes)
+    # ---- 正向确认：止跌 K 线形态（唯一被回测证实能显著增益的确认）----
+    # 回测结论：深跌 + 止跌形态 → 20日 +10.2%、86.7% 胜率（vs 深跌单独 +1.2%），
+    # 与 left-side 独立回测「止跌形态是最强单信号 fut20 +4.8%/66%」交叉印证。
     pattern, pattern_detail = _detect_reversal_pattern(klines)
+
+    # ---- 仅参考项（回测显示叠加在深跌上无增量，不改变结论）----
+    # 底背离：深跌+底背离 20日 +0.7%（中性）；技术超卖：深跌+超卖 +0.1%（无增量）。
+    div, div_detail = _detect_bottom_divergence(closes)
     intraday_flow_div = (q.change_pct is not None and q.change_pct < 0
                          and ff is not None and ff.is_valid
                          and ff.main_net is not None and ff.main_net > 0)
+    # 5日主力累计净流入需达到一定量级才算「吸筹」，避免 +0.0x 亿的噪声误判
     flow_div = intraday_flow_div or (pct5 is not None and pct5 < 0
-                                     and flow_sum is not None and flow_sum > 0)
+                                     and flow_sum is not None and flow_sum > 5e7)
+    # 靠近强支撑不作加分（回测：深跌+靠近支撑 20日 -2.2%，小盘股「支撑」更像会被跌穿的磁铁）
     near_support = False
     if tech.support and q.price:
         if tech.atr and tech.atr > 0:
@@ -439,27 +448,23 @@ def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
         return "✅" if v else "❌"
 
     print(f"  近20日跌幅 {_f(pct20, 2)}%  近5日跌幅 {_f(pct5, 2)}%  现价 {_f(q.price, 3)}")
-    print(f"  超卖(RSI<30/KDJ J<0): {_chk(oversold)}  RSI {_f(tech.rsi, 0)}  KDJ J {_f(tech.kdj_j, 0)}")
     print(f"  深度回撤(≤{deep_drop_threshold:.0f}%{'ETF' if is_etf else '个股'}): {_chk(deep_drop)}")
-    print(f"  底背离(MACD): {_chk(div)}  {div_detail}")
-    print(f"  止跌形态: {_chk(pattern)}  {pattern_detail}")
+    print(f"  止跌K线形态(正向确认): {_chk(pattern)}  {pattern_detail}")
+    print(f"  底背离(MACD, 仅参考): {_chk(div)}  {div_detail}")
+    print(f"  技术超卖(RSI<30/KDJ J<0, 仅参考): {_chk(oversold)}  RSI {_f(tech.rsi, 0)}  KDJ J {_f(tech.kdj_j, 0)}")
     flow_txt = f"近5日主力 {flow_sum / 1e8:+.2f} 亿" if flow_sum is not None else "无数据"
-    print(f"  资金背离吸筹(价跌主力流入): {_chk(flow_div)}  {flow_txt}")
-    print(f"  靠近强支撑(支撑 {_f(tech.support, 3)}): {_chk(near_support)}")
+    print(f"  资金背离吸筹(价跌主力流入, 仅参考): {_chk(flow_div)}  {flow_txt}")
+    print(f"  靠近强支撑(支撑 {_f(tech.support, 3)}, 不作加分): {_chk(near_support)}")
 
-    # ---- 聚合判定（稳健优先）----
-    has_oversold = oversold or deep_drop
-    # 主动反转确认：底背离 / 止跌K线形态 / 资金背离吸筹
-    # （靠近强支撑仅作加分，不算独立确认——超跌本就近支撑，避免误判「还在跌」为「可抄底」）
-    confirm_count = sum(1 for v in (div, pattern, flow_div) if v)
-    if not has_oversold:
-        verdict = "❌ 无抄底信号（未超跌/跌得不够，仍在半山腰），不接飞刀"
-    elif confirm_count == 0:
-        verdict = "⚠️ 超跌但未企稳（无底背离/止跌形态/资金吸筹），左侧观望，等止跌信号"
+    # ---- 聚合判定（回测校准：深度回撤为核心，止跌形态为正向确认）----
+    if not deep_drop:
+        verdict = "❌ 无抄底信号（近20日未深度回撤，仍在半山腰），不接飞刀"
+    elif pattern:
+        verdict = (f"✅ 深度回撤 {pct20:.1f}% + 止跌形态确认，可尝试左侧抄底"
+                   f"（回测20日 +10.2%/86.7% 胜率，设好止损）")
     else:
-        verdict = f"✅ 超跌 + {confirm_count} 项止跌确认，可尝试左侧轻仓抄底（设好止损）"
-        if near_support:
-            verdict += "，且靠近强支撑，胜率加分"
+        verdict = (f"⚠️ 深度回撤 {pct20:.1f}% 但未见止跌形态，可轻仓埋伏，"
+                   f"等止跌K线出现再加（设好止损）")
     print(f"  → 判定: {verdict}")
 
 
@@ -505,7 +510,7 @@ def main():
     # ---- 做 T 测算（5 分钟 K 线）----
     _print_t0_measure(code, market, q)
 
-    # ---- 抄底信号测算（超跌 + 背离 + 止跌确认）----
+    # ---- 抄底信号测算（深度回撤 + 参考确认）----
     _print_bottom_signal(code, market, days, q, ff, flow_sum, klines)
 
     return 0

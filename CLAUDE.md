@@ -78,6 +78,12 @@ py .claude/skills/left-side/scan_left_side.py <板块/行业> [输出数量]
 
 # Right-side scan (右侧选股：板块/行业放量突破候选扫描)
 py .claude/skills/right-side/scan_right_side.py <板块/行业> [输出数量]
+
+# Threshold backtests (阈值历史收益回测：中证1000成分 + 日K线，验证各 skill 打分阈值)
+py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
+py .claude/skills/left-side/backtest_left_side.py [回测日期数]
+py .claude/skills/right-side/backtest_right_side.py [回测日期数]
+py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 ```
 
 ## Skills

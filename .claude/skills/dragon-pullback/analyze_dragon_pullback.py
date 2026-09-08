@@ -24,6 +24,7 @@
 
 输出: 分 6 段——龙头识别 / 首波强度 / 回踩质量 / 企稳信号 / 二次启动确认 / 结论聚合。
 """
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,9 @@ from pathlib import Path
 
 # 禁用 akshare/tqdm 进度条，避免污染 skill 输出
 os.environ.setdefault("TQDM_DISABLE", "1")
+
+# 抑制 app 模块 INFO/WARNING 日志，避免污染数据包输出
+logging.disable(logging.WARNING)
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -133,11 +137,12 @@ def _is_limit_up(pct: float, code: str) -> bool:
     return pct >= _limit_pct(code) * 100 - 0.6
 
 
-def _consecutive_limit_ups(pcts: list[float], code: str) -> int:
-    """连续涨停天数（从最新一根往回数）。"""
+def _consecutive_limit_ups(pcts: list[float], code: str, end_idx: int | None = None) -> int:
+    """连续涨停天数（从 end_idx 往前数；默认从最新一根往回数）。"""
+    end = len(pcts) - 1 if end_idx is None else min(end_idx, len(pcts) - 1)
     n = 0
-    for pct in reversed(pcts):
-        if _is_limit_up(pct, code):
+    for i in range(end, -1, -1):
+        if _is_limit_up(pcts[i], code):
             n += 1
         else:
             break
@@ -226,20 +231,27 @@ def _detect_reversal_pattern(klines: list[KlineData]) -> tuple[bool, str]:
 # ---------------------------------------------------------------- 打印段
 
 def _print_dragon_id(code: str, name: str, board: str, pcts: list[float],
-                     closes: list[float]) -> int:
-    """【1】龙头识别：板块 + 连板高度 + 龙虎榜。返回连板数。"""
+                     closes: list[float], wave: dict | None) -> int:
+    """【1】龙头识别：板块 + 首波连板 + 当前状态 + 龙虎榜。返回首波连板数。"""
     print("=" * 72)
     print(f"【1. 龙头识别】{code} {name}（{board}）")
     print("=" * 72)
     limit = _limit_pct(code) * 100
     print(f"  涨跌停幅度 ±{limit:.0f}%（{board}）")
-    consec = _consecutive_limit_ups(pcts, code)
-    if consec >= 2:
-        print(f"  连板高度: {consec} 连板（{'当前仍在连板' if _is_limit_up(pcts[-1], code) else '已断板'}）")
-    elif consec == 1:
-        print("  涨停: 最近 1 个交易日涨停")
+    # 首波连板 = 在首波顶点往前数连续涨停（龙头成色的关键）。龙回头标的当前已回调，
+    # 若从最新一根往回数会把「连板」漏成 0/1，须定位到首波顶点 hi。
+    wave_consec = _consecutive_limit_ups(pcts, code, wave["hi"]) if wave else 0
+    if wave_consec >= 2:
+        print(f"  首波连板: {wave_consec} 连板（顶点 {wave['high_date']}）")
+    elif wave_consec == 1:
+        print("  首波涨停: 1 个（非连板模式拉升，靠首波涨幅定龙头成色）")
     else:
-        print("  涨停/连板: 无（近期无封板，或非连板模式拉升）")
+        print("  首波涨停/连板: 无（首波非涨停拉升）")
+    cur_consec = _consecutive_limit_ups(pcts, code)
+    if cur_consec >= 1:
+        print(f"  当前状态: {'仍在连板' if cur_consec >= 2 else '最近 1 个交易日涨停'}")
+    else:
+        print("  当前状态: 近期无封板（处于回调/企稳段）")
 
     # 龙虎榜（识别龙头：游资/机构介入、净买、上榜原因）
     print("  龙虎榜:", end=" ")
@@ -256,7 +268,7 @@ def _print_dragon_id(code: str, name: str, board: str, pcts: list[float],
         print(f"✅ 上榜 | 净买 {_fmt_amount(hit.net_buy)} 亿 | 买卖比 {_f(ratio)} | 换手 {_f(hit.turnover_rate, 1)}%")
         if hit.reason:
             print(f"    上榜原因: {hit.reason}")
-    return consec
+    return wave_consec
 
 
 def _print_first_wave(klines: list[KlineData], wave: dict | None):
@@ -326,10 +338,10 @@ def _print_pullback(klines: list[KlineData], wave: dict | None, price: float | N
     if price is not None and rise_pct > 0:
         fib = (wave_high - price) / (wave_high - start_low)  # 现价回撤占首波涨幅比例
         band = ("几乎没回调(<0.2，追高)" if fib < 0.2 else
-                "强势回调(0.2~0.382)" if fib < 0.382 else
-                "标准回调(0.382~0.5，健康买点)" if fib < 0.5 else
-                "偏深回调(0.5~0.618)" if fib < 0.618 else
-                "过深(>0.618，转弱风险大)")
+                "浅回调(0.2~0.382)" if fib < 0.382 else
+                "浅回调(0.382~0.5，回测 fut20 偏弱)" if fib < 0.5 else
+                "中段回调(0.5~0.618，回测最优)" if fib < 0.618 else
+                "深回踩(>0.618，不破起涨平台则支撑强)")
         print(f"  黄金分割位: 现价回撤吃掉首波涨幅的 {fib * 100:.0f}%  →  {band}")
 
     # 缩量判断
@@ -399,13 +411,13 @@ def _print_second_start(klines: list[KlineData], q: Quote, ff: FundFlowDetail | 
     above_ma5 = ma5 is not None and price is not None and price >= ma5
     print(f"  站上 MA5: {'✅' if above_ma5 else '❌'}  （现价 {_f(price)} vs MA5 {_f(ma5)}）")
 
-    # 突破回调区间高点
-    if len(klines) >= 3:
-        recent_highs = [k.high for k in klines[-5:] if k.high is not None]
-        if recent_highs and price is not None:
-            zone_high = max(recent_highs)
+    # 突破回调区间高点（回踩区间 = 今日之前，须排除今日高点，否则现价永远 ≤ 今日高点、信号永不触发）
+    if len(klines) >= 6:
+        zone_highs = [k.high for k in klines[-6:-1] if k.high is not None]
+        if zone_highs and price is not None:
+            zone_high = max(zone_highs)
             broke = price > zone_high and last.close > last.open
-            print(f"  突破回踩区间高点: {'✅' if broke else '❌'}  （现价 {_f(price)} vs 近5日高 {_f(zone_high)}）")
+            print(f"  突破回踩区间高点: {'✅' if broke else '❌'}  （现价 {_f(price)} vs 前5日高 {_f(zone_high)}）")
             if broke:
                 print("  ✅ 放量阳线突破，二次启动确认信号")
 
@@ -451,9 +463,9 @@ def _print_verdict(code: str, name: str, board: str, consec: int, wave: dict | N
     else:
         suo = False
     checks.append(("缩量回调", suo, "回调量 < 首波 0.7 倍"))
-    # 4. 回调未过深（黄金分割 ≤0.618，用现价）
-    shallow = (price is not None and (wave_high - price) <= (wave_high - start_low) * 0.618)
-    checks.append(("回调未过深", shallow, "现价回撤 ≤ 首波涨幅 0.618"))
+    # 4. 回调充分（回测：浅回调 0.382~0.5 追高 fut20 最差；深回踩不破位反而强，破位见 #5）
+    not_chasing = (price is not None and (wave_high - price) >= (wave_high - start_low) * 0.2)
+    checks.append(("回调充分", not_chasing, "现价已回撤 ≥ 首波涨幅 0.2（非追高）"))
     # 回调低点（盘中最低，止损参考）
     pull_low = min([k.low for k in klines[hi + 1:] if k.low is not None], default=None) if in_pullback else None
     # 5. 不破位
@@ -597,7 +609,7 @@ def main():
     wave = _find_first_wave(klines)
 
     # ---- 输出 6 段 ----
-    consec = _print_dragon_id(code, name, board, pcts, closes)
+    consec = _print_dragon_id(code, name, board, pcts, closes, wave)
     _print_first_wave(klines, wave)
     _print_pullback(klines, wave, price, ma5, ma10, ma20)
     _print_stabilize(klines, tech, price, atr)

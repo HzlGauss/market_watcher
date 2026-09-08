@@ -217,20 +217,25 @@ def _score_candidate(code: str, stock: dict, klines: list[KlineData]) -> dict | 
         if vol_ratio < 0.7:
             score += 25
         elif vol_ratio < 0.85:
-            score += 18
+            score += 12
         elif vol_ratio < 1.0:
-            score += 10
+            score += 6
 
-    # 回调位置 25（黄金分割：现价回撤占首波涨幅比例，0.382~0.5 最理想）
+    # 回调位置 25（黄金分割：现价回撤占首波涨幅比例）
+    # 回测结论（中证1000 池 / 8 个历史交易日切片 / 289 候选）：0.382~0.5 的「教科书标准
+    # 回调」实为 fut20 最差（-1.8%、胜率 26.7%），而 0.5~0.618 最优（+6.0%、51.2%）、
+    # ≥0.618 深回踩不破位也强（≥0.8 档胜率 58%）。即「回踩支撑不破 > 浅回调追高」。
     # 注意用现价（收盘价）而非盘中最低，避免盘中插针误判回调深度
     fib = (wave_high - price) / (wave_high - start_low) if price else None
     if fib is not None:
-        if 0.382 <= fib < 0.5:
-            score += 25
-        elif 0.2 <= fib < 0.382 or 0.5 <= fib < 0.618:
-            score += 18
-        else:
-            score += 8   # 几乎没回调（追高）或回调过深（转弱）
+        if 0.5 <= fib < 0.618:
+            score += 25   # 回踩中段支撑不破，洗盘充分（回测最优）
+        elif fib >= 0.618:
+            score += 20   # 深回踩不破起涨平台，二次探底（回测胜率最高）
+        elif fib < 0.382:
+            score += 14   # 浅回调/几乎没回调，追高风险
+        else:  # 0.382 <= fib < 0.5
+            score += 10   # 教科书浅回调，但回测 fut20 最差，降权
 
     # 企稳/二次启动 20
     ma5 = calc_sma(closes, 5)[-1] if len(closes) >= 5 else None
@@ -240,6 +245,14 @@ def _score_candidate(code: str, stock: dict, klines: list[KlineData]) -> dict | 
         last = klines[-1]
         if last.close is not None and last.open is not None and last.close > last.open:
             score += 10  # 缩量小阳，弱企稳
+
+    # 回调天数扣分：3~5 日最佳；拖长则人气散、二次启动持续性弱，逐档扣分
+    if gap > 11:
+        score -= 12
+    elif gap > 8:
+        score -= 8
+    elif gap > 5:
+        score -= 4
 
     retrace = (wave_high - price) / wave_high * 100 if price else None
     return {

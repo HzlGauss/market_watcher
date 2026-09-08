@@ -23,6 +23,7 @@
 
 输出: 分 6 段——白马成色 / 挖坑幅度 / 坑底缩量 / 估值低位 / 企稳反转 / 结论聚合。
 """
+import logging
 import os
 import re
 import sys
@@ -31,6 +32,9 @@ from pathlib import Path
 
 # 禁用 akshare/tqdm 进度条，避免污染 skill 输出
 os.environ.setdefault("TQDM_DISABLE", "1")
+
+# 抑制 app 模块 INFO/WARNING 日志，避免污染数据包输出
+logging.disable(logging.WARNING)
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
 for _stream in (sys.stdout, sys.stderr):

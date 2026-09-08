@@ -6,9 +6,10 @@
 数据源（按优先级）：
 1. 指数成分：akshare ``index_stock_cons``（沪深300/中证500/中证1000/上证50/中证红利 ...）
 2. 板（创业板/科创板/沪深主板/深主板）：东方财富 clist 全市场快照按 ``fs`` 过滤
-3. 行业/概念板块：东方财富 clist 板块列表（``m:90 t:2`` 行业 / ``t:3`` 概念）按名称匹配
+3. 精确关键字优先映射（``KEY_BOARD_PRIORITY``）：白酒/化工/光伏/军工/芯片/有色/医药/新能源
+   → 精确东财板块名（``b:BKxxxx``），避免模糊匹配命中「非白酒」「磷肥及磷化工」等子板块/反义词。
+4. 行业/概念板块：东方财富 clist 板块列表（``m:90 t:2`` 行业 / ``t:3`` 概念）按名称模糊匹配兜底
    → 板块成分（``b:BKxxxx``）。绕开 akshare ``stock_board_industry_*_em`` 的 push2 易断连接口。
-4. 宽泛简称兜底：化工/有色/医药/新能源/军工 → 合并多个细分行业板块
 
 核心不依赖 MX_APIKEY。
 """
@@ -52,13 +53,20 @@ BOARD_FS: dict[str, str] = {
     "北交所": "m:0 t:81 s:2048",
 }
 
-# 宽泛行业简称 → 若干东财行业板块名（合并成一个池）。仅作兜底，精确名优先。
-BROAD_ALIASES: dict[str, list[str]] = {
-    "化工": ["化学制品", "化学原料", "化肥行业", "化学纤维", "塑料制品", "橡胶制品"],
-    "有色": ["有色金属", "贵金属", "能源金属", "小金属"],
-    "医药": ["化学制药", "中药", "生物制品", "医疗器械", "医药商业", "医疗服务"],
+# 精确关键字 → 优先命中的东财板块名（精确匹配，先行业后概念）。
+# 用「精确名」而非模糊匹配，避免「白酒」命中「非白酒」、「化工」命中「磷肥及磷化工」、
+# 「光伏」命中「光伏辅材」、「军工」命中「军工电子Ⅲ」等反义词/子板块误匹配。
+# 值为多个板块名 = 合并成一个池（如新能源）。
+KEY_BOARD_PRIORITY: dict[str, list[str]] = {
+    "半导体": ["半导体"],
+    "芯片": ["半导体"],
+    "化工": ["基础化工"],
+    "白酒": ["白酒Ⅱ"],
+    "光伏": ["光伏设备"],
+    "军工": ["国防军工"],
+    "有色": ["有色金属"],
+    "医药": ["医药生物"],
     "新能源": ["电池", "光伏设备", "风电设备", "电网设备"],
-    "军工": ["航天航空", "船舶制造", "地面兵装"],
 }
 
 
@@ -159,7 +167,10 @@ def _pool_from_board_code(board_code: str, label: str) -> dict[str, dict]:
 
 
 def _match_board(key: str, sector_type: str) -> tuple[str, str] | None:
-    """在板块列表里找最佳匹配：精确 → 双向包含 → 前缀，返回 (board_code, board_name)。"""
+    """在板块列表里找最佳匹配：精确 → 前缀 → 包含，返回 (board_code, board_name)。
+
+    不用双向包含（`name in key`）——那会让「白酒」命中「非白酒」。
+    """
     boards = _list_boards(sector_type)
     if not boards:
         return None
@@ -167,13 +178,13 @@ def _match_board(key: str, sector_type: str) -> tuple[str, str] | None:
     for code, name in boards:
         if name == key:
             return code, name
-    # 双向包含（「化工」→「化工原料/煤化工」，「半导体」→「半导体」）
-    for code, name in boards:
-        if key in name or name in key:
-            return code, name
-    # 前缀
+    # 前缀（「白酒」→「白酒Ⅱ」，但「非白酒」startswith「白酒」为假，不会误命中）
     for code, name in boards:
         if name.startswith(key):
+            return code, name
+    # 包含（最后兜底：「磷肥及磷化工」含「化工」）
+    for code, name in boards:
+        if key in name:
             return code, name
     return None
 
@@ -190,16 +201,23 @@ def _pool_from_board_name(key: str) -> dict[str, dict]:
     return {}
 
 
-def _pool_from_broad_alias(key: str) -> dict[str, dict]:
-    """宽泛简称（化工/有色/...）→ 合并多个细分行业板块成分。"""
-    labels = BROAD_ALIASES.get(key)
-    if not labels:
+def _pool_from_priority(key: str) -> dict[str, dict]:
+    """精确关键字 → 东财板块成分（按 KEY_BOARD_PRIORITY 精确板块名匹配，可合并多板块）。"""
+    names = KEY_BOARD_PRIORITY.get(key)
+    if not names:
         return {}
+    # 一次拉全 行业+概念 板块列表，构建 名→代码 索引（避免逐名重复拉列表）
+    name_to_code: dict[str, str] = {}
+    for sector_type in ("2", "3"):
+        for code, name in _list_boards(sector_type):
+            name_to_code.setdefault(name, code)
     pool: dict[str, dict] = {}
-    for label in labels:
-        sub = _pool_from_board_name(label)
-        if sub:
-            pool.update(sub)
+    for name in names:
+        code = name_to_code.get(name)
+        if code:
+            sub = _pool_from_board_code(code, name)
+            if sub:
+                pool.update(sub)
     return pool
 
 
@@ -233,13 +251,13 @@ def resolve_board_pool(query: str) -> dict[str, dict]:
         if key == bname:
             return _filter_scannable(_pool_from_board(fs, bname))
 
-    # 3) 行业/概念板块名（精确→包含→前缀）
-    pool = _pool_from_board_name(key)
+    # 3) 精确关键字优先映射（白酒/化工/光伏/军工/芯片/有色/医药/新能源… 精确板块名）
+    pool = _pool_from_priority(key)
     if pool:
         return _filter_scannable(pool)
 
-    # 4) 宽泛简称兜底（化工/有色/医药/新能源/军工）
-    pool = _pool_from_broad_alias(key)
+    # 4) 行业/概念板块名模糊匹配（精确→前缀→包含，仅作兜底）
+    pool = _pool_from_board_name(key)
     if pool:
         return _filter_scannable(pool)
 

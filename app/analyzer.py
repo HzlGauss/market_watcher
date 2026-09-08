@@ -974,10 +974,7 @@ def analyze(
             score_info = calc_composite_score(tech, q.price or 0, flow_pct=flow_pct_val)
             regime = detect_market_regime(tech, q.price or 0, tech.atr)
             final_score = score_info["score"]
-            score_info["label"] = ("🟢 强烈看多" if final_score >= 75 else
-                                  "🟢 偏多" if final_score >= 60 else
-                                  "⚪ 中性" if final_score >= 45 else
-                                  "🟡 偏空" if final_score >= 35 else "🔴 强烈看空")
+            # label 直接取 calc_composite_score 返回值（短线动量强度），不在此重复判定、避免漂移
             score_info["regime"] = regime.regime
             score_info["regime_suggestion"] = regime.suggestion
             score_info["bb_squeeze"] = regime.bb_squeeze

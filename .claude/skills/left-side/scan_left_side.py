@@ -141,6 +141,11 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         macd = None
     pattern = _detect_reversal_pattern(klines)
 
+    # 已反弹到位（超买）= 不再是「超跌埋伏」标的，交还给右侧扫描
+    # 左侧要的是「跌得差不多 + 有止跌苗头」，不是已经涨回去的票。
+    if (rsi is not None and rsi > 60) or (kdj is not None and kdj.j is not None and kdj.j > 85):
+        return None
+
     above_ma5 = ma5 is not None and price >= ma5
     above_ma10 = ma10 is not None and price >= ma10
     above_ma20 = ma20 is not None and price >= ma20
@@ -150,56 +155,58 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
     # ---- 打分 0~100 ----
     score = 0
 
-    # 超跌深度 30（跌得越深左侧空间越大，但 >45% 疑似暴雷会标记）
-    if dd >= 40:
-        score += 30
+    # 超跌深度 20（回测：浅跌 12~30% 反弹最佳，深跌≥40% 多为暴雷、fut20 最差）
+    if dd >= 45:
+        score += 4    # 深度暴跌，暴雷风险
+    elif dd >= 40:
+        score += 8
     elif dd >= 30:
-        score += 26
-    elif dd >= 20:
-        score += 20
-    else:
         score += 12
+    elif dd >= 20:
+        score += 16
+    else:
+        score += 20   # 12~20% 温和超跌
 
-    # 缩量抛压衰竭 25
+    # 缩量抛压衰竭 20（回测：缩量<0.6 略优，信号偏弱，降权）
     if vol_ratio is not None:
         if vol_ratio < 0.6:
-            score += 25
+            score += 20
         elif vol_ratio < 0.8:
-            score += 18
+            score += 14
         elif vol_ratio < 1.0:
-            score += 10
+            score += 8
         # >= 1.0 放量（疑似出货）不加分
 
-    # 超卖 20
+    # 超卖 15（回测：超卖 RSI≤30 略优，信号偏弱，降权）
     if rsi is not None:
         if rsi <= 30:
-            score += 8
+            score += 5
         elif rsi <= 40:
-            score += 4
+            score += 2
     if kdj is not None and kdj.j is not None:
         if kdj.j <= 0:
-            score += 6
-        elif kdj.signal in ("超卖", "金叉"):
             score += 4
+        elif kdj.signal in ("超卖", "金叉"):
+            score += 2
     if macd is not None:
         if macd.signal == "金叉":
-            score += 6
-        elif (macd.histogram or 0) > 0:
             score += 4
+        elif (macd.histogram or 0) > 0:
+            score += 2
 
-    # 企稳 15
+    # 企稳 25（回测：止跌形态是最强单信号 fut20 +4.8%/胜率66%，大幅上调）
     if pattern:
-        score += 5
+        score += 15
     if above_ma5:
         score += 5
     if above_ma10:
         score += 5
 
-    # 未破长期趋势 10
+    # 未破长期趋势 20（回测：站上 MA120 是最强信号之一，fut20 +2.6% vs 跌破 -2.5%）
     if above_ma120:
-        score += 5
+        score += 12
     if above_ma250:
-        score += 5
+        score += 8
 
     return {
         "code": code,
@@ -271,15 +278,25 @@ def _fetch_fundamental(mx, name: str, code: str) -> dict:
 
 
 def _fund_gate(f: dict) -> tuple[str, str]:
-    """确定性门槛：技术面初筛通过后再做基本面否决。"""
+    """确定性门槛：技术面初筛通过后再做基本面否决。并列列出所有命中的问题。"""
     if all(v is None for v in f.values()):
         return "--", "未查到（缺 key/查询失败）"
+    issues = []
     if f["profit_growth"] is not None and f["profit_growth"] < 0:
-        return "❌ 真跌", f"净利同比 {f['profit_growth']:.1f}%"
+        issues.append(f"净利同比 {f['profit_growth']:.1f}%")
     if f["pb_pct"] is not None and f["pb_pct"] > 70:
-        return "⚠️ 估值高", f"PB分位 {f['pb_pct']:.1f}%"
+        issues.append(f"PB分位 {f['pb_pct']:.1f}%")
     if f["roe"] is not None and f["roe"] < 8:
-        return "⚠️ 成色弱", f"ROE {f['roe']:.1f}%"
+        issues.append(f"ROE {f['roe']:.1f}%")
+    if issues:
+        # 优先级取最严重标签：真跌(净利<0) > 估值高(PB>70) > 成色弱(ROE<8)
+        if f["profit_growth"] is not None and f["profit_growth"] < 0:
+            label = "❌ 真跌"
+        elif f["pb_pct"] is not None and f["pb_pct"] > 70:
+            label = "⚠️ 估值高"
+        else:
+            label = "⚠️ 成色弱"
+        return label, "；".join(issues)
     if f["pb_pct"] is None:
         return "-- 待查", "估值分位缺失，需人工确认 PB 分位后再定"
     return "✅ 通过", "估值+基本面 双过"
@@ -358,6 +375,7 @@ def main():
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~4 分钟）...")
     results = []
+    deep_results = []
     done = 0
     for code, stock in pool.items():
         try:
@@ -367,18 +385,23 @@ def main():
                 continue
             r = _score_candidate(code, stock, klines)
             if r is not None:
-                results.append(r)
+                (deep_results if r.get("overdeep") else results).append(r)
         except Exception:
             pass
         done += 1
         if done % 50 == 0:
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
-    if not results:
+    if not results and not deep_results:
         print("\n❌ 当前该板块/行业无符合条件的左侧机会候选（多处于「未明显回调」或「已破位走坏」状态）")
         return 0
 
     results.sort(key=lambda x: -x["score"])
+    # 深坑股按「缩量优先 → 回撤更深」排序（缩量更像错杀，放量更像暴雷）
+    deep_results.sort(key=lambda x: (
+        not (x.get("vol_ratio") is not None and x["vol_ratio"] < 0.8),
+        -x["dd"],
+    ))
 
     print()
     print("=" * 72)
@@ -392,19 +415,41 @@ def main():
         vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
         rsi_txt = f"{r['rsi']:.0f}" if r["rsi"] is not None else "  --"
         j_txt = f"{r['j']:.0f}" if r["j"] is not None else "  --"
-        deep_mark = " ⚠️深" if r["overdeep"] else ""
         print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{r['dd']:>7.1f}"
               f"{vol_txt:>7}{rsi_txt:>6}{j_txt:>7}{r['macd_sig']:>6}"
               f"{('✅' if r['above_ma20'] else '❌'):>7}{('✅' if r['pattern'] else '❌'):>5}"
-              f"{r['score']:>4}  {_verdict(r['score'])}{deep_mark}")
+              f"{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("  说明:")
     print("    - 板块=成分归属（指数名/行业名）；回撤%=现价距近120日高点跌幅；缩量比=回调段均量/高点前20日均量（<0.6 抛压衰竭）")
     print("    - RSI<30 / J值≤0 / MACD金叉 = 超卖反转信号；站MA20=初步企稳；止跌=长下影/锤子/看涨吞没")
-    print("    - ⚠️深 = 回撤>45%，跌得过深，大概率已非「短期错杀」，务必先查基本面是否暴雷")
+    print("    - 回测：深跌≠好事——回撤≥40% 多为暴雷（fut20 最差），12~30% 温和超跌反弹最佳；止跌形态+站上 MA120 权重最高")
+    print("    - 已超买（RSI>60 或 J>85）= 已反弹到位，不作为「超跌埋伏」列入")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 左侧是赌反转的埋伏仓，需分批、留补仓空间；确认买点/止损对单只运行 analyze_golden_pit.py 或 stock-analysis")
+
+    # ---- 深度超阈值（>45%）单独列出，供人工判断基本面 ----
+    if deep_results:
+        n_deep = min(len(deep_results), top)
+        print()
+        print("=" * 72)
+        print(f"❌ 深度超阈值候选（回撤 >45%，大概率非「短期错杀」而是暴雷，共 {len(deep_results)} 只，显示前 {n_deep}）")
+        print("=" * 72)
+        print("  跌得过深，务必先查基本面是「深度错杀」还是「暴雷」，再决定是否左侧埋伏。")
+        print()
+        dheader = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'回撤%':>7}"
+                   f"{'缩量比':>7}{'站半年线':>8}{'RSI':>6}{'止跌':>5}")
+        print(dheader)
+        print("  " + "-" * 90)
+        for r in deep_results[:n_deep]:
+            vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+            rsi_txt = f"{r['rsi']:.0f}" if r["rsi"] is not None else "  --"
+            print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{r['dd']:>7.1f}"
+                  f"{vol_txt:>7}{('✅' if r['above_ma120'] else '❌'):>8}{rsi_txt:>6}"
+                  f"{('✅' if r['pattern'] else '❌'):>5}")
+        print()
+        print("  说明: 站半年线(MA120)✅ + 缩量比<1.0 = 更可能是「深度错杀」，值得进一步查基本面。")
 
     _fundamental_check(results, top)
     return 0

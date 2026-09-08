@@ -337,15 +337,25 @@ def _fetch_fundamental(mx, name: str, code: str) -> dict:
 
 
 def _fund_gate(f: dict) -> tuple[str, str]:
-    """确定性门槛：返回 (标签, 说明)。技术面初筛通过后再做基本面否决。"""
+    """确定性门槛：返回 (标签, 说明)。技术面初筛通过后再做基本面否决。并列列出所有命中的问题。"""
     if all(v is None for v in f.values()):
         return "--", "未查到（缺 key/查询失败）"
+    issues = []
     if f["profit_growth"] is not None and f["profit_growth"] < 0:
-        return "❌ 真跌", f"净利同比 {f['profit_growth']:.1f}%"
+        issues.append(f"净利同比 {f['profit_growth']:.1f}%")
     if f["pb_pct"] is not None and f["pb_pct"] > 70:
-        return "⚠️ 估值高", f"PB分位 {f['pb_pct']:.1f}%"
+        issues.append(f"PB分位 {f['pb_pct']:.1f}%")
     if f["roe"] is not None and f["roe"] < 8:
-        return "⚠️ 成色弱", f"ROE {f['roe']:.1f}%"
+        issues.append(f"ROE {f['roe']:.1f}%")
+    if issues:
+        # 优先级取最严重标签：真跌(净利<0) > 估值高(PB>70) > 成色弱(ROE<8)
+        if f["profit_growth"] is not None and f["profit_growth"] < 0:
+            label = "❌ 真跌"
+        elif f["pb_pct"] is not None and f["pb_pct"] > 70:
+            label = "⚠️ 估值高"
+        else:
+            label = "⚠️ 成色弱"
+        return label, "；".join(issues)
     if f["pb_pct"] is None:
         return "-- 待查", "估值分位缺失，需人工确认 PB 分位后再定"
     return "✅ 通过", "估值+基本面 双过"

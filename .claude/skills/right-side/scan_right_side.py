@@ -142,35 +142,36 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
     else:
         score += 8
 
-    # 突破 25
+    # 突破 25（放量突破才算有效突破；无量创新高 = 假突破嫌疑，降级）
+    vol_confirm = vol_ratio is not None and vol_ratio >= 1.2
     if broke20:
-        score += 25
+        score += 25 if vol_confirm else 12
     elif broke60:
-        score += 20
+        score += 20 if vol_confirm else 10
     elif high20 is not None and price >= high20 * 0.98:
         score += 12
     elif ma60 is not None and price >= ma60:
         score += 8
 
-    # 放量 20
+    # 放量 20（回测：极端放量≥2.0 为追涨衰竭、fut20 最差；温和放量 1.2~1.5 相对最好）
     if vol_ratio is not None:
         if vol_ratio >= 2.0:
-            score += 20
+            score += 6
         elif vol_ratio >= 1.5:
-            score += 14
+            score += 12
         elif vol_ratio >= 1.2:
-            score += 8
+            score += 20
 
-    # 涨幅强度 15
+    # 涨幅强度 15（回测：5日已涨≥10% 为追高衰竭、fut20 最差；健康启动 3~6% 相对最好）
     if gain5 is not None:
         if gain5 >= 10:
-            score += 15
-        elif gain5 >= 6:
-            score += 11
-        elif gain5 >= 3:
-            score += 7
-        elif gain5 >= 1:
             score += 4
+        elif gain5 >= 6:
+            score += 8
+        elif gain5 >= 3:
+            score += 15
+        elif gain5 >= 1:
+            score += 10
 
     # MACD 动量 10
     if macd is not None:
@@ -182,7 +183,8 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
     align_txt = ("多头排列" if full_align else
                  "MA5>10>20" if bull_align else
                  "MA5>10" if ma5_gt_ma10 else "站MA20")
-    breakout_txt = "创20日新高" if broke20 else "创60日新高" if broke60 else ("逼近高点" if (high20 is not None and price >= high20 * 0.98) else "站MA60" if (ma60 is not None and price >= ma60) else "—")
+    _no_vol = "（无量）" if (broke20 or broke60) and not vol_confirm else ""
+    breakout_txt = ("创20日新高" if broke20 else "创60日新高" if broke60 else ("逼近高点" if (high20 is not None and price >= high20 * 0.98) else "站MA60" if (ma60 is not None and price >= ma60) else "—")) + _no_vol
 
     return {
         "code": code,
@@ -372,6 +374,8 @@ def main():
     print("    - 均线：多头排列(MA5>10>20>60 最强) / MA5>10>20 / MA5>10 / 站MA20；突破=创20/60日新高或逼近高点")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 右侧是突破确认后的顺势仓，回踩 MA5/MA10 是常见买点，跌破 MA20 止损；确认单只对 stock-analysis 或 intraday-signal 细看")
+    print("    - ⚠️ 右侧属「顺势追涨」策略，仅在上升市有效；震荡/弱势市追高易被套（回测 fut20 强档反为最差）")
+    print("      建议配合 market-heat 判断市场情绪，弱势市右侧信号降级或仅轻仓试错。")
 
     _flow_check(results, top)
     return 0

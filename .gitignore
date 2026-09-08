@@ -79,6 +79,10 @@ strong_screening/*.md
 analysis_reports/*.md
 *.log
 
+# Backtest artifacts (K-line cache + result outputs)
+.claude/skills/*/_klines_cache_*.json
+.claude/skills/*/backtest_result.json
+
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
 
