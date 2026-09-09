@@ -46,6 +46,9 @@ py .claude/skills/news-search/search_news.py <关键词> [小时]
 # Natural-language financial data query (自然语言金融数据问答)
 py .claude/skills/financial-query/query_finance.py <自然语言问题>
 
+# Macro data query (宏观数据查询：CPI/PPI 居民消费/工业生产者出厂价格指数)
+py .claude/skills/macro-data/query_macro.py [cpi|ppi|all] [月份数]
+
 # Lightweight natural-language stock screening (轻量智能选股)
 py .claude/skills/stock-screen/screen_stock.py <自然语言条件> [数量]
 
@@ -95,6 +98,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`intraday-signal`** — 盘中决策：输入单个标的（个股/ETF），拉实时快照 + 当日资金流 + 近N日K线趋势 + 近5日资金流 + 5分钟K线支撑压力，再由 AI 判断今天建仓/加仓/减仓/清仓/不动，以及是否适合做T、买卖挂单价。用户问「今天该买还是卖」「要不要加仓/减仓」「能不能做T」「做T挂多少钱」时使用。核心功能不依赖 `MX_APIKEY`。详见 `.claude/skills/intraday-signal/SKILL.md`。
 - **`news-search`** — 财经资讯/新闻/公告/研报搜索：输入自然语言关键词，按类型分组返回（研报/公告/新闻，含评级/机构/关联证券）。用户问「XX 有什么新闻」「搜一下 XX 的消息」「XX 板块有什么利好/利空」「XX 最新研报/公告/减持增持」时使用。详见 `.claude/skills/news-search/SKILL.md`。
 - **`financial-query`** — 自然语言金融数据问答：任意问句查行情/财务/资金流/筹码/估值分位/分红，返回结构化表格。用户问「查 XX 的市盈率/PE 历史分位」「XX 的 ROE/毛利率/负债率」「XX 的分红/股息率」「XX 近5日主力资金」时使用。详见 `.claude/skills/financial-query/SKILL.md`。
+- **`macro-data`** — 宏观数据查询：拉取统计局月度 CPI（居民消费价格指数）/ PPI（工业生产者出厂价格指数），输出最新一期同比/环比/累计 + 最近 N 个月趋势。用户问「8 月 CPI/PPI 数据」「通胀/通缩」「物价涨跌」「宏观数据」时使用。数据源 akshare（`macro_china_cpi`/`macro_china_ppi`），妙想 `query` 接口取不到宏观数据。详见 `.claude/skills/macro-data/SKILL.md`。
 - **`stock-screen`** — 轻量智能选股：一句式自然语言选股条件 → 结构化候选列表。用户问「帮我选股」「找满足 XX 条件的股票」「筛选连续主力净流入/低估值/放量突破」时使用。与 smart/strong 重管线不同，仅即时查询。详见 `.claude/skills/stock-screen/SKILL.md`。
 - **`mock-portfolio`** — 妙想模拟盘管理：查模拟持仓/资金/委托，模拟买卖下单、撤单。用户问「查我的模拟盘/模拟组合」「模拟盘买入/卖出 XX」「模拟盘撤单」时使用。需先绑定妙想模拟账户。详见 `.claude/skills/mock-portfolio/SKILL.md`。
 - **`fund-analysis`** — 主动基金诊基：输入场外开放式基金代码，算净值绩效（年化收益/夏普/最大回撤等）+ 业绩基准对比（Alpha/Beta），再用妙想查权威评级/持仓/经理/规模，AI 生成评价与买卖建议。用户问「分析/诊断某只基金」「这只基金怎么样/值不值得买」「基金评级/持仓/经理」时使用。ETF 走 `etf-grid`/`stock-analysis`。详见 `.claude/skills/fund-analysis/SKILL.md`。
