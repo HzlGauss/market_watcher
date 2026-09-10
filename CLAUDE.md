@@ -43,6 +43,12 @@ py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]
 # Search financial news/announcements/reports (资讯/新闻/公告/研报搜索)
 py .claude/skills/news-search/search_news.py <关键词> [小时]
 
+# Real-time financial flash news (实时财经快讯流：全球快讯，可按关键词过滤)
+py .claude/skills/akshare-news/flash_news.py [关键词] [条数]
+
+# Individual stock news (个股新闻：某只股票的东财新闻)
+py .claude/skills/akshare-news/stock_news.py <代码> [名称]
+
 # Natural-language financial data query (自然语言金融数据问答)
 py .claude/skills/financial-query/query_finance.py <自然语言问题>
 
@@ -97,6 +103,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`sector-flow`** — 查询 A 股行业/概念/地域板块资金流排名（今日/5日/10日主力净流入，东方财富数据中心直连，无需妙想/`.env`）。用户问「各行业板块资金流向」「哪些板块主力流入最多」「板块资金排名」时使用。详见 `.claude/skills/sector-flow/SKILL.md`。
 - **`intraday-signal`** — 盘中决策：输入单个标的（个股/ETF），拉实时快照 + 当日资金流 + 近N日K线趋势 + 近5日资金流 + 5分钟K线支撑压力，再由 AI 判断今天建仓/加仓/减仓/清仓/不动，以及是否适合做T、买卖挂单价。用户问「今天该买还是卖」「要不要加仓/减仓」「能不能做T」「做T挂多少钱」时使用。核心功能不依赖 `MX_APIKEY`。详见 `.claude/skills/intraday-signal/SKILL.md`。
 - **`news-search`** — 财经资讯/新闻/公告/研报搜索：输入自然语言关键词，按类型分组返回（研报/公告/新闻，含评级/机构/关联证券）。用户问「XX 有什么新闻」「搜一下 XX 的消息」「XX 板块有什么利好/利空」「XX 最新研报/公告/减持增持」时使用。详见 `.claude/skills/news-search/SKILL.md`。
+- **`akshare-news`** — AKShare 实时快讯 + 个股新闻（免费、实时，东财/新浪源，无需 `MX_APIKEY`）。`flash_news.py` 拉全球实时快讯（可按关键词过滤），`stock_news.py` 查某只股票的东财新闻。用户问「今晚美股为什么跌」「最近有什么实时财经快讯」「XX 股票有什么新闻」且需要免费/盘中实时源时使用。与 `news-search`（妙想，含研报/评级/公告）互补。详见 `.claude/skills/akshare-news/SKILL.md`。
 - **`financial-query`** — 自然语言金融数据问答：任意问句查行情/财务/资金流/筹码/估值分位/分红，返回结构化表格。用户问「查 XX 的市盈率/PE 历史分位」「XX 的 ROE/毛利率/负债率」「XX 的分红/股息率」「XX 近5日主力资金」时使用。详见 `.claude/skills/financial-query/SKILL.md`。
 - **`macro-data`** — 宏观数据查询：拉取统计局月度 CPI（居民消费价格指数）/ PPI（工业生产者出厂价格指数），输出最新一期同比/环比/累计 + 最近 N 个月趋势。用户问「8 月 CPI/PPI 数据」「通胀/通缩」「物价涨跌」「宏观数据」时使用。数据源 akshare（`macro_china_cpi`/`macro_china_ppi`），妙想 `query` 接口取不到宏观数据。详见 `.claude/skills/macro-data/SKILL.md`。
 - **`stock-screen`** — 轻量智能选股：一句式自然语言选股条件 → 结构化候选列表。用户问「帮我选股」「找满足 XX 条件的股票」「筛选连续主力净流入/低估值/放量突破」时使用。与 smart/strong 重管线不同，仅即时查询。详见 `.claude/skills/stock-screen/SKILL.md`。
