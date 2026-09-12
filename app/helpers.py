@@ -305,3 +305,30 @@ def format_quote_summary(quotes: list[Quote]) -> str:
         lines.append(f"... and {len(quotes) - 5} more")
 
     return " | ".join(lines)
+
+
+def order_flow_bias(quote: Quote) -> dict:
+    """订单流方向：内外盘主动买/卖 + 委比/委差盘口挂单。
+
+    返回 dict：
+      bs_ratio: 外盘/内盘比值（>1 主动买占优，None 无数据）
+      bs_bias:  '主动买' / '主动卖' / None（≥1.2 或 ≤0.8 才判定，阈值与 t0_monitor 一致）
+      bar_bias: '挂单看多' / '挂单看空' / None（委比 >25 / <-25）
+
+    内外盘是全天累积量（主动买入/主动卖出），盘中盘后都有意义；
+    委比/委差是盘口瞬时快照，仅盘中有效（盘后常为 0 或缺失）。
+    """
+    bs_ratio = bs_bias = None
+    if quote.bid_volume and quote.ask_volume and quote.ask_volume > 0:
+        bs_ratio = quote.bid_volume / quote.ask_volume
+        if bs_ratio >= 1.2:
+            bs_bias = "主动买"
+        elif bs_ratio <= 0.8:
+            bs_bias = "主动卖"
+    bar_bias = None
+    if quote.bid_ask_ratio is not None:
+        if quote.bid_ask_ratio > 25:
+            bar_bias = "挂单看多"
+        elif quote.bid_ask_ratio < -25:
+            bar_bias = "挂单看空"
+    return {"bs_ratio": bs_ratio, "bs_bias": bs_bias, "bar_bias": bar_bias}

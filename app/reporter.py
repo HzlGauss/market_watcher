@@ -11,6 +11,7 @@ from app.models import WatchItem, Quote, Holding
 from app.config import Config
 from app.data_fetcher import fetch_quotes, fetch_quotes_rich
 from app.analyzer import analyze, calc_market_sentiment
+from app.helpers import order_flow_bias
 from app.utils import log
 from app.http_client import serverchan_client
 from app.llm_client import get_llm_client, SYSTEM_PROMPTS
@@ -382,6 +383,9 @@ def _get_holdings_tech_analysis(
                 crowd_score += 1
         crowd_label = f"🚨 极高拥挤(×{crowd_score})" if crowd_score >= 4 else (f"⚠️ 高拥挤(×{crowd_score})" if crowd_score >= 3 else "")
 
+        # 订单流（内外盘主动买/卖 + 委比盘口挂单）
+        of = order_flow_bias(quote)
+
         return {
             "name": h.name,
             "code": h.code,
@@ -411,6 +415,9 @@ def _get_holdings_tech_analysis(
             "volume": quote.volume,
             "turnover": quote.turnover_rate,
             "volume_ratio": quote.volume_ratio,
+            "bs_ratio": of["bs_ratio"],
+            "bs_bias": of["bs_bias"],
+            "bar_bias": of["bar_bias"],
             "avg_price": quote.avg_price,
             "volume_clusters": sr.volume_clusters,
             # 跳空缺口 & 关键位突破
@@ -3287,8 +3294,8 @@ def generate_evening_review(config: Config) -> Path | None:
     if tech_data_evening:
         data_lines.append("\n## 七、持仓技术分析")
         data_lines.append("")
-        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | 布林(上/中/下) | RSI | MACD | KDJ | OBV | 成交量 | 换手率 |")
-        data_lines.append("|------|------|------|--------|------|------|--------------|-----|------|-----|-----|--------|--------|")
+        data_lines.append("| 标的 | 现价 | 均价 | 涨跌幅 | 量比 | 量价 | 布林(上/中/下) | RSI | MACD | KDJ | OBV | 成交量 | 换手率 | 主动买/卖 |")
+        data_lines.append("|------|------|------|--------|------|------|--------------|-----|------|-----|-----|--------|--------|-----------|")
         for t in tech_data_evening:
             price = f"{t['price']:.3f}" if t.get('price') else "--"
             avg_p_val = t.get('avg_price')
@@ -3311,7 +3318,8 @@ def generate_evening_review(config: Config) -> Path | None:
             bb_m = t.get('bb_middle')
             bb_l = t.get('bb_lower')
             bb_str = f"{bb_u:.3f}/{bb_m:.3f}/{bb_l:.3f}" if bb_u and bb_m and bb_l else "--"
-            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {bb_str} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} |")
+            of_str = f"{t['bs_bias']} {t['bs_ratio']:.2f}" if t.get('bs_bias') and t.get('bs_ratio') is not None else "--"
+            data_lines.append(f"| {t['name']} | {price} | {avg_str} | {chg} | {vr_str} | {t['vol_price']} | {bb_str} | {rsi} | {macd} | {kdj} | {obv_val} | {vol} | {tr} | {of_str} |")
 
     if strategy_signals_evening:
         data_lines.append(f"\n## 八、⭐ 组合策略信号（多指标共振，明日操作参考）")

@@ -372,6 +372,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
                     q.ask_volume = cached["ask_volume"]
                 if cached.get("bid_ask_ratio") is not None:
                     q.bid_ask_ratio = cached["bid_ask_ratio"]
+                if cached.get("bid_ask_diff") is not None:
+                    q.bid_ask_diff = cached["bid_ask_diff"]
 
     # Separate quotes by type for statistics
     holdings_quotes = [q for q in quotes if q.type == "持仓"]
@@ -625,6 +627,8 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                     q.ask_volume = cached["ask_volume"]
                 if cached.get("bid_ask_ratio") is not None:
                     q.bid_ask_ratio = cached["bid_ask_ratio"]
+                if cached.get("bid_ask_diff") is not None:
+                    q.bid_ask_diff = cached["bid_ask_diff"]
 
     # Get K-line data from shared pool
     klines_map = {}

@@ -9,6 +9,7 @@ from typing import Optional
 
 from app.models import Quote, Alert, SentimentResult, AnalysisStats, TechnicalSummary, NorthFlowData, MarketBreadth
 from app.config import Config
+from app.helpers import order_flow_bias
 
 
 # ============================================================
@@ -904,6 +905,23 @@ def analyze(
                 items.append(f"📊 偏强(高于均价{vwap_dev:.1f}%)")
             elif vwap_dev < -1.0:
                 items.append(f"📉 偏弱(低于均价{abs(vwap_dev):.1f}%)")
+
+        # ---- 订单流（内外盘主动买/卖 + 委比盘口挂单）----
+        of = order_flow_bias(q)
+        if of["bs_bias"] == "主动卖" and cp is not None and cp > 0:
+            items.append(f"⚠️ 拉高主动出货(涨{cp:+.1f}%但内盘>外盘，外盘/内盘 {of['bs_ratio']:.2f}) — 诱多嫌疑")
+            alert_count += 1
+        elif of["bs_bias"] == "主动买" and cp is not None and cp < 0:
+            items.append(f"💡 主动承接(跌{cp:.1f}%但外盘>内盘，外盘/内盘 {of['bs_ratio']:.2f}) — 吸筹迹象")
+            alert_count += 1
+        elif of["bs_bias"] == "主动卖":
+            items.append(f"📉 主动卖盘占优(外盘/内盘 {of['bs_ratio']:.2f})")
+        elif of["bs_bias"] == "主动买":
+            items.append(f"📈 主动买盘占优(外盘/内盘 {of['bs_ratio']:.2f})")
+        if of["bar_bias"] == "挂单看多":
+            items.append(f"📈 委比+{q.bid_ask_ratio:.0f}%(挂单看多)")
+        elif of["bar_bias"] == "挂单看空":
+            items.append(f"📉 委比{q.bid_ask_ratio:.0f}%(挂单看空)")
 
         # ---- 顶底综合检测 ----
         if tech_summaries and q.code in tech_summaries:
