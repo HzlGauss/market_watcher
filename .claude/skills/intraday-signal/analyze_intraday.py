@@ -152,6 +152,38 @@ def _fetch_min_klines(code: str, market: str) -> list[KlineData]:
     return fetch_historical_kline(code, market, days=2, scale=5)
 
 
+def _orderflow_bias(q: Quote) -> str:
+    """盘中订单流倾向：内外盘 + 委比 + 委差 综合判断主动买卖方向。
+
+    只做提示，不直接下买卖结论；三者口径与 t0_monitor 一致（委比 >25 看多 / <-25 看空，
+    外盘/内盘 >1 主动买占优）。
+    """
+    bs = q.bid_volume / q.ask_volume if (q.bid_volume and q.ask_volume and q.ask_volume > 0) else None
+    buy, sell = [], []
+    if bs is not None:
+        if bs >= 1.2:
+            buy.append(f"外盘/内盘 {bs:.2f}（主动买占优）")
+        elif bs <= 0.8:
+            sell.append(f"外盘/内盘 {bs:.2f}（主动卖占优）")
+    if q.bid_ask_ratio is not None:
+        if q.bid_ask_ratio > 25:
+            buy.append(f"委比 +{q.bid_ask_ratio:.0f}%（挂单看多）")
+        elif q.bid_ask_ratio < -25:
+            sell.append(f"委比 {q.bid_ask_ratio:.0f}%（挂单看空）")
+    if q.bid_ask_diff is not None:
+        if q.bid_ask_diff > 0:
+            buy.append(f"委差 +{q.bid_ask_diff:.0f}手（委买挂单多）")
+        elif q.bid_ask_diff < 0:
+            sell.append(f"委差 {q.bid_ask_diff:.0f}手（委卖挂单多）")
+    if buy and sell:
+        return f"分歧：{'；'.join(buy)}  vs  {'；'.join(sell)}"
+    if buy:
+        return f"偏多：{'；'.join(buy)}"
+    if sell:
+        return f"偏空：{'；'.join(sell)}"
+    return "中性（内外盘/委比/委差均无明显方向）"
+
+
 def _print_realtime(q: Quote):
     print("=" * 72)
     print(f"【1. 实时快照】{q.code} {q.name}")
@@ -165,7 +197,8 @@ def _print_realtime(q: Quote):
     bs = None
     if q.bid_volume and q.ask_volume and q.ask_volume > 0:
         bs = q.bid_volume / q.ask_volume
-    print(f"  外盘/内盘 {_f(bs, 2)}（>1 主动买占优）  委比 {_f(q.bid_ask_ratio, 1)}%")
+    print(f"  外盘/内盘 {_f(bs, 2)}（>1 主动买占优）  委比 {_f(q.bid_ask_ratio, 1)}%  委差 {_f(q.bid_ask_diff, 0)}手")
+    print(f"  订单流: {_orderflow_bias(q)}")
     if q.high and q.low and q.price and q.high > q.low:
         pos = (q.price - q.low) / (q.high - q.low) * 100
         print(f"  日内位置 {_f(pos, 0)}%（现价在今日高低区间的位置，0=最低 100=最高）")

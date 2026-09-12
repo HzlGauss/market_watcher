@@ -164,6 +164,8 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                         q.ask_volume = data["ask_volume"]
                     if data.get("bid_ask_ratio") is not None:
                         q.bid_ask_ratio = data["bid_ask_ratio"]
+                    if data.get("bid_ask_diff") is not None:
+                        q.bid_ask_diff = data["bid_ask_diff"]
         except Exception:
             pass  # 腾讯API失败时忽略，不影响主流程
 
@@ -237,11 +239,13 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
             # 外盘（主动买入）在 fields[7]，内盘（主动卖出）在 fields[8]
             # （fields[6] 是成交量，外盘+内盘=成交量，已交叉验证）
             # 委比在 fields[74]（百分比，五档盘口委买-委卖占比）
+            # 委差在 fields[50]（委买-委卖，单位手）
             turnover = _parse_float(fields[38]) if len(fields) > 38 else None
             volume_ratio = _parse_float(fields[49]) if len(fields) > 49 else None
             bid_volume = _parse_float(fields[7]) if len(fields) > 7 else None
             ask_volume = _parse_float(fields[8]) if len(fields) > 8 else None
             bid_ask_ratio = _parse_float(fields[74]) if len(fields) > 74 and fields[74] else None
+            bid_ask_diff = _parse_float(fields[50]) if len(fields) > 50 and fields[50] else None
 
             result[code] = {
                 "volume_ratio": volume_ratio,
@@ -249,6 +253,7 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
                 "bid_volume": bid_volume,
                 "ask_volume": ask_volume,
                 "bid_ask_ratio": bid_ask_ratio,
+                "bid_ask_diff": bid_ask_diff,
             }
 
         return result
@@ -1293,7 +1298,7 @@ class BackgroundDataCache:
         with self._lock:
             for code, data in tencent_data.items():
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "fund_flow": None}
                 if data.get("volume_ratio") is not None:
                     self._cache[code]["volume_ratio"] = data["volume_ratio"]
                 if data.get("turnover_rate") is not None:
@@ -1304,6 +1309,8 @@ class BackgroundDataCache:
                     self._cache[code]["ask_volume"] = data["ask_volume"]
                 if data.get("bid_ask_ratio") is not None:
                     self._cache[code]["bid_ask_ratio"] = data["bid_ask_ratio"]
+                if data.get("bid_ask_diff") is not None:
+                    self._cache[code]["bid_ask_diff"] = data["bid_ask_diff"]
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
@@ -1319,7 +1326,7 @@ class BackgroundDataCache:
             detail = fetch_fund_flow_detail(code, item.market)
             with self._lock:
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "fund_flow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "fund_flow": None}
                 if detail is not None:
                     self._cache[code]["fund_flow"] = detail
                     # 向后兼容：同时存 main_net_inflow

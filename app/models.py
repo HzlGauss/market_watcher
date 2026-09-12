@@ -224,7 +224,8 @@ class Quote:
     fund_flow: Optional[FundFlowDetail] = None
     bid_volume: Optional[float] = None  # 外盘（主动买入）
     ask_volume: Optional[float] = None  # 内盘（主动卖出）
-    bid_ask_ratio: Optional[float] = None  # 委比
+    bid_ask_ratio: Optional[float] = None  # 委比（百分比）
+    bid_ask_diff: Optional[float] = None  # 委差（委买-委卖，手）
     upper_limit: Optional[float] = None
     lower_limit: Optional[float] = None
     industry: str = ""  # 所属行业板块（从东方财富行业分类获取）

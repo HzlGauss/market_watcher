@@ -101,10 +101,10 @@ def print_quotes_table(quotes: list[Quote]) -> None:
     header = (
         f"{'代码':>8} {'名称':<12} {'最新价':>8} {'均价':>8} "
         f"{'涨跌幅':>8} {'主力净流入':>10} {'总体':>10} {'资金信号':<14} "
-        f"{'量比':>6} {'换手率':>8} {'振幅':>7}"
+        f"{'量比':>6} {'换手率':>8} {'委比':>7} {'委差':>7} {'振幅':>7}"
     )
     print(f"\n{Color.CYAN}{Color.BOLD}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 112}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 128}{Color.RESET}")
 
     for q in quotes:
         price = f"{q.price:.3f}" if q.price is not None else f"{Color.DIM}--{Color.RESET}"
@@ -179,6 +179,16 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         else:
             bar_str = f"{Color.DIM}--{Color.RESET}"
 
+        # 委差（委买-委卖，手）：正=委买挂单占优，负=委卖占优
+        if q.bid_ask_diff is not None:
+            bar_diff_str = f"{q.bid_ask_diff:+.0f}"
+            if q.bid_ask_diff > 0:
+                bar_diff_str = f"{Color.RED}{bar_diff_str}{Color.RESET}"
+            elif q.bid_ask_diff < 0:
+                bar_diff_str = f"{Color.GREEN}{bar_diff_str}{Color.RESET}"
+        else:
+            bar_diff_str = f"{Color.DIM}--{Color.RESET}"
+
         # 换手率
         if q.turnover_rate is not None:
             tr_str = f"{q.turnover_rate:.2f}%"
@@ -200,7 +210,7 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         line = (
             f"{q.code:>8} {q.name:<12} {price:>8} {avg_str:>8} {cp:>8} "
             f"{flow_str:>10} {total_str:>10} {sig_str:<14} "
-            f"{vr_str:>6} {tr_str:>8} {amp_str:>7}"
+            f"{vr_str:>6} {tr_str:>8} {bar_str:>7} {bar_diff_str:>7} {amp_str:>7}"
         )
         print(f"  {line}")
 
