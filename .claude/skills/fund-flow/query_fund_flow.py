@@ -39,6 +39,7 @@ from app.utils import load_env
 from app.miaoxiang import MXClient
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_fund_flow_detail
+from app.analyzer import detect_split_order_from_nets
 
 # 5 档净流入的关键字段名（妙想返回的精确键名）
 _TIERS = [
@@ -79,6 +80,22 @@ def _parse_amount(value):
         return float(s) * mult
     except ValueError:
         return None
+
+
+def _row_main_net(r):
+    """主力净流入：优先取「主力净流入资金」字段，缺省用 超大单+大单 合成。
+
+    妙想 query_structured 返回的逐日表只有 超大单/大单/中单/小单 净流入，
+    没有「主力净流入资金」列（该列只在 (区间) 聚合表出现），故需合成。
+    """
+    main = _parse_amount(r.get("主力净流入资金"))
+    if main is not None:
+        return main
+    sup = _parse_amount(r.get("超大单净流入资金"))
+    lrg = _parse_amount(r.get("大单净流入资金"))
+    if sup is None and lrg is None:
+        return None
+    return (sup or 0.0) + (lrg or 0.0)
 
 
 def _norm_date(s) -> str:
@@ -160,10 +177,12 @@ def main():
     for t in mx.query_structured(query):
         for r in t.get("rows") or []:
             d = _norm_date(r.get("日期"))
-            main = _parse_amount(r.get("主力净流入资金"))
+            main = _row_main_net(r)
             if not d or main is None or d in seen:
                 continue
             seen.add(d)
+            if "主力净流入资金" not in r:
+                r["主力净流入资金"] = main
             rows.append((d, r))
 
     if not rows:
@@ -211,6 +230,17 @@ def main():
         tag = " (今日·实时)" if d == today_str else ""
         cells = [_fmt_amount(_parse_amount(r.get(key))) for _, key in _TIERS]
         print(f"  {d}{tag:<9}  " + "  ".join(cells))
+
+    # 拆单检测（纯净额版，最新交易日）：小单单边活跃 + 大单/超大单近乎沉默 = 疑似拆单
+    _, latest_r = rows[0]
+    split_signal = detect_split_order_from_nets(
+        _parse_amount(latest_r.get("小单净流入资金")),
+        _parse_amount(latest_r.get("大单净流入资金")),
+        _parse_amount(latest_r.get("超大单净流入资金")),
+        None,
+    )
+    if split_signal:
+        print(f"  {split_signal}")
     return 0
 
 

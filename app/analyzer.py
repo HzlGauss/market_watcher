@@ -512,6 +512,57 @@ def detect_split_order(ff, amount: float, change_pct: Optional[float]) -> Option
     return None
 
 
+def detect_split_order_from_nets(
+    small_net: Optional[float],
+    large_net: Optional[float],
+    super_large_net: Optional[float],
+    change_pct: Optional[float] = None,
+) -> Optional[str]:
+    """纯净额版拆单检测（供 fund-flow / stock-analysis 等 skill 调用）
+
+    detect_split_order 依赖成交额/净占比（东财 f57-f61），但妙想资金流只返回 5 档
+    「净额」，无占比、无成交额。本函数改用「小单净额 vs 大单+超大单净额」的相对结构
+    判断拆单指纹：主力把大单拆成小单后，小单净额异常放大、大单/超大单净额收缩到接近零。
+
+    局限：只能给「疑似」信号——「小单单边活跃 + 大单沉默」也可能是纯散户行为，
+    需结合换手/量能/后续走势验证，不能当作确定性结论。
+
+    Args:
+        small_net: 小单净流入（元）
+        large_net: 大单净流入（元）
+        super_large_net: 超大单净流入（元）
+        change_pct: 当日涨跌幅（%），缺失时放宽价格约束（仅按资金流结构判断）
+
+    Returns:
+        拆单信号字符串，无迹象时返回 None
+    """
+    if None in (small_net, large_net, super_large_net):
+        return None
+    total = abs(small_net) + abs(large_net) + abs(super_large_net)
+    if total <= 0:
+        return None
+
+    # 小单净额在三档总净额中的占比（-1~1）；大单+超大单占比（0~1）
+    small_share = small_net / total
+    big_share = (abs(large_net) + abs(super_large_net)) / total
+
+    if change_pct is not None:
+        if small_share >= 0.65 and big_share <= 0.20 and 0 < change_pct < 3.0:
+            return (f"🔍 疑似拆单吸筹(小单净流入占资金流{small_share*100:.0f}%"
+                    f"但大单+超大单仅{big_share*100:.0f}%，价{change_pct:+.1f}%)")
+        if small_share <= -0.65 and big_share <= 0.20 and -3.0 < change_pct < 0:
+            return (f"🔍 疑似拆单出货(小单净流出占资金流{abs(small_share)*100:.0f}%"
+                    f"但大单+超大单仅{big_share*100:.0f}%，价{change_pct:+.1f}%)")
+    else:
+        if small_share >= 0.65 and big_share <= 0.20:
+            return (f"🔍 疑似拆单吸筹(小单净流入占资金流{small_share*100:.0f}%"
+                    f"但大单+超大单仅{big_share*100:.0f}%，价格约束未纳入)")
+        if small_share <= -0.65 and big_share <= 0.20:
+            return (f"🔍 疑似拆单出货(小单净流出占资金流{abs(small_share)*100:.0f}%"
+                    f"但大单+超大单仅{big_share*100:.0f}%，价格约束未纳入)")
+    return None
+
+
 def _detect_flow_anomaly(
     inflow_pct: float,
     history: Optional[list[float]],

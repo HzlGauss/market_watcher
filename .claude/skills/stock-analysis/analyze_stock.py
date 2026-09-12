@@ -39,6 +39,7 @@ from app.utils import load_env
 from app.miaoxiang import MXClient
 from app.models import KlineData, Quote
 from app import technical as T
+from app.analyzer import detect_split_order_from_nets
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -78,6 +79,22 @@ def _parse_amount(value) -> float | None:
         return float(s) * mult
     except ValueError:
         return None
+
+
+def _row_main_net(r) -> float | None:
+    """主力净流入：优先取「主力净流入资金」字段，缺省用 超大单+大单 合成。
+
+    妙想 query_structured 返回的逐日表只有 超大单/大单/中单/小单 净流入，
+    没有「主力净流入资金」列（该列只在 (区间) 聚合表出现），故需合成。
+    """
+    main = _parse_amount(r.get("主力净流入资金"))
+    if main is not None:
+        return main
+    sup = _parse_amount(r.get("超大单净流入资金"))
+    lrg = _parse_amount(r.get("大单净流入资金"))
+    if sup is None and lrg is None:
+        return None
+    return (sup or 0.0) + (lrg or 0.0)
 
 
 def _norm_date(s) -> str:
@@ -317,10 +334,12 @@ def main():
     for t in mx.query_structured(q):
         for r in t.get("rows") or []:
             d = _norm_date(r.get("日期"))
-            main = _parse_amount(r.get("主力净流入资金"))
+            main = _row_main_net(r)
             if not d or main is None or d in seen:
                 continue
             seen.add(d)
+            if "主力净流入资金" not in r:
+                r["主力净流入资金"] = main
             flow_rows.append((d, r))
     if flow_rows:
         flow_rows.sort(key=lambda x: x[0], reverse=True)
@@ -355,6 +374,16 @@ def main():
                 print(f"  ⚠️ 背离：最新日价跌({last_pct:+.2f}%)但主力净流入 {latest_main / 1e8:+.2f} 亿（逆势吸筹）")
             elif latest_main < 0 and last_pct > 0:
                 print(f"  ⚠️ 背离：最新日价涨({last_pct:+.2f}%)但主力净流出 {latest_main / 1e8:+.2f} 亿（拉高出货）")
+
+        # 拆单检测（纯净额版）：小单单边活跃 + 大单/超大单近乎沉默 = 疑似拆单
+        split_signal = detect_split_order_from_nets(
+            _parse_amount(flow_rows[0][1].get("小单净流入资金")),
+            _parse_amount(flow_rows[0][1].get("大单净流入资金")),
+            _parse_amount(flow_rows[0][1].get("超大单净流入资金")),
+            last_pct,
+        )
+        if split_signal:
+            print(f"  {split_signal}")
     else:
         print("  ⚠️ 未查到资金流数据")
 
