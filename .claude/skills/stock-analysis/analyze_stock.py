@@ -97,6 +97,59 @@ def _row_main_net(r) -> float | None:
     return (sup or 0.0) + (lrg or 0.0)
 
 
+def _volume_price_signal(klines, last_pct) -> str | None:
+    """量价配合：量比 + 放量/缩量 + OBV 能量潮 + 量价方向结论。
+
+    量比 = 最近1日成交量 / 前5日均量；放量≥1.2、显著放量≥2、缩量≤0.8、明显缩量≤0.6。
+    OBV 复用 technical.calc_obv（顶背离/底背离/资金加速流入流出等能量潮信号）。
+    数据不足（<6 根 K 线或成交量缺失）时返回 None。
+    """
+    vols = [k.volume for k in klines if k is not None and k.volume is not None]
+    if len(vols) < 6:
+        return None
+    last_vol = vols[-1]
+    prev5 = vols[-6:-1]
+    if not prev5:
+        return None
+    avg5 = sum(prev5) / len(prev5)
+    if avg5 <= 0:
+        return None
+    vr = last_vol / avg5
+
+    if vr >= 2.0:
+        vol_label = f"显著放量({vr:.1f}倍)"
+    elif vr >= 1.2:
+        vol_label = f"放量({vr:.1f}倍)"
+    elif vr <= 0.6:
+        vol_label = f"明显缩量({vr:.2f}倍)"
+    elif vr <= 0.8:
+        vol_label = f"缩量({vr:.2f}倍)"
+    else:
+        vol_label = f"量平({vr:.2f}倍)"
+
+    if last_pct is not None:
+        if vr >= 1.2 and last_pct > 0:
+            vp = "量价齐升（放量上涨，突破有效）"
+        elif vr >= 1.2 and last_pct < 0:
+            vp = "放量下跌（抛压/出货，警惕）"
+        elif vr <= 0.8 and last_pct > 0:
+            vp = "缩量上涨（上涨乏力，追高需谨慎）"
+        elif vr <= 0.8 and last_pct < 0:
+            vp = "缩量下跌（抛压减轻，企稳迹象）"
+        else:
+            vp = "量价平稳"
+    else:
+        vp = ""
+
+    obv = T.calc_obv(klines)
+    obv_str = f"OBV {obv.signal}" if obv.signal and obv.signal != "数据不足" else "OBV 数据不足"
+
+    parts = [f"量比 {vr:.2f}（{vol_label}）", obv_str]
+    if vp:
+        parts.append(vp)
+    return "量价: " + " | ".join(parts)
+
+
 def _norm_date(s) -> str:
     """日期归一化："2026-08-21(日)" / "2026-08-24 13:07" -> "2026-08-21" """
     m = _DATE_RE.search(str(s or ""))
@@ -263,6 +316,8 @@ def main():
         last_close = closes[-1]
         last_open = _num(rows[-1][1].get("开盘价"))
         last_pct = _num(rows[-1][1].get("涨跌幅"))
+        if last_pct is None and len(closes) > 1 and closes[-2]:
+            last_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
         rng30 = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) > 1 and closes[0] else None
 
         klines = _to_klines(rows)
@@ -304,6 +359,11 @@ def main():
         if box is not None and box.regime and box.regime != "数据不足":
             pos = f"  现价位置 {box.pos_pct:.0f}%" if box.pos_pct is not None else ""
             print(f"  箱体: {box.regime}  区间 [{_fmt_price(box.lower)}, {_fmt_price(box.upper)}]{pos}")
+
+        # 量价配合（量比 + 放量/缩量 + OBV + 方向结论）
+        vp_signal = _volume_price_signal(klines, last_pct)
+        if vp_signal:
+            print(f"  {vp_signal}")
 
         # 涨跌幅：查询结果常缺该字段，改由相邻收盘价计算
         row_pct = {}
