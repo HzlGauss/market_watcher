@@ -41,6 +41,7 @@ sys.path.insert(0, str(_ROOT))
 logging.disable(logging.WARNING)
 
 from app.helpers import _detect_market
+from app.data_fetcher import fetch_turnover_map
 from app.technical import (
     fetch_historical_kline,
     calc_sma,
@@ -145,7 +146,7 @@ def _detect_reversal_pattern(klines) -> bool:
     return False
 
 
-def _score_candidate(code: str, stock: dict, klines) -> dict | None:
+def _score_candidate(code: str, stock: dict, klines, turnover: float | None = None) -> dict | None:
     """对单只候选股做黄金坑检测 + 打分。太浅(<20%)直接排除；过深(>45%)不排除，
     标记 overdeep=True 单独列出（供人工判断基本面是「深度错杀」还是「暴雷」）。"""
     n = len(klines)
@@ -210,6 +211,7 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         "dd": dd,
         "gap": gap,
         "vol_ratio": vol_ratio,
+        "turnover": turnover,
         "price": price,
         "peak": peak,
         "ma20": ma20,
@@ -254,6 +256,15 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         score += 18
     elif vol_ratio < 1.0:
         score += 10
+
+    # 换手率确认（±5）：低换手=地量见底确认真缩量；高换手=抛压未尽，缩量存疑
+    if turnover is not None:
+        if turnover < 1.0:
+            score += 5      # 地量，缩量可信
+        elif turnover < 2.0:
+            score += 3      # 低换手，抛压衰减
+        elif turnover >= 5.0:
+            score -= 3      # 高换手，仍有资金活跃，缩量存疑
 
     # 企稳反转 25（封顶）
     stab = 0
@@ -426,6 +437,7 @@ def main():
 
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 2~4 分钟）...")
+    turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     deep_results = []
     done = 0
@@ -435,7 +447,7 @@ def main():
             klines = fetch_historical_kline(code, market, days=250, scale=240)
             if not klines or len(klines) < 60:
                 continue
-            r = _score_candidate(code, stock, klines)
+            r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
                 (deep_results if r.get("overdeep") else results).append(r)
         except Exception:
@@ -462,14 +474,15 @@ def main():
     print("=" * 72)
     if results:
         header = (f"  {'代码':<8}{'名称':<10}{'指数':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
-                  f"{'缩量比':>7}{'站MA20':>7}{'MACD':>6}{'KDJ':>6}{'止跌':>5}{'分':>4}  分级")
+                  f"{'缩量比':>7}{'换手%':>6}{'站MA20':>7}{'MACD':>6}{'KDJ':>6}{'止跌':>5}{'分':>4}  分级")
         print(header)
-        print("  " + "-" * 100)
+        print("  " + "-" * 106)
         for r in results[:top]:
             idx_txt = "/".join(sorted(r["indices"]))
             vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+            tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
             print(f"  {r['code']:<8}{r['name']:<10}{idx_txt:<16}{_fmt_mktcap(r['mktcap']):>8}{r['price']:>8.2f}{r['dd']:>7.1f}"
-                  f"{vol_txt:>7}{('✅' if r['above_ma20'] else '❌'):>7}{r['macd_sig']:>6}"
+                  f"{vol_txt:>7}{tr_txt:>6}{('✅' if r['above_ma20'] else '❌'):>7}{r['macd_sig']:>6}"
                   f"{('✅' if r['kdj_ok'] else '❌'):>6}{('✅' if r['pattern'] else '❌'):>5}"
                   f"{r['score']:>4}  {_verdict(r['score'])}")
     else:
@@ -479,6 +492,7 @@ def main():
     print("  说明:")
     print("    - 指数=候选所属指数（上证50/沪深300/中证红利）；市值=总市值（行情源未覆盖的新纳入成分显示 —）；回撤%=现价距近120日高点跌幅")
     print("    - 缩量比=坑段均量/高点前20日均量（<0.6 健康）；站MA20/MACD金叉/KDJ金叉/止跌形态=企稳信号")
+    print("    - 换手%=今日换手率（<1% 地量见底确认真缩量 / ≥5% 高换手则缩量存疑）")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 确认估值/基本面/买点止损请对单只运行: py .claude/skills/golden-pit/analyze_golden_pit.py <代码>")
 
@@ -493,14 +507,15 @@ def main():
         print("  但个别可能属「深度错杀」，需对单只跑 analyze_golden_pit.py 确认基本面是否未恶化。")
         print()
         dheader = (f"  {'代码':<8}{'名称':<10}{'指数':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
-                   f"{'缩量比':>7}{'站半年线':>8}{'MACD':>6}{'KDJ':>6}{'止跌':>5}")
+                   f"{'缩量比':>7}{'换手%':>6}{'站半年线':>8}{'MACD':>6}{'KDJ':>6}{'止跌':>5}")
         print(dheader)
-        print("  " + "-" * 100)
+        print("  " + "-" * 106)
         for r in deep_results[:n_deep]:
             idx_txt = "/".join(sorted(r["indices"]))
             vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+            tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
             print(f"  {r['code']:<8}{r['name']:<10}{idx_txt:<16}{_fmt_mktcap(r['mktcap']):>8}{r['price']:>8.2f}{r['dd']:>7.1f}"
-                  f"{vol_txt:>7}{('✅' if r['above_ma120'] else '❌'):>8}{r['macd_sig']:>6}"
+                  f"{vol_txt:>7}{tr_txt:>6}{('✅' if r['above_ma120'] else '❌'):>8}{r['macd_sig']:>6}"
                   f"{('✅' if r['kdj_ok'] else '❌'):>6}{('✅' if r['pattern'] else '❌'):>5}")
         print()
         print("  说明: 站半年线(MA120)=长期趋势未完全破坏；缩量比<1.0=抛压衰竭。「站半年线✅且缩量」者更可能是深度错杀，值得进一步查基本面。")

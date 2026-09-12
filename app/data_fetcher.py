@@ -13,6 +13,7 @@ from app.models import Quote, WatchItem, MARKET_PREFIX, NorthFlowData, MarketNew
 from app.config import Config
 from app.utils import log
 from app.http_client import sina_client, eastmoney_client
+from app.helpers import _detect_market
 
 # ============================================================
 # 常量
@@ -255,6 +256,35 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
     except Exception as e:
         log.warning(f"腾讯财经数据解析异常: {e}")
         return {}
+
+
+def fetch_turnover_map(codes: list[str], batch_size: int = 50) -> dict[str, float]:
+    """批量获取换手率 {code: turnover_rate(%)}（腾讯财经，实时/最近收盘）。
+
+    换手率需流通股本，新浪日 K 线只有成交量、无换手率，故走腾讯批量接口补。
+    大池子分片请求，避免单次 URL 过长；单只失败/无数据跳过。
+    """
+    result: dict[str, float] = {}
+    if not codes:
+        return result
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in codes:
+        c = str(c).zfill(6)
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    for i in range(0, len(uniq), batch_size):
+        chunk = uniq[i:i + batch_size]
+        items = [WatchItem(code=c, market=_detect_market(c)) for c in chunk]
+        try:
+            data = fetch_tencent_data(items)
+        except Exception:
+            data = {}
+        for c, d in data.items():
+            if d and d.get("turnover_rate") is not None:
+                result[c] = d["turnover_rate"]
+    return result
 
 
 # ============================================================

@@ -45,6 +45,7 @@ logging.disable(logging.WARNING)
 
 from app.board_pool import resolve_board_pool
 from app.helpers import _detect_market
+from app.data_fetcher import fetch_turnover_map
 from app.technical import (
     fetch_historical_kline,
     calc_sma,
@@ -64,7 +65,7 @@ def _mean_vol(klines) -> float | None:
     return sum(vols) / len(vols) if vols else None
 
 
-def _score_candidate(code: str, stock: dict, klines) -> dict | None:
+def _score_candidate(code: str, stock: dict, klines, turnover: float | None = None) -> dict | None:
     """对单只候选股做右侧机会检测 + 打分（0~100）。不满足「站上MA20 + 至少一个走强确认」直接排除。"""
     n = len(klines)
     if n < 60:
@@ -162,6 +163,15 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         elif vol_ratio >= 1.2:
             score += 20
 
+    # 换手率确认（±5）：量比是相对值，大盘股量比可能虚高；换手率给绝对流动性校准
+    if turnover is not None:
+        if turnover >= 5.0:
+            score += 5      # 高换手，放量可信（资金真在交易）
+        elif turnover >= 2.0:
+            score += 3      # 换手正常，放量有效
+        elif turnover < 1.0 and vol_ratio is not None and vol_ratio >= 1.2:
+            score -= 3      # 低换手却量比高 = 大盘股量比虚高，放量存疑
+
     # 涨幅强度 15（回测：5日已涨≥10% 为追高衰竭、fut20 最差；健康启动 3~6% 相对最好）
     if gain5 is not None:
         if gain5 >= 10:
@@ -193,6 +203,7 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         "price": price,
         "gain5": gain5,
         "vol_ratio": vol_ratio,
+        "turnover": turnover,
         "align": align_txt,
         "macd_sig": macd.signal if macd else "",
         "breakout": breakout_txt,
@@ -330,6 +341,7 @@ def main():
 
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~3 分钟）...")
+    turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     done = 0
     for code, stock in pool.items():
@@ -338,7 +350,7 @@ def main():
             klines = fetch_historical_kline(code, market, days=120, scale=240)
             if not klines or len(klines) < 60:
                 continue
-            r = _score_candidate(code, stock, klines)
+            r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
                 results.append(r)
         except Exception:
@@ -357,20 +369,22 @@ def main():
     print("=" * 72)
     print(f"右侧机会候选（按信号分降序，共 {len(results)} 只，显示前 {min(top, len(results))}）")
     print("=" * 72)
-    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'5日涨%':>7}{'量比':>6}"
+    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'5日涨%':>7}{'量比':>6}{'换手%':>6}"
               f"{'均线':<10}{'MACD':>6}{'突破':<10}{'分':>4}  分级")
     print(header)
-    print("  " + "-" * 92)
+    print("  " + "-" * 98)
     for r in results[:top]:
         gain_txt = f"{r['gain5']:.1f}" if r["gain5"] is not None else "  --"
         vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+        tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
         print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{gain_txt:>7}"
-              f"{vol_txt:>6}{r['align']:<10}{r['macd_sig']:>6}{r['breakout']:<10}"
+              f"{vol_txt:>6}{tr_txt:>6}{r['align']:<10}{r['macd_sig']:>6}{r['breakout']:<10}"
               f"{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("  说明:")
     print("    - 板块=成分归属；5日涨%=近5个交易日涨幅；量比=今日量/前5日均量（≥1.2 放量，≥2 显著放量）")
+    print("    - 换手%=今日换手率（<1% 地量 / 1~3% 正常 / 3~5% 活跃 / ≥5% 高换手），高换手确认真放量、低换手则量比可能虚高存疑")
     print("    - 均线：多头排列(MA5>10>20>60 最强) / MA5>10>20 / MA5>10 / 站MA20；突破=创20/60日新高或逼近高点")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 右侧是突破确认后的顺势仓，回踩 MA5/MA10 是常见买点，跌破 MA20 止损；确认单只对 stock-analysis 或 intraday-signal 细看")

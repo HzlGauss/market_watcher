@@ -46,6 +46,7 @@ logging.disable(logging.WARNING)
 
 from app.board_pool import resolve_board_pool
 from app.helpers import _detect_market
+from app.data_fetcher import fetch_turnover_map
 from app.technical import (
     fetch_historical_kline,
     calc_sma,
@@ -90,7 +91,7 @@ def _detect_reversal_pattern(klines) -> bool:
     return False
 
 
-def _score_candidate(code: str, stock: dict, klines) -> dict | None:
+def _score_candidate(code: str, stock: dict, klines, turnover: float | None = None) -> dict | None:
     """对单只候选股做左侧机会检测 + 打分（0~100）。太浅(<12%)/刚见顶直接排除。"""
     n = len(klines)
     if n < 60:
@@ -177,6 +178,15 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
             score += 8
         # >= 1.0 放量（疑似出货）不加分
 
+    # 换手率确认（±5）：低换手=地量确认真缩量；高换手=抛压未尽/仍有人活跃交易，缩量存疑
+    if turnover is not None:
+        if turnover < 1.0:
+            score += 5      # 地量，缩量可信
+        elif turnover < 2.0:
+            score += 3      # 低换手，抛压衰减
+        elif turnover >= 5.0 and vol_ratio is not None and vol_ratio < 1.0:
+            score -= 3      # 高换手却缩量比低 = 仍有资金活跃，缩量存疑
+
     # 超卖 15（回测：超卖 RSI≤30 略优，信号偏弱，降权）
     if rsi is not None:
         if rsi <= 30:
@@ -216,6 +226,7 @@ def _score_candidate(code: str, stock: dict, klines) -> dict | None:
         "dd": dd,
         "gap": gap,
         "vol_ratio": vol_ratio,
+        "turnover": turnover,
         "rsi": rsi,
         "j": kdj.j if kdj else None,
         "macd_sig": macd.signal if macd else "",
@@ -374,6 +385,7 @@ def main():
 
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~4 分钟）...")
+    turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     deep_results = []
     done = 0
@@ -383,7 +395,7 @@ def main():
             klines = fetch_historical_kline(code, market, days=250, scale=240)
             if not klines or len(klines) < 60:
                 continue
-            r = _score_candidate(code, stock, klines)
+            r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
                 (deep_results if r.get("overdeep") else results).append(r)
         except Exception:
@@ -407,22 +419,24 @@ def main():
     print("=" * 72)
     print(f"左侧机会候选（按信号分降序，共 {len(results)} 只，显示前 {min(top, len(results))}）")
     print("=" * 72)
-    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'回撤%':>7}{'缩量比':>7}"
+    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'回撤%':>7}{'缩量比':>7}{'换手%':>6}"
               f"{'RSI':>6}{'J值':>7}{'MACD':>6}{'站MA20':>7}{'止跌':>5}{'分':>4}  分级")
     print(header)
-    print("  " + "-" * 104)
+    print("  " + "-" * 110)
     for r in results[:top]:
         vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+        tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
         rsi_txt = f"{r['rsi']:.0f}" if r["rsi"] is not None else "  --"
         j_txt = f"{r['j']:.0f}" if r["j"] is not None else "  --"
         print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{r['dd']:>7.1f}"
-              f"{vol_txt:>7}{rsi_txt:>6}{j_txt:>7}{r['macd_sig']:>6}"
+              f"{vol_txt:>7}{tr_txt:>6}{rsi_txt:>6}{j_txt:>7}{r['macd_sig']:>6}"
               f"{('✅' if r['above_ma20'] else '❌'):>7}{('✅' if r['pattern'] else '❌'):>5}"
               f"{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("  说明:")
     print("    - 板块=成分归属（指数名/行业名）；回撤%=现价距近120日高点跌幅；缩量比=回调段均量/高点前20日均量（<0.6 抛压衰竭）")
+    print("    - 换手%=今日换手率（<1% 地量确认真缩量 / ≥5% 高换手则缩量存疑）")
     print("    - RSI<30 / J值≤0 / MACD金叉 = 超卖反转信号；站MA20=初步企稳；止跌=长下影/锤子/看涨吞没")
     print("    - 回测：深跌≠好事——回撤≥40% 多为暴雷（fut20 最差），12~30% 温和超跌反弹最佳；止跌形态+站上 MA120 权重最高")
     print("    - 已超买（RSI>60 或 J>85）= 已反弹到位，不作为「超跌埋伏」列入")

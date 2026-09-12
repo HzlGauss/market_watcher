@@ -43,6 +43,7 @@ logging.disable(logging.WARNING)
 
 from app.helpers import _detect_market
 from app.models import KlineData
+from app.data_fetcher import fetch_turnover_map
 from app.technical import fetch_historical_kline, calc_sma
 
 
@@ -174,7 +175,7 @@ def _second_start(klines: list[KlineData], price: float | None, ma5: float | Non
     return yang and fangliang and above_ma5
 
 
-def _score_candidate(code: str, stock: dict, klines: list[KlineData]) -> dict | None:
+def _score_candidate(code: str, stock: dict, klines: list[KlineData], turnover: float | None = None) -> dict | None:
     """对单只候选股做龙回头检测 + 打分。不满足硬门槛返回 None。"""
     wave = _find_first_wave(klines)
     if wave is None:
@@ -221,6 +222,15 @@ def _score_candidate(code: str, stock: dict, klines: list[KlineData]) -> dict | 
         elif vol_ratio < 1.0:
             score += 6
 
+    # 换手率确认（±3）：连板股换手=人气；回调段换手适中=洗盘充分，过低=人气散尽，过高=分歧/出货
+    if turnover is not None:
+        if 0.5 <= turnover < 8.0:
+            score += 3      # 换手适中，洗盘充分、人气未散
+        elif turnover < 0.5:
+            score -= 3      # 极度缩量，人气散尽
+        elif turnover >= 15.0:
+            score -= 3      # 极高换手，分歧/出货嫌疑
+
     # 回调位置 25（黄金分割：现价回撤占首波涨幅比例）
     # 回测结论（中证1000 池 / 8 个历史交易日切片 / 289 候选）：0.382~0.5 的「教科书标准
     # 回调」实为 fut20 最差（-1.8%、胜率 26.7%），而 0.5~0.618 最优（+6.0%、51.2%）、
@@ -262,6 +272,7 @@ def _score_candidate(code: str, stock: dict, klines: list[KlineData]) -> dict | 
         "gap": gap,
         "retrace": retrace,
         "vol_ratio": vol_ratio,
+        "turnover": turnover,
         "fib": fib,
         "industry": stock["industry"],
         "name": stock["name"],
@@ -313,6 +324,7 @@ def main():
     # ---- 逐股检测打分 ----
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~2 分钟）...")
+    turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     done = 0
     for code, stock in pool.items():
@@ -321,7 +333,7 @@ def main():
             klines = fetch_historical_kline(code, market, days=60, scale=240)
             if not klines or len(klines) < 20:
                 continue
-            r = _score_candidate(code, stock, klines)
+            r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
                 r["code"] = code
                 results.append(r)
@@ -342,18 +354,20 @@ def main():
     print("=" * 72)
     print(f"龙回头候选（按信号分降序，共 {len(results)} 只，显示前 {min(top, len(results))}）")
     print("=" * 72)
-    header = f"  {'代码':<8}{'名称':<10}{'行业':<10}{'连板':>4}{'首波%':>7}{'回撤%':>7}{'缩量比':>7}{'黄金位':>7}{'分':>4}  分级"
+    header = f"  {'代码':<8}{'名称':<10}{'行业':<10}{'连板':>4}{'首波%':>7}{'回撤%':>7}{'缩量比':>7}{'换手%':>6}{'黄金位':>7}{'分':>4}  分级"
     print(header)
-    print("  " + "-" * 78)
+    print("  " + "-" * 84)
     for r in results[:top]:
         fib_txt = f"{r['fib'] * 100:.0f}%" if r["fib"] is not None else "  --"
         vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+        tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
         print(f"  {r['code']:<8}{r['name']:<10}{r['industry']:<10}{r['consec']:>4}"
-              f"{r['rise']:>7.1f}{r['retrace']:>7.1f}{vol_txt:>7}{fib_txt:>7}{r['score']:>4}  {_verdict(r['score'])}")
+              f"{r['rise']:>7.1f}{r['retrace']:>7.1f}{vol_txt:>7}{tr_txt:>6}{fib_txt:>7}{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("  说明:")
     print("    - 连板=近N日最高连板数；缩量比=回调均量/首波均量（<0.7 健康）；黄金位=回撤占首波涨幅比例")
+    print("    - 换手%=今日换手率（连板股换手=人气：0.5~8% 洗盘充分 / <0.5% 人气散尽 / ≥15% 分歧出货）")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 确认买卖点/止损请对单只运行: py .claude/skills/dragon-pullback/analyze_dragon_pullback.py <代码>")
     return 0
