@@ -88,6 +88,9 @@ py .claude/skills/left-side/scan_left_side.py <板块/行业> [输出数量]
 # Right-side scan (右侧选股：板块/行业放量突破候选扫描)
 py .claude/skills/right-side/scan_right_side.py <板块/行业> [输出数量]
 
+# Strong-support + box-extreme-low scan (强支撑+箱体极低位选股：单维度技术筛选)
+py .claude/skills/support-box/scan_support_box.py <板块/行业> [输出数量]
+
 # Threshold backtests (阈值历史收益回测：中证1000成分 + 日K线，验证各 skill 打分阈值)
 py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
 py .claude/skills/left-side/backtest_left_side.py [回测日期数]
@@ -115,6 +118,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`market-heat`** — 市场热度雷达：拉取最近交易日涨幅榜、跌幅榜、龙虎榜，聚合行业与概念板块资金流，分析当前热点方向（资金在买什么板块）和避坑方向（资金在撤离什么板块），并给出市场情绪周期判断。用户问「最近热点是什么」「哪些板块在涨/在跌」「龙虎榜资金动向」「现在该关注/回避什么方向」「市场情绪怎么样」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-heat/SKILL.md`。
 - **`left-side`** — 左侧选股扫描：输入板块/行业（创业板/科创板/沪深300/中证500/中证1000/半导体/芯片/化工...），解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」检测打分，输出左侧机会（底部左侧买入、赌反转/埋伏）候选，并对 top 候选做妙想估值/基本面门槛。用户问「XX 板块/行业里有没有跌到位、可以埋伏/抄底/左侧买的票」「XX 有没有超跌机会」时使用。成分池用 app.board_pool（指数成分 akshare + 东财 clist），核心不依赖 `MX_APIKEY`。详见 `.claude/skills/left-side/SKILL.md`。
 - **`right-side`** — 右侧选股扫描：输入板块/行业，解析成分股池，逐股按「均线多头→放量突破→MACD动量→涨幅强度」检测打分，输出右侧机会（底部右侧买入、突破确认后顺势追）候选，并对 top 候选做妙想主力资金确认。用户问「XX 板块/行业里有没有已启动、可以顺势/追涨/右侧买的票」「XX 有没有突破/放量机会」时使用。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/right-side/SKILL.md`。
+- **`support-box`** — 强支撑+箱体极低位选股扫描：输入板块/行业，解析成分股池，逐股**只按「箱体极低位 + 到达强支撑」这一个维度**检测打分，输出已跌到近期箱体极低位、且紧贴下方强支撑位的候选。用户问「XX 板块里有没有跌到箱体底部、紧贴强支撑的票」「哪些票到了强支撑位 + 箱体下沿」时使用。纯技术维度筛选，不含基本面/缩量/超卖；需叠加左侧逻辑走 `left-side`。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/support-box/SKILL.md`。
 
 ## Configuration
 
