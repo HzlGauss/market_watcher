@@ -1050,10 +1050,10 @@ def fetch_global_markets() -> dict[str, str]:
         if not match:
             return {}
         fields = match.group(1).split(",")
-        # 港股格式: 名称,今开,昨收,现价,最高,最低,涨跌额,涨跌幅,...
-        if len(fields) > 7:
-            price = fields[3]
-            chg_pct = fields[7]
+        # 港股格式: 代码,名称,今开,昨收,最高,最低,现价,涨跌额,涨跌幅,...
+        if len(fields) > 8:
+            price = fields[6]
+            chg_pct = fields[8]
             return {"恒生指数": f"{price} ({chg_pct}%)"}
         return {}
 
