@@ -91,6 +91,12 @@ py .claude/skills/right-side/scan_right_side.py <板块/行业> [输出数量]
 # Strong-support + box-extreme-low scan (强支撑+箱体极低位选股：单维度技术筛选)
 py .claude/skills/support-box/scan_support_box.py <板块/行业> [输出数量]
 
+# Market watch (大盘盯盘：8指数+广度+板块资金流+两融 → 大盘强弱/进攻防守)
+py .claude/skills/market-watch/scan_market_watch.py
+
+# Limit-up/down analysis (涨跌停分析：涨停梯队/炸板率/封单/题材/跌停 → 短线情绪周期)
+py .claude/skills/limit-analysis/scan_limit.py [日期YYYYMMDD]
+
 # Threshold backtests (阈值历史收益回测：中证1000成分 + 日K线，验证各 skill 打分阈值)
 py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
 py .claude/skills/left-side/backtest_left_side.py [回测日期数]
@@ -119,6 +125,8 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`left-side`** — 左侧选股扫描：输入板块/行业（创业板/科创板/沪深300/中证500/中证1000/半导体/芯片/化工...），解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」检测打分，输出左侧机会（底部左侧买入、赌反转/埋伏）候选，并对 top 候选做妙想估值/基本面门槛。用户问「XX 板块/行业里有没有跌到位、可以埋伏/抄底/左侧买的票」「XX 有没有超跌机会」时使用。成分池用 app.board_pool（指数成分 akshare + 东财 clist），核心不依赖 `MX_APIKEY`。详见 `.claude/skills/left-side/SKILL.md`。
 - **`right-side`** — 右侧选股扫描：输入板块/行业，解析成分股池，逐股按「均线多头→放量突破→MACD动量→涨幅强度」检测打分，输出右侧机会（底部右侧买入、突破确认后顺势追）候选，并对 top 候选做妙想主力资金确认。用户问「XX 板块/行业里有没有已启动、可以顺势/追涨/右侧买的票」「XX 有没有突破/放量机会」时使用。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/right-side/SKILL.md`。
 - **`support-box`** — 强支撑+箱体极低位选股扫描：输入板块/行业，解析成分股池，逐股**只按「箱体极低位 + 到达强支撑」这一个维度**检测打分，输出已跌到近期箱体极低位、且紧贴下方强支撑位的候选。用户问「XX 板块里有没有跌到箱体底部、紧贴强支撑的票」「哪些票到了强支撑位 + 箱体下沿」时使用。纯技术维度筛选，不含基本面/缩量/超卖；需叠加左侧逻辑走 `left-side`。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/support-box/SKILL.md`。
+- **`market-watch`** — 大盘盯盘：拉 8 大核心指数实时行情 + 近 60 日位置 + 全市场广度（涨跌家数/成交额/涨跌停）+ 行业/概念板块领涨领跌 + 两融余额（替代已停披露的北向资金），判断当前大盘强弱与进攻/防守。用户问「今天大盘怎么样」「大盘强不强」「现在该进攻还是防守」「指数什么位置」「市场广度/情绪如何」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-watch/SKILL.md`。
+- **`limit-analysis`** — 涨跌停深度分析：拉最近交易日涨停池/炸板池/跌停池，算涨停梯队（连板高度分层）、炸板率、封单额 TOP、题材归类、跌停池，判断短线情绪周期与主线题材。涨跌停用东财精确口径（10%/20%/ST 5%），非 9.9% 近似。用户问「今天多少涨停/跌停」「涨停梯队/连板高度」「炸板率」「谁在涨停、什么题材」「短线情绪怎么样」「空间板是谁」时使用。需 `pip install akshare`。详见 `.claude/skills/limit-analysis/SKILL.md`。
 
 ## Configuration
 
