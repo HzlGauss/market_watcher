@@ -1948,6 +1948,231 @@ def detect_market_regime(
 
 
 @dataclass
+class StageDetection:
+    """价格周期阶段识别结果（7 阶段全周期分类器）
+
+    由 detect_stage() 计算，供 stock-analysis 与报告共用。
+    三轴交叉：趋势轴（均线排列/MA20 斜率） + 量能轴（量比） + 动量轴（RSI/KDJ J 值），
+    可选叠加资金轴（主力净流入，判断价量背离）。
+    """
+    stage: str = "数据不足"          # 下跌期 / 磨底期 / 启动期 / 主升浪 / 赶顶期 / 派发期 / 震荡市(方向未明)
+    confidence: int = 0              # 0-100
+    trend_axis: str = ""             # 趋势轴描述
+    volume_axis: str = ""            # 量能轴描述
+    momentum_axis: str = ""          # 动量轴描述
+    fund_axis: str = ""              # 资金轴描述（未传入资金数据时为空）
+    action: str = ""                 # 对应操作建议
+    reasons: list[str] = None        # 命中判据（供展示/LLM）
+
+
+def detect_stage(
+    klines: list[KlineData],
+    tech: Optional[TechnicalSummary] = None,
+    main_inflow_1d: Optional[float] = None,   # 最新一日主力净流入（亿元）
+    main_inflow_5d: Optional[float] = None,   # 近5日主力累计净流入（亿元）
+    price_change_1d: Optional[float] = None,  # 最新一日涨跌幅（%）
+) -> StageDetection:
+    """识别当前价格周期阶段（7 阶段）
+
+    阶段：下跌期 / 磨底期 / 启动期 / 主升浪 / 赶顶期 / 派发期 / 震荡市(方向未明)
+
+    判定规则（三轴交叉，趋势轴定方向，量能/动量轴细化，资金轴做背离覆盖）：
+    - 趋势轴：均线排列（多头/空头/缠绕/多头回调/空头反弹）+ 现价 vs MA20/MA60
+    - 量能轴：量比 = 当日量 / 前5日均量（放量 ≥1.2 / 缩量 ≤0.8 / 温和）
+    - 动量轴：RSI + KDJ J 值（超卖 J≤10 或 RSI≤30 / 超买 J≥90 或 RSI≥70）
+    - 资金轴（可选）：价涨主力净流出 = 背离（派发/赶顶信号），价跌主力净流入 = 逆势吸筹（磨底确认）
+
+    主要给 stock-analysis ②/③ 段与报告做「当前处于哪个阶段」的一等判断，
+    替代此前由 AI 在数据包上临时合成的阶段归位。
+    """
+    result = StageDetection()
+    result.reasons = []
+
+    closes = [k.close for k in klines if k.close is not None]
+    if len(closes) < 20:
+        result.reasons.append("需至少 20 根 K 线")
+        return result
+
+    price = closes[-1]
+    highs = [k.high for k in klines if k.high is not None]
+    lows = [k.low for k in klines if k.low is not None]
+
+    # ---- MA（直接算，不依赖 calc_ma_alignment 的 60 根硬门槛，≥20 根即可）----
+    def _sma_last(series: list[float], period: int) -> Optional[float]:
+        sma = calc_sma(series, period)
+        return sma[-1] if sma and sma[-1] is not None else None
+
+    ma5 = _sma_last(closes, 5)
+    ma10 = _sma_last(closes, 10)
+    ma20 = _sma_last(closes, 20)
+    ma60 = _sma_last(closes, 60)  # <60 根时为 None
+
+    ma20_prev = _sma_last(closes[:-1], 20)
+    ma20_rising = ma20_prev is not None and ma20 is not None and ma20 > ma20_prev
+    ma20_falling = ma20_prev is not None and ma20 is not None and ma20 < ma20_prev
+
+    if ma5 is not None and ma10 is not None and ma20 is not None:
+        if ma5 > ma10 > ma20 and (ma60 is None or ma20 > ma60):
+            ma_align = "多头排列"
+        elif ma5 < ma10 < ma20 and (ma60 is None or ma20 < ma60):
+            ma_align = "空头排列"
+        elif ma5 < ma10 and ma20_rising:
+            ma_align = "多头回调"
+        elif ma5 > ma10 and ma20_falling:
+            ma_align = "空头反弹"
+        else:
+            ma_align = "缠绕"
+    else:
+        ma_align = "缠绕"
+
+    # ---- 动量指标（tech 传入且有效时复用，否则自算）----
+    if tech is not None and tech.rsi is not None and tech.kdj_j is not None and tech.macd_signal:
+        rsi = tech.rsi
+        j = tech.kdj_j
+        macd_signal = tech.macd_signal
+    else:
+        rsi = calc_rsi(closes)
+        kdj = calc_kdj(highs, lows, closes)
+        j = kdj.j
+        macd = calc_macd(closes)
+        macd_signal = macd.signal
+
+    # ---- 量能轴：量比 = 当日量 / 前5日均量 ----
+    vols = [k.volume for k in klines if k.volume is not None]
+    vol_ratio: Optional[float] = None
+    if len(vols) >= 6 and vols[-1] and sum(vols[-6:-1]) > 0:
+        vol_ratio = vols[-1] / (sum(vols[-6:-1]) / 5)
+
+    # ---- 趋势轴 ----
+    if ma_align == "多头排列":
+        trend_axis = "多头排列"
+    elif ma_align == "空头排列":
+        trend_axis = "空头排列"
+    elif ma_align == "多头回调":
+        trend_axis = "多头回调"
+    elif ma_align == "空头反弹":
+        trend_axis = "空头反弹"
+    else:
+        trend_axis = "缠绕(无方向)"
+
+    bias20 = (price - ma20) / ma20 * 100 if ma20 else 0.0
+
+    # ---- 动量轴 ----
+    overbought = (j is not None and j >= 90) or (rsi is not None and rsi >= 70)
+    oversold = (j is not None and j <= 10) or (rsi is not None and rsi <= 30)
+    if overbought:
+        momentum_axis = "超买"
+    elif oversold:
+        momentum_axis = "超卖"
+    else:
+        momentum_axis = "中性"
+
+    # ---- 量能轴描述 ----
+    if vol_ratio is None:
+        volume_axis = "—"
+    elif vol_ratio >= 1.2:
+        volume_axis = f"放量({vol_ratio:.2f}倍)"
+    elif vol_ratio <= 0.8:
+        volume_axis = f"缩量({vol_ratio:.2f}倍)"
+    else:
+        volume_axis = f"温和({vol_ratio:.2f}倍)"
+
+    # ---- 阶段判定（决策树）----
+    stage = "震荡市(方向未明)"
+    confidence = 40
+
+    recent_high_20 = max(closes[-20:])
+    drawdown_high = (recent_high_20 - price) / recent_high_20 * 100 if recent_high_20 else 0.0
+
+    if ma_align in ("空头排列", "空头反弹"):
+        if vol_ratio is not None and vol_ratio <= 0.8 and oversold:
+            stage = "磨底期"
+            confidence = 65
+            result.reasons.append("空头末期 + 缩量 + 超卖，抛压衰竭，左侧埋伏区")
+        else:
+            stage = "下跌期"
+            confidence = 70 if ma_align == "空头排列" else 55
+            result.reasons.append("均线空头，仍在下杀，别接飞刀")
+
+    elif ma_align == "缠绕":
+        if vol_ratio is not None and vol_ratio <= 0.8 and (oversold or (rsi is not None and rsi <= 40)):
+            stage = "磨底期"
+            confidence = 55
+            result.reasons.append("均线缠绕 + 缩量 + 偏超卖，疑似底部横盘")
+        else:
+            stage = "震荡市(方向未明)"
+            confidence = 45
+            result.reasons.append("均线缠绕，方向未明，宜观望")
+
+    elif ma_align in ("多头排列", "多头回调"):
+        if overbought and (bias20 >= 15 or (vol_ratio is not None and vol_ratio >= 1.3)):
+            stage = "赶顶期"
+            confidence = 60
+            result.reasons.append("超买 + 乖离过大/放天量，加速见顶，警惕止盈")
+        elif vol_ratio is not None and vol_ratio >= 1.2 and macd_signal in ("金叉", "多头") and drawdown_high < 8:
+            stage = "启动期"
+            confidence = 60
+            result.reasons.append("放量 + MACD 转多 + 距近期高点近，刚突破启动")
+        else:
+            stage = "主升浪"
+            confidence = 65
+            result.reasons.append("均线多头，趋势中继，持有为主")
+
+    # 派发期：跌破 MA20 + 从近期高点回落 8%~25%（刚从高位回落，非深跌成空头）
+    if ma20 and price < ma20 and 8 <= drawdown_high < 25 and ma_align != "空头排列":
+        if vol_ratio is None or vol_ratio >= 0.9:
+            stage = "派发期"
+            confidence = 55
+            result.reasons.append("跌破 MA20 + 高位回落 + 量能未缩，疑似派发出货")
+
+    # ---- 资金轴（可选）：价量背离覆盖 ----
+    if main_inflow_1d is not None:
+        if main_inflow_1d < 0:
+            if price_change_1d is not None and price_change_1d > 0:
+                result.fund_axis = f"主力净流出 {main_inflow_1d:+.2f}亿(价涨背离)"
+                if stage in ("主升浪", "启动期") and overbought:
+                    stage = "赶顶期"
+                    confidence = max(confidence, 70)
+                    result.reasons.append("价涨但主力净流出，高位派发背离")
+                elif stage == "主升浪":
+                    result.reasons.append("价涨但主力净流出，动能存疑，追高需谨慎")
+            else:
+                result.fund_axis = f"主力净流出 {main_inflow_1d:+.2f}亿"
+        else:
+            result.fund_axis = f"主力净流入 {main_inflow_1d:+.2f}亿"
+            if stage == "磨底期":
+                confidence = max(confidence, 70)
+                result.reasons.append("主力逆势净流入，磨底吸筹确认")
+    elif main_inflow_5d is not None:
+        if main_inflow_5d > 0:
+            result.fund_axis = f"5日主力净流入 {main_inflow_5d:+.2f}亿"
+            if stage == "磨底期":
+                confidence = max(confidence, 70)
+                result.reasons.append("5日主力净流入，磨底吸筹确认")
+        else:
+            result.fund_axis = f"5日主力净流出 {main_inflow_5d:+.2f}亿"
+
+    result.stage = stage
+    result.confidence = min(confidence, 95)
+    result.trend_axis = trend_axis
+    result.volume_axis = volume_axis
+    result.momentum_axis = momentum_axis
+
+    action_map = {
+        "下跌期": "空仓观望，别接飞刀",
+        "磨底期": "左侧分批埋伏，破位止损",
+        "启动期": "右侧确认，可试仓追入",
+        "主升浪": "持有为主，移动止盈",
+        "赶顶期": "止盈减仓，不追高",
+        "派发期": "离场/减仓，警惕补跌",
+        "震荡市(方向未明)": "观望等方向",
+    }
+    result.action = action_map.get(stage, "观望")
+
+    return result
+
+
+@dataclass
 class BoxRegime:
     """箱体震荡 + 网格适用性诊断结果
 

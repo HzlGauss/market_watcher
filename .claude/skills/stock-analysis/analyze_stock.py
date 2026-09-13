@@ -310,6 +310,8 @@ def main():
             rows.append((d, r, close))
 
     last_close = last_open = last_pct = None
+    klines = None
+    ts = None
     if rows:
         rows.sort(key=lambda x: x[0])  # 日期升序
         closes = [c for _, _, c in rows]
@@ -355,6 +357,18 @@ def main():
             print(f"  支撑 {_fmt_price(ts.support)} / 压力 {_fmt_price(ts.resistance)}  |  ATR {_fmt_price(ts.atr)}")
             if ts.signals:
                 print("  技术信号: " + " | ".join(ts.signals))
+
+        # 阶段定位（技术面三轴：趋势 + 量能 + 动量，资金轴在③段确认）
+        try:
+            stage = T.detect_stage(klines, ts)
+            if stage.stage != "数据不足":
+                print(f"  阶段定位: {stage.stage}（置信度{stage.confidence}%）| "
+                      f"趋势:{stage.trend_axis} 量能:{stage.volume_axis} 动量:{stage.momentum_axis}")
+                if stage.reasons:
+                    print(f"    判据: " + "；".join(stage.reasons))
+                print(f"    建议: {stage.action}")
+        except Exception:
+            pass
 
         if box is not None and box.regime and box.regime != "数据不足":
             pos = f"  现价位置 {box.pos_pct:.0f}%" if box.pos_pct is not None else ""
@@ -434,6 +448,23 @@ def main():
                 print(f"  ⚠️ 背离：最新日价跌({last_pct:+.2f}%)但主力净流入 {latest_main / 1e8:+.2f} 亿（逆势吸筹）")
             elif latest_main < 0 and last_pct > 0:
                 print(f"  ⚠️ 背离：最新日价涨({last_pct:+.2f}%)但主力净流出 {latest_main / 1e8:+.2f} 亿（拉高出货）")
+
+        # 阶段定位（资金轴确认，三轴完整）
+        if klines is not None:
+            try:
+                full_stage = T.detect_stage(
+                    klines, ts,
+                    main_inflow_1d=(latest_main / 1e8) if latest_main is not None else None,
+                    main_inflow_5d=(tot / 1e8) if tot else None,
+                    price_change_1d=last_pct,
+                )
+                if full_stage.stage != "数据不足":
+                    fund_txt = full_stage.fund_axis or "资金数据缺失"
+                    print(f"  → 阶段定位（含资金）: {full_stage.stage}（置信度{full_stage.confidence}%）| 资金轴:{fund_txt}")
+                    if full_stage.reasons:
+                        print(f"    判据: " + "；".join(full_stage.reasons))
+            except Exception:
+                pass
 
         # 拆单检测（纯净额版）：小单单边活跃 + 大单/超大单近乎沉默 = 疑似拆单
         split_signal = detect_split_order_from_nets(

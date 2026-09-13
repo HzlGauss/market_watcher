@@ -276,6 +276,7 @@ def _get_holdings_tech_analysis(
         calc_composite_score,
         detect_market_regime,
         detect_box_regime,
+        detect_stage,
         MarketRegime,
         rsi_signal,
         detect_gap,
@@ -351,6 +352,18 @@ def _get_holdings_tech_analysis(
             regime = MarketRegime(regime="未知", suggestion="", confidence="低")
             from app.utils import log
             log.warning(f"复合评分计算失败 [{h.code}]: {exc}")
+
+        # 阶段定位（7阶段全周期，趋势/量能/动量 + 资金轴背离）
+        try:
+            main_1d = (quote.main_net_inflow / 1e8) if quote.main_net_inflow else None
+            stage = detect_stage(
+                klines, tech_summary,
+                main_inflow_1d=main_1d,
+                price_change_1d=quote.change_pct,
+            )
+        except Exception as exc:
+            stage = None
+            log.warning(f"阶段定位计算失败 [{h.code}]: {exc}")
         support_parts = []
         if sr.support:
             support_parts.append(f"主支撑:{sr.support:.3f}")
@@ -461,6 +474,15 @@ def _get_holdings_tech_analysis(
             "is_box": box.is_box,
             "grid_verdict": box.grid_verdict,
             "grid_verdict_reason": box.grid_verdict_reason,
+            # 阶段定位（7阶段全周期）
+            "stage": stage.stage if stage else "数据不足",
+            "stage_confidence": stage.confidence if stage else 0,
+            "stage_trend": stage.trend_axis if stage else "",
+            "stage_volume": stage.volume_axis if stage else "",
+            "stage_momentum": stage.momentum_axis if stage else "",
+            "stage_fund": stage.fund_axis if stage else "",
+            "stage_action": stage.action if stage else "",
+            "stage_reasons": stage.reasons if stage else [],
         }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -516,6 +538,55 @@ def _format_box_grid_section(tech_data: list[dict]) -> tuple[str, str]:
         llm_parts.append(
             f"{name}: 箱体={regime}(评分{score}) 区间[{box_range}] 位置{pos_s} "
             f"日均振幅{amp_s} → 代码判定:{verdict}"
+        )
+
+    return "\n".join(lines), "  " + "\n  ".join(llm_parts)
+
+
+def _format_stage_section(tech_data: list[dict], title: str = "## 🧭 阶段定位（代码判定）") -> tuple[str, str]:
+    """阶段定位数据表（7阶段全周期，代码确定性判定）
+
+    Returns:
+        (markdown, llm紧凑文本)；两者均为 "" 表示无有效数据。
+    """
+    rows = [t for t in tech_data if t.get("stage") and t["stage"] != "数据不足"]
+    if not rows:
+        return "", ""
+
+    lines = [title, ""]
+    lines.append("| 标的 | 阶段 | 置信度 | 趋势 | 量能 | 动量 | 操作建议 |")
+    lines.append("|------|------|--------|------|------|------|---------|")
+
+    stage_icon = {
+        "下跌期": "🔴", "磨底期": "🟡", "启动期": "🟢", "主升浪": "🟢",
+        "赶顶期": "🔴", "派发期": "🔴", "震荡市(方向未明)": "⚪",
+    }
+
+    llm_parts = []
+    for t in rows:
+        name = t.get("name") or t.get("code", "")
+        code = t.get("code", "")
+        stage = t.get("stage", "")
+        conf = t.get("stage_confidence", 0)
+        trend = t.get("stage_trend", "")
+        vol = t.get("stage_volume", "")
+        mom = t.get("stage_momentum", "")
+        fund = t.get("stage_fund", "")
+        action = t.get("stage_action", "")
+        reasons = t.get("stage_reasons") or []
+
+        icon = stage_icon.get(stage, "⚪")
+        stage_s = f"{icon} {stage}" + (f"（{fund}）" if fund else "")
+
+        lines.append(
+            f"| {name}({code}) | {stage_s} | {conf}% | {trend} | {vol} | {mom} | {action} |"
+        )
+        detail = "；".join(reasons) if reasons else ""
+        llm_parts.append(
+            f"{name}: 阶段={stage}(置信度{conf}%) 趋势{trend} 量能{vol} 动量{mom} "
+            + (f"资金[{fund}] " if fund else "")
+            + f"→ 建议:{action}"
+            + (f"（{detail}）" if detail else "")
         )
 
     return "\n".join(lines), "  " + "\n  ".join(llm_parts)
@@ -705,6 +776,7 @@ def generate_morning_brief(config: Config) -> Path | None:
          for w in config.watch_items], quotes
     ) if config.watch_items and quotes else []
     box_md, box_llm = _format_box_grid_section(tech_data + watch_tech)
+    stage_md, stage_llm = _format_stage_section(tech_data + watch_tech)
 
     if strategy_signals:
         data_lines.append(f"\n## 五、⭐ 组合策略信号（多指标共振）")
@@ -744,6 +816,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     # 箱体震荡与网格判定（代码判定，覆盖自选+持仓）
     if box_md:
         data_lines.append("\n" + box_md)
+    # 阶段定位（7阶段全周期，代码判定）
+    if stage_md:
+        data_lines.append("\n" + stage_md)
 
     # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
     _append_mx_analysis(data_lines, config, all_items, quotes)
@@ -857,6 +932,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     if box_llm:
         llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
         llm_lines.append(box_llm)
+    if stage_llm:
+        llm_lines.append("\n[🧭 阶段定位（代码预计算）]")
+        llm_lines.append(stage_llm)
 
     llm_lines.append(f"""
 
@@ -1013,6 +1091,7 @@ def generate_midday_review(config: Config) -> Path | None:
          for w in config.watch_items], quotes
     ) if config.watch_items and quotes else []
     box_md, box_llm = _format_box_grid_section(tech_data + watch_tech)
+    stage_md, stage_llm = _format_stage_section(tech_data + watch_tech)
     if tech_data:
         data_lines.append("\n## 六、持仓技术分析")
         data_lines.append("")
@@ -1084,6 +1163,9 @@ def generate_midday_review(config: Config) -> Path | None:
     # 箱体震荡与网格判定（代码判定，覆盖自选+持仓）
     if box_md:
         data_lines.append("\n" + box_md)
+    # 阶段定位（7阶段全周期，代码判定）
+    if stage_md:
+        data_lines.append("\n" + stage_md)
 
     # 妙想分析：消息面 + 体检 + 评级事件（持仓+自选全量）
     _append_mx_analysis(data_lines, config, all_items, quotes)
@@ -1202,6 +1284,9 @@ def generate_midday_review(config: Config) -> Path | None:
     if box_llm:
         llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
         llm_lines.append(box_llm)
+    if stage_llm:
+        llm_lines.append("\n[🧭 阶段定位（代码预计算）]")
+        llm_lines.append(stage_llm)
 
     llm_lines.append(f"""
 
@@ -3480,8 +3565,12 @@ def generate_evening_review(config: Config) -> Path | None:
     box_md, box_llm = _format_box_grid_section(
         tech_data_evening + (watch_tech if watchlist else [])
     )
+    stage_md, stage_llm = _format_stage_section(tech_data_evening + (watch_tech if watchlist else []))
     if box_md:
         data_lines.append("\n" + box_md)
+    # 阶段定位（7阶段全周期，代码判定）
+    if stage_md:
+        data_lines.append("\n" + stage_md)
 
     # 个股两融数据（融资融券，逐标的：持仓 + 自选，仅普通 A 股）
     from app.data_fetcher import fetch_stock_margin_detail
@@ -3717,6 +3806,9 @@ def generate_evening_review(config: Config) -> Path | None:
     if box_llm:
         llm_lines.append("\n[📦 箱体与网格（代码预计算）]")
         llm_lines.append(box_llm)
+    if stage_llm:
+        llm_lines.append("\n[🧭 阶段定位（代码预计算）]")
+        llm_lines.append(stage_llm)
 
     llm_lines.append(f"""
 
@@ -3829,6 +3921,7 @@ def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: f
         calc_support_resistance,
         calc_composite_score,
         detect_market_regime,
+        detect_stage,
         MarketRegime,
     )
 
@@ -3852,6 +3945,7 @@ def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: f
 
     composite = {"score": 0, "label": "", "signals": [], "breakdown": {}}
     regime = MarketRegime()
+    stage = None
     if tech is not None and quote is not None:
         try:
             flow_pct = None
@@ -3861,6 +3955,15 @@ def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: f
             regime = detect_market_regime(tech, quote.price or 0, sr.atr)
         except Exception:
             pass
+        try:
+            main_1d = (quote.main_net_inflow / 1e8) if quote.main_net_inflow else None
+            stage = detect_stage(
+                klines, tech,
+                main_inflow_1d=main_1d,
+                price_change_1d=quote.change_pct,
+            )
+        except Exception:
+            stage = None
 
     return {
         "name": item.name,
@@ -3882,6 +3985,15 @@ def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: f
         "composite_signals": composite.get("signals", []),
         "market_regime": regime.regime,
         "crowd_label": "",
+        # 阶段定位（7阶段全周期）
+        "stage": stage.stage if stage else "数据不足",
+        "stage_confidence": stage.confidence if stage else 0,
+        "stage_trend": stage.trend_axis if stage else "",
+        "stage_volume": stage.volume_axis if stage else "",
+        "stage_momentum": stage.momentum_axis if stage else "",
+        "stage_fund": stage.fund_axis if stage else "",
+        "stage_action": stage.action if stage else "",
+        "stage_reasons": stage.reasons if stage else [],
     }
 
 
@@ -4002,6 +4114,11 @@ def generate_weekly_review(config: Config) -> Path | None:
             f"| {d['name']} | {d['ma_alignment']} | {rsi} | {d['macd_signal']} "
             f"| {d['kdj_signal']} | {d['obv_signal']} | {sup} | {res} |")
 
+    # 阶段定位（7阶段全周期，代码判定，复用共享表）
+    stage_md, stage_llm = _format_stage_section(weekly_data, title="### 阶段定位（代码判定）")
+    if stage_md:
+        data_lines.append("\n" + stage_md)
+
     # 四、个股两融（杠杆资金，仅普通 A 股；ETF/指数/基金/港股无个股两融明细）
     stock_margin = fetch_stock_margin_detail()
     margin_targets = []  # [(name, code, StockMarginData)]
@@ -4085,6 +4202,9 @@ def generate_weekly_review(config: Config) -> Path | None:
             f"  {d['name']}({d['code']})[{d['type']}]: 近5日{wr} 超额{ex} "
             f"评分{d['composite_score']} 均线{d['ma_alignment']} RSI{d['rsi_signal']} "
             f"MACD{d['macd_signal']} 支撑{sup} 压力{res}")
+    if stage_llm:
+        llm_lines.append("\n[🧭 阶段定位（代码预计算）]")
+        llm_lines.append(stage_llm)
     if margin_llm_lines:
         llm_lines.append("\n[个股两融（杠杆资金，仅普通 A 股）]")
         llm_lines.append("  " + "；".join(margin_llm_lines))
