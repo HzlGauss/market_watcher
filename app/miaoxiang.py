@@ -636,10 +636,18 @@ class MXClient:
         if not s or s in ("-", "--", "None", "null", "nan"):
             return None
         try:
+            # 妙想金额常见「9.483亿元」「2493万元」「0元」等带「元」的单位，
+            # 先剥「元」再判断「亿/万」，否则 endswith("亿") 匹配不上
+            if s.endswith("亿元"):
+                return float(s[:-2]) * 1e8
+            if s.endswith("万元"):
+                return float(s[:-2]) * 1e4
             if s.endswith("亿"):
                 return float(s[:-1]) * 1e8
             if s.endswith("万"):
                 return float(s[:-1]) * 1e4
+            if s.endswith("元"):
+                return float(s[:-1])
             return float(s)
         except ValueError:
             return None
@@ -1385,7 +1393,7 @@ def fetch_etf_fund_flow(config, items) -> dict:
         return {}
 
     # 过滤出 ETF：优先 A股 ETF 代码号段，type/name 兜底（holdings 里的 ETF 常无 type 且名不带"ETF"）
-    _ETF_PREFIXES = ("51", "56", "58", "159")
+    _ETF_PREFIXES = ("51", "56", "58", "15", "16", "18")
     etfs: list[tuple[str, str]] = []
     seen: set[str] = set()
     for it in items:

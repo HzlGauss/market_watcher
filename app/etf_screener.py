@@ -101,7 +101,7 @@ def _get_etf_list() -> list[dict]:
                         'price': _safe_float(row.get('最新价')) or 0,
                         'amount': amount,
                         'volume': _safe_float(row.get('成交量')) or 0,
-                        'change_pct': _safe_float(row.get('涨跌额')) or 0,
+                        'change_pct': _safe_float(row.get('涨跌幅')) or 0,
                     })
 
             etfs.sort(key=lambda x: x['amount'], reverse=True)

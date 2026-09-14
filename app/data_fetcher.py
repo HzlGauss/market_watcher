@@ -1607,6 +1607,87 @@ def _etf_name_to_industry(name: str) -> str:
     return ""
 
 
+def fetch_etf_spot_snapshot() -> list[dict]:
+    """获取全市场 ETF 实时快照（规模/折溢价/份额/单日资金流一次拿全）
+
+    数据源：东方财富 fund_etf_spot_em（akshare，push2delay 域名，一次调用返回
+    全市场约 1600 只 ETF 的实时行情 + IOPV/折价率 + 最新份额/流通市值/总市值
+    + 主力净流入等）。这是 ETF 筛选「流动性+规模」硬门槛和「资金流+份额」
+    维度的免费数据源，无需 MX_APIKEY。
+
+    失败时回退到 etf_screener._get_etf_list()（新浪源，仅有行情/成交额/成交量，
+    无规模/折溢价/份额/资金流字段）。
+
+    Returns:
+        [{code, name, price, change_pct, amount, volume, turnover, mktcap,
+          share, premium, iopv, main_net, main_pct, data_date}]，按成交额降序。
+    """
+    import akshare as ak
+
+    try:
+        df = ak.fund_etf_spot_em()
+        if df is None or len(df) == 0:
+            log.warning("fund_etf_spot_em 返回空，回退新浪 ETF 列表")
+            return _etf_list_fallback()
+        rows: list[dict] = []
+        for _, r in df.iterrows():
+            code = str(r.get("代码", "") or "").strip()
+            if not code:
+                continue
+            rows.append({
+                "code": code,
+                "name": str(r.get("名称", "") or "").strip(),
+                "price": _safe_float(r.get("最新价")),
+                "change_pct": _safe_float(r.get("涨跌幅")),
+                "amount": _safe_float(r.get("成交额")),
+                "volume": _safe_float(r.get("成交量")),
+                "turnover": _safe_float(r.get("换手率")),
+                "mktcap": _safe_float(r.get("总市值")),
+                "share": _safe_float(r.get("最新份额")),
+                "premium": _safe_float(r.get("基金折价率")),
+                "iopv": _safe_float(r.get("IOPV实时估值")),
+                "main_net": _safe_float(r.get("主力净流入-净额")),
+                "main_pct": _safe_float(r.get("主力净流入-净占比")),
+                "data_date": str(r.get("数据日期", "") or ""),
+            })
+        rows.sort(key=lambda x: x["amount"] or 0, reverse=True)
+        log.info(f"ETF 快照已获取: {len(rows)} 只（fund_etf_spot_em）")
+        return rows
+    except Exception as e:
+        log.warning(f"fund_etf_spot_em 获取失败: {type(e).__name__}，回退新浪 ETF 列表")
+        return _etf_list_fallback()
+
+
+def _etf_list_fallback() -> list[dict]:
+    """回退数据源：新浪 ETF 列表（仅行情/成交额，无规模/折溢价/份额/资金流）"""
+    try:
+        from app.etf_screener import _get_etf_list
+        etfs = _get_etf_list()
+    except Exception as e:
+        log.warning(f"新浪 ETF 列表回退失败: {type(e).__name__}")
+        return []
+    rows: list[dict] = []
+    for e in etfs:
+        rows.append({
+            "code": str(e.get("code", "") or ""),
+            "name": str(e.get("name", "") or ""),
+            "price": e.get("price"),
+            "change_pct": e.get("change_pct"),
+            "amount": e.get("amount"),
+            "volume": e.get("volume"),
+            "turnover": None,
+            "mktcap": None,
+            "share": None,
+            "premium": None,
+            "iopv": None,
+            "main_net": None,
+            "main_pct": None,
+            "data_date": "",
+        })
+    log.info(f"ETF 快照（新浪回退）: {len(rows)} 只")
+    return rows
+
+
 def enrich_quotes_with_industry(quotes: list[Quote]) -> None:
     """为 Quote 列表补充行业分类（原地修改）
 
