@@ -15,12 +15,14 @@ analyze_dragon_pullback.py 细看。
     回溯天数   回看多少个已收盘交易日构建涨停候选池（可选，默认 10）
     输出数量   输出的候选数量上限（可选，默认 20）
 
-数据源: akshare 涨停股池（stock_zt_pool_em，需 pip install akshare）+ 新浪日 K 线
-（fetch_historical_kline）。核心不依赖 MX_APIKEY。
+数据源: 涨停股池（同花顺官方金融数据，无 key 回退 akshare stock_zt_pool_em）+ 日 K 线
+（fetch_historical_kline，新浪→同花顺→akshare）。核心不依赖 MX_APIKEY。
 """
 import logging
 import os
+import re
 import sys
+import time
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -37,6 +39,13 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 # 定位项目根目录（skills/dragon-pullback 上三级）
 _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT))
+
+# 加载 .env（API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
 
 # 抑制 app 模块的 WARNING 噪音（如北交所 K 线获取失败刷屏）
 logging.disable(logging.WARNING)
@@ -58,13 +67,64 @@ def _build_pool(lookback: int) -> dict[str, dict]:
     """拉近 lookback 个已收盘交易日的涨停股池，合并去重。
 
     返回 {code: {name, consec(最高连板数), last_date(最近涨停日), industry}}。
-    akshare 未装或某日无数据时静默降级。
+    优先同花顺（HITHINK_FINANCE_API_KEY），失败/无 key 回退 akshare；两者都不可用时静默降级。
     """
+    pool = _build_pool_hithink(lookback)
+    if pool:
+        return pool
+    return _build_pool_akshare(lookback)
+
+
+def _build_pool_hithink(lookback: int) -> dict[str, dict]:
+    """同花顺涨停池构建候选池（近 lookback 已收盘交易日）。"""
+    pool: dict[str, dict] = {}
+    try:
+        from app import hithink
+        days = hithink.fetch_trade_days()
+    except Exception:
+        return pool
+    if not days:
+        return pool
+    today = date.today().strftime("%Y%m%d")
+    recent = [d for d in days if d < today][-lookback:]
+    if not recent:
+        return pool
+
+    print(f"  回溯交易日(同花顺): {len(recent)} 个（{recent[0]} ~ {recent[-1]}）")
+    for ds in recent:
+        try:
+            items = hithink.fetch_limit_pool("limit_up", ds)
+        except Exception:
+            continue
+        time.sleep(0.8)  # 同花顺逐日接口限流较紧，逐日间加小间隔降低 429
+        if not items:
+            continue
+        for it in items:
+            code = str(it.get("ticker", "")).zfill(6)
+            if not code or code in ("nan", "000000"):
+                continue
+            consec = int(it.get("continue_day_cnt") or 0)
+            cur = pool.get(code)
+            if cur is None:
+                pool[code] = {
+                    "name": str(it.get("name", "")),
+                    "consec": consec,
+                    "last_date": ds,
+                    "industry": str(it.get("limit_up_reason") or ""),
+                }
+            else:
+                cur["consec"] = max(cur["consec"], consec)
+                cur["last_date"] = max(cur["last_date"], ds)
+    return pool
+
+
+def _build_pool_akshare(lookback: int) -> dict[str, dict]:
+    """akshare 涨停池兜底构建候选池。"""
     pool: dict[str, dict] = {}
     try:
         import akshare as ak
     except ImportError:
-        print("❌ 未安装 akshare，无法构建涨停候选池（pip install akshare）")
+        print("❌ 同花顺与 akshare 均不可用，无法构建涨停候选池（pip install akshare 或配置 HITHINK_FINANCE_API_KEY）")
         return pool
     try:
         cal = ak.tool_trade_date_hist_sina()
@@ -73,7 +133,7 @@ def _build_pool(lookback: int) -> dict[str, dict]:
     except Exception:
         return pool
 
-    print(f"  回溯交易日: {len(recent)} 个（{recent[0]} ~ {recent[-1]}）")
+    print(f"  回溯交易日(akshare): {len(recent)} 个（{recent[0]} ~ {recent[-1]}）")
     for d in recent:
         ds = d.strftime("%Y%m%d")
         try:
@@ -102,8 +162,19 @@ def _build_pool(lookback: int) -> dict[str, dict]:
 
 
 def _industry_heat(pool: dict[str, dict]) -> list[tuple[str, int]]:
-    """板块热度：近 N 日涨停家数按所属行业聚合，取 TOP10。"""
-    cnt = Counter(s["industry"] for s in pool.values() if s.get("industry"))
+    """板块热度：近 N 日涨停家数按所属行业/涨停原因聚合，取 TOP10。
+
+    同花顺源「所属行业」实为 '+' 分隔的涨停原因，拆开计数更贴近题材；东财源无 '+' 按整串计。
+    """
+    cnt = Counter()
+    for s in pool.values():
+        raw = str(s.get("industry") or "").strip()
+        if not raw or raw.lower() == "none":
+            continue
+        for token in re.split(r"[+＋/、]", raw):
+            token = token.strip()
+            if token and token.lower() != "none":
+                cnt[token] += 1
     return cnt.most_common(10)
 
 

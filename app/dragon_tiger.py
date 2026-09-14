@@ -34,8 +34,8 @@ SELL_THRESHOLD = -10_000_000  # -1000万
 def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
     """获取每日龙虎榜上榜个股列表
 
-    通过 AKShare 调用东方财富龙虎榜详情接口，
-    获取当日全部上榜个股及其交易数据。
+    优先同花顺官方金融数据（HITHINK_FINANCE_API_KEY），失败/无 key 回退 AKShare。
+    同花顺无「换手率」，turnover_rate 置 None；total_trade 由买入额+卖出额近似。
 
     Args:
         max_count: 最大返回条数
@@ -43,6 +43,44 @@ def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
     Returns:
         DragonTigerRecord 列表
     """
+    # 同花顺主源
+    try:
+        from app import hithink
+        items = hithink.fetch_dragon_tiger()
+        if items:
+            records = []
+            for it in items:
+                try:
+                    total_buy = float(it.get("buy_value") or 0)
+                    total_sell = float(it.get("sell_value") or 0)
+                    change = it.get("change")
+                    change_pct = round(float(change) * 100, 2) if change is not None else None
+                    records.append(DragonTigerRecord(
+                        code=str(it.get("ticker", "")),
+                        name=str(it.get("name", "")),
+                        change_pct=change_pct,
+                        total_buy=total_buy,
+                        total_sell=total_sell,
+                        net_buy=float(it.get("net_value") or 0),
+                        total_trade=total_buy + total_sell,
+                        turnover_rate=None,
+                        reason=str(it.get("limit_reason", "")),
+                    ))
+                except Exception:
+                    continue
+                if len(records) >= max_count:
+                    break
+            if records:
+                log.info(f"龙虎榜数据获取成功(同花顺): {len(records)} 条")
+                return records
+    except Exception as e:
+        log.warning(f"同花顺龙虎榜获取失败: {e}")
+
+    return _fetch_dragon_tiger_akshare(max_count)
+
+
+def _fetch_dragon_tiger_akshare(max_count: int = 30) -> list[DragonTigerRecord]:
+    """AKShare 兜底：东方财富龙虎榜详情。"""
     try:
         import akshare as ak
         import pandas as pd

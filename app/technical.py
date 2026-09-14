@@ -84,7 +84,29 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
         except Exception as e:
             log.warning(f"K线数据解析失败 {code}: {e}")
 
-    # 新浪数据为空或解析失败，尝试 AKShare 兜底
+    # 同花顺兜底（仅日线；分钟线 THS 不支持）
+    if scale >= 240:
+        try:
+            from app import hithink
+            ths_k = hithink.fetch_daily_kline(code, market, days=days)
+            if ths_k:
+                results = [
+                    KlineData(
+                        date=it.get("date", ""),
+                        open=_sf(it.get("open")),
+                        high=_sf(it.get("high")),
+                        low=_sf(it.get("low")),
+                        close=_sf(it.get("close")),
+                        volume=_sf(it.get("volume")),
+                    )
+                    for it in ths_k
+                ]
+                if results:
+                    return results
+        except Exception as e:
+            log.warning(f"同花顺K线数据获取失败 {code}: {e}")
+
+    # 新浪/同花顺均失败，尝试 AKShare 兜底
     try:
         import akshare as ak
         # ETF/LOF 基金代码需用 fund_etf_* 接口（stock_zh_a_* 只支持股票，会报 NoneType 错误）

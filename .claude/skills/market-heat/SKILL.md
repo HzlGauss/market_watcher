@@ -62,7 +62,7 @@ py .claude/skills/market-heat/scan_market_heat.py 30 20    # 涨幅榜 30、跌�
 
 ## 注意事项
 
-- **数据源**：全市场行情 + 行业（东财 clist，直连 `_fetch_em_clist`，不依赖 akshare `stock_zh_a_spot_em` 易断连接口）、龙虎榜（`app.dragon_tiger`）、板块资金流（东财数据中心）。**全部不依赖 `MX_APIKEY`**。
+- **数据源**：全市场行情 + 行业（东财 clist，直连 `_fetch_em_clist`，不依赖 akshare `stock_zh_a_spot_em` 易断连接口）、龙虎榜（同花顺官方金融数据，需 `.env` 配置 `HITHINK_FINANCE_API_KEY`，无 key 回退 akshare `stock_lhb_detail_em`）、板块资金流（东财数据中心）。**全部不依赖 `MX_APIKEY`**。
 - **非交易时段**：显示最近收盘数据；龙虎榜为最近交易日（节假日顺延）。
 - **涨停阈值近似**：9.9% 近似统计，含创业板/科创板 20cm，ST 股 5% 涨停不计入。
 - **行业 ≠ 概念**：行业板块（电子/计算机）较宽泛，概念板块（AI算力/机器人）更贴合主题炒作；本 skill 用「行业聚集 + 概念板块资金流」两条腿交叉，比单一维度更准。

@@ -19,7 +19,7 @@
 
 数据源:
     - 全市场行情 + 行业: 东财 clist（_fetch_em_clist，push2delay/push2 双 host 回退）
-    - 龙虎榜: 东方财富（app.dragon_tiger.fetch_dragon_tiger_list）
+    - 龙虎榜: 同花顺官方金融数据（app.dragon_tiger.fetch_dragon_tiger_list，无 key 回退东财）
     - 板块资金流: 东财数据中心（fetch_sector_fund_flow_rank，行业/概念）
     全部不依赖 MX_APIKEY。
 """
@@ -43,6 +43,13 @@ sys.path.insert(0, str(_ROOT))
 # 抑制 app 模块 WARNING 噪音
 import logging
 logging.disable(logging.WARNING)
+
+# 加载 .env（同花顺 API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
 
 from app.data_fetcher import _fetch_em_clist, fetch_sector_fund_flow_rank
 from app.dragon_tiger import fetch_dragon_tiger_list

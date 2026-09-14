@@ -74,16 +74,16 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
 
     resp = sina_client.get(url)
     if resp is None:
-        log.warning("新浪财经API请求失败")
-        return []
+        log.warning("新浪财经API请求失败，尝试同花顺兜底...")
+        return _fetch_quotes_hithink(items)
 
     try:
         resp.encoding = "gbk"
         text = resp.text.strip()
 
         if not text:
-            log.warning("新浪财经返回空数据")
-            return []
+            log.warning("新浪财经返回空数据，尝试同花顺兜底...")
+            return _fetch_quotes_hithink(items)
 
         results: list[Quote] = []
         lines = text.strip().split("\n")
@@ -172,8 +172,70 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
         return results
 
     except Exception as e:
-        log.error(f"数据解析异常: {e}")
+        log.error(f"数据解析异常: {e}，尝试同花顺兜底...")
+        return _fetch_quotes_hithink(items)
+
+
+def _fetch_quotes_hithink(items: list[WatchItem]) -> list[Quote]:
+    """同花顺兜底：批量实时快照映射为 Quote（新浪失败时调用）。
+
+    THS snapshot 无 name/turnover_rate/volume_ratio/pe/pb，name 从 WatchItem 取，
+    其余留 None，与新浪主路径行为一致。
+    """
+    from app import hithink
+
+    thscodes = [hithink.thscode(it.code, it.market) for it in items]
+    snap = hithink.fetch_snapshot(thscodes)
+    if not snap:
         return []
+
+    results: list[Quote] = []
+    for item in items:
+        it = snap.get(str(item.code))
+        if not it:
+            continue
+
+        price = _parse_float(it.get("last_price"))
+        pre_close = _parse_float(it.get("prev_price"))
+        high = _parse_float(it.get("high_price"))
+        low = _parse_float(it.get("low_price"))
+        change_pct = _parse_float(it.get("price_change_ratio_pct"))
+        change_amt = _parse_float(it.get("price_change"))
+        if change_pct is not None:
+            change_pct = round(change_pct, 2)
+        if change_amt is not None:
+            change_amt = round(change_amt, 3)
+
+        amplitude: Optional[float] = None
+        if high is not None and low is not None and pre_close is not None and pre_close != 0:
+            amplitude = round((high - low) / pre_close * 100, 2)
+
+        vol_val = _parse_float(it.get("volume"))
+        amt_val = _parse_float(it.get("turnover"))
+        avg_price: Optional[float] = None
+        if vol_val and amt_val and vol_val > 0:
+            avg_price = round(amt_val / vol_val, 3)
+
+        results.append(Quote(
+            code=item.code,
+            name=item.name,
+            type=item.type,
+            price=price,
+            change_pct=change_pct,
+            change_amt=change_amt,
+            pre_close=pre_close,
+            open=_parse_float(it.get("open_price")),
+            high=high,
+            low=low,
+            volume=vol_val,
+            amount=amt_val,
+            amplitude=amplitude,
+            avg_price=avg_price,
+            turnover_rate=None,
+            volume_ratio=None,
+        ))
+
+    return results
 
 
 # ============================================================

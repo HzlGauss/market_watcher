@@ -152,3 +152,11 @@ llm_client = HttpClient(
     timeout=30,
     max_retries=2,
 )
+
+# 同花顺官方金融数据服务 client（X-api-key 在 app.hithink 按次传入，避免 import 时序问题）
+hithink_client = HttpClient(
+    base_url="https://fuyao.aicubes.cn",
+    headers={**DEFAULT_HEADERS},
+    timeout=15,
+    max_retries=2,
+)

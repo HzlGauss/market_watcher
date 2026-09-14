@@ -37,6 +37,13 @@ for _s in (sys.stdout, sys.stderr):
 
 _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT))
+
+# 加载 .env（API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.backtest import (  # noqa: E402

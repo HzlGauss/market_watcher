@@ -16,11 +16,13 @@
     日期   可选，指定交易日（默认最近交易日）
 
 数据源:
-    - 涨停池/炸板池/跌停池: 东财（akshare stock_zt_pool_em / stock_zt_pool_zbgc_em / stock_zt_pool_dtgc_em，需 pip install akshare）
-    不依赖 MX_APIKEY。涨跌停判定由东财精确口径（10%/20%/ST 5%）给出，非 9.9% 近似。
+    - 涨停池/炸板池/跌停池: 同花顺官方金融数据（HITHINK_FINANCE_API_KEY，无 key/失败时回退东财 akshare）
+    不依赖 MX_APIKEY。涨跌停判定由同花顺/东财精确口径（10%/20%/ST 5%）给出，非 9.9% 近似。
 """
 import os
+import re
 import sys
+import time
 import datetime
 from collections import Counter
 from pathlib import Path
@@ -41,6 +43,13 @@ sys.path.insert(0, str(_ROOT))
 # 抑制 app 模块 WARNING 噪音
 import logging
 logging.disable(logging.WARNING)
+
+# 加载 .env（同花顺 API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
 
 
 def _num(v):
@@ -72,7 +81,16 @@ def _short(s, n=12) -> str:
 
 
 def _latest_trade_date() -> str:
-    """返回最近交易日 YYYYMMDD。"""
+    """返回最近交易日 YYYYMMDD（同花顺日历优先，AKShare 兜底）。"""
+    try:
+        from app import hithink
+        days = hithink.fetch_trade_days()
+        if days:
+            today = datetime.date.today().strftime("%Y%m%d")
+            past = [d for d in days if d <= today]
+            return (past or days)[-1]
+    except Exception:
+        pass
     try:
         import akshare as ak
         cal = ak.tool_trade_date_hist_sina()
@@ -98,6 +116,61 @@ def _fetch_pool(fn, date: str, name: str):
     if df is None or getattr(df, "empty", True):
         return None
     return df
+
+
+def _df_from_records(records, columns):
+    """list[dict] → pandas DataFrame（无 pandas 时返回 None，交由 AKShare 兜底）。"""
+    if not records:
+        return None
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+    return pd.DataFrame(records, columns=columns)
+
+
+def _fetch_hithink(kind: str, date: str):
+    """同花顺涨/跌/炸板池 → DataFrame（东财兼容中文列名）。失败/无 key 返回 None。"""
+    try:
+        from app import hithink
+        items = hithink.fetch_limit_pool(kind, date)
+    except Exception:
+        return None
+    if not items:
+        return None
+
+    if kind == "limit_up":
+        records = [{
+            "代码": str(it.get("ticker", "")).zfill(6),
+            "名称": str(it.get("name", "")),
+            "连板数": _int(it.get("continue_day_cnt")),
+            "涨停统计": str(it.get("continue_day_text", "")),
+            "封板资金": _num(it.get("seal_money")),
+            "所属行业": str(it.get("limit_up_reason") or ""),
+        } for it in items]
+        return _df_from_records(records, ["代码", "名称", "连板数", "涨停统计", "封板资金", "所属行业"])
+
+    if kind == "limit_break":
+        # 炸板池仅用于炸板率条数；THS 无行业列
+        records = [{
+            "代码": str(it.get("ticker", "")).zfill(6),
+            "名称": str(it.get("name", "")),
+            "所属行业": "",
+        } for it in items]
+        return _df_from_records(records, ["代码", "名称", "所属行业"])
+
+    if kind == "limit_down":
+        # THS 无 连续跌停/封单资金/所属行业 三列，用可得的 涨跌幅/换手率 替代
+        records = [{
+            "代码": str(it.get("ticker", "")).zfill(6),
+            "名称": str(it.get("name", "")),
+            "涨跌幅": _num(it.get("price_change_ratio_pct")),
+            "换手率": _num(it.get("turnover_ratio_pct")),
+            "所属行业": "",
+        } for it in items]
+        return _df_from_records(records, ["代码", "名称", "涨跌幅", "换手率", "所属行业"])
+
+    return None
 
 
 # ---------------------------------------------------------------- 聚合
@@ -151,11 +224,22 @@ def _seal_top(zt_df, n=10):
 
 
 def _industry_agg(df, top_n=12):
-    """题材归类：按所属行业聚合计数。"""
+    """题材归类：按所属行业/涨停原因聚合计数。
+
+    同花顺源的「所属行业」实为 '+' 分隔的涨停原因，按 token 拆开计数更贴近题材；
+    东财源是单一行业字符串，无 '+' 时按整串计数。
+    """
     if df is None:
         return []
-    cnt = Counter(str(r.get("所属行业", "") or "").strip() for _, r in df.iterrows())
-    cnt.pop("", None)
+    cnt = Counter()
+    for _, r in df.iterrows():
+        raw = str(r.get("所属行业", "") or "").strip()
+        if not raw or raw.lower() == "none":
+            continue
+        for token in re.split(r"[+＋/、]", raw):
+            token = token.strip()
+            if token and token.lower() != "none":
+                cnt[token] += 1
     return cnt.most_common(top_n)
 
 
@@ -175,7 +259,7 @@ def _print_tiers(tiers, high):
     print(f"  最高连板（空间板）: {max_consec} 板")
     if high:
         print("  ── 连板股（≥2板，按高度降序）──")
-        header = f"  {'代码':<8}{'名称':<10}{'连板':>4}{'涨停统计':>8}{'封单额':>10}{'行业':<12}"
+        header = f"  {'代码':<8}{'名称':<10}{'连板':>4}{'涨停统计':>8}{'封单额':>10}{'题材':<12}"
         print(header)
         print("  " + "-" * 72)
         for h in high:
@@ -211,7 +295,7 @@ def _print_seal_top(rows):
     if not rows:
         print("  ⚠️ 无涨停数据")
         return
-    header = f"  {'代码':<8}{'名称':<10}{'连板':>4}{'封单额':>10}{'行业':<12}"
+    header = f"  {'代码':<8}{'名称':<10}{'连板':>4}{'封单额':>10}{'题材':<12}"
     print(header)
     print("  " + "-" * 72)
     for r in rows:
@@ -245,16 +329,21 @@ def _print_dt_pool(dt_df):
         rows.append({
             "code": str(r.get("代码", "")).zfill(6),
             "name": str(r.get("名称", "")),
-            "consec": _int(r.get("连续跌停")),
-            "seal": _num(r.get("封单资金")),
+            "pct": _num(r.get("涨跌幅")),
+            "turnover": _num(r.get("换手率")),
+            "consec": _num(r.get("连续跌停")),   # 仅东财源有
+            "seal": _num(r.get("封单资金")),      # 仅东财源有
             "industry": str(r.get("所属行业", "")),
         })
-    rows.sort(key=lambda x: -x["consec"])
-    header = f"  {'代码':<8}{'名称':<10}{'连跌':>4}{'封单额':>10}{'行业':<12}"
+    rows.sort(key=lambda x: -(x["pct"] or 0))
+    header = f"  {'代码':<8}{'名称':<10}{'涨跌幅':>8}{'换手':>7}{'连跌':>4}{'封单额':>10}{'题材':<12}"
     print(header)
     print("  " + "-" * 72)
     for r in rows:
-        print(f"  {r['code']:<8}{_short(r['name'], 9):<10}{r['consec']:>4}"
+        pct = f"{r['pct']:.2f}%" if r["pct"] is not None else "   --"
+        turn = f"{r['turnover']:.1f}%" if r["turnover"] is not None else "  --"
+        consec = f"{int(r['consec'])}" if r["consec"] is not None else " --"
+        print(f"  {r['code']:<8}{_short(r['name'], 9):<10}{pct:>8}{turn:>7}{consec:>4}"
               f"{_fmt_yi(r['seal']):>10}{_short(r['industry'], 11):<12}")
 
 
@@ -269,15 +358,28 @@ def main():
     print("=" * 72)
     print(f"  交易日: {date}")
 
-    try:
-        import akshare as ak
-    except ImportError:
-        print("❌ 未安装 akshare，无法拉取涨跌停池（pip install akshare）")
-        return 1
+    # 优先同花顺（稳定主源），失败/无 key 回退东财 akshare
+    # 同花顺限流较紧，三池逐次拉取间加小间隔降低 429
+    zt_df = _fetch_hithink("limit_up", date)
+    time.sleep(1.0)
+    zb_df = _fetch_hithink("limit_break", date)
+    time.sleep(1.0)
+    dt_df = _fetch_hithink("limit_down", date)
 
-    zt_df = _fetch_pool(ak.stock_zt_pool_em, date, "涨停池")
-    zb_df = _fetch_pool(ak.stock_zt_pool_zbgc_em, date, "炸板池")
-    dt_df = _fetch_pool(ak.stock_zt_pool_dtgc_em, date, "跌停池")
+    if zt_df is None or zb_df is None or dt_df is None:
+        try:
+            import akshare as ak
+        except ImportError:
+            ak = None
+        if ak is None:
+            print("❌ 同花顺与 akshare 均不可用（pip install akshare 或配置 HITHINK_FINANCE_API_KEY）")
+            return 1
+        if zt_df is None:
+            zt_df = _fetch_pool(ak.stock_zt_pool_em, date, "涨停池")
+        if zb_df is None:
+            zb_df = _fetch_pool(ak.stock_zt_pool_zbgc_em, date, "炸板池")
+        if dt_df is None:
+            dt_df = _fetch_pool(ak.stock_zt_pool_dtgc_em, date, "跌停池")
 
     zt_n = len(zt_df) if zt_df is not None else 0
     zb_n = len(zb_df) if zb_df is not None else 0
@@ -314,8 +416,9 @@ def main():
 
     print()
     print("  说明:")
-    print("    - 涨跌停判定由东财精确口径给出（10%/20%/ST 5%），非 9.9% 近似")
+    print("    - 涨跌停判定由同花顺/东财精确口径给出（10%/20%/ST 5%），非 9.9% 近似")
     print("    - 涨停统计 = N天M板（如 3/3 = 3天3板）；封单额 = 收盘封板资金")
+    print("    - 题材列：同花顺源=涨停原因，东财源=所属行业；跌停题材同花顺无数据")
     print("    - 炸板率 = 炸板数 /（涨停数+炸板数），反映封板坚决度与短线分歧")
     print("    - 本脚本只做取数聚合，『情绪周期 / 主线题材』结论由 AI 依据 SKILL.md 框架生成")
     return 0

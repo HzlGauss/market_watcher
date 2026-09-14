@@ -617,6 +617,11 @@ class Config:
         return self._env("MX_APIKEY_2")
 
     @property
+    def hithink_finance_api_key(self) -> Optional[str]:
+        """同花顺官方金融数据服务 API Key（行情/日K/涨跌停/龙虎榜兜底源）"""
+        return self._env("HITHINK_FINANCE_API_KEY")
+
+    @property
     def mx_apikeys(self) -> list[str]:
         """所有妙想 API Key 列表（主 key + 备用 key，去重去空）"""
         keys = [self.mx_apikey, self.mx_apikey_2]

@@ -34,6 +34,13 @@ for _stream in (sys.stdout, sys.stderr):
 _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT))
 
+# 加载 .env（API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
+
 from app.data_fetcher import fetch_sector_fund_flow_rank
 
 _INDICATORS = {

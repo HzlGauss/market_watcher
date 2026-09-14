@@ -35,6 +35,13 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT))
 
+# 加载 .env（API Key 等）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
+
 # 抑制 app 模块的 WARNING 噪音（个别 K 线获取失败刷屏）
 logging.disable(logging.WARNING)
 
