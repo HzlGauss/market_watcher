@@ -13,6 +13,7 @@
     symbols             列出本地证券表（可按 --exchange/--asset-type 过滤）
     status              查看库状态（各表行数 + 最大日期）
     sync-symbols        刷新 dim_symbol 证券维度表（symbols 子命令依赖）
+    streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
 
 用法:
     py tools/marketdb_local.py bootstrap
@@ -242,6 +243,135 @@ def cmd_sync_symbols(args) -> int:
     return r.returncode
 
 
+# ---------------------------------------------------------------- streaks
+
+_STREAK_LABEL = {
+    "up": "连续上涨",
+    "down": "连续下跌",
+    "vol-up": "连续放量",
+    "vol-down": "连续缩量",
+}
+
+# kind -> 断点条件（True=断点，即中断当前连续段）
+_STREAK_BREAK = {
+    "up": "prev IS NULL OR adj <= prev",
+    "down": "prev IS NULL OR adj >= prev",
+    "vol-up": "prev_vol IS NULL OR vol <= prev_vol",
+    "vol-down": "prev_vol IS NULL OR vol >= prev_vol",
+}
+
+
+def cmd_streaks(args) -> int:
+    """全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法：断点标记→累计求和→分组聚合）。
+
+    借鉴 DuckDB 窗口函数「连续区间」技巧：LAG() 取前一行 → CASE 标记断点 →
+    SUM() OVER() 生成组号 → GROUP BY 组号聚合出每段起止日期与持续天数。
+    涨跌判定默认用前复权价（close*forward_factor），除权除息日不会误判断点。
+    """
+    db = _db_path(args.db)
+    if not db.exists():
+        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        return 1
+    try:
+        import duckdb
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+
+    price_based = args.kind in ("up", "down")
+    val_expr = "k.close" if args.adjust == "none" else "k.close * COALESCE(a.forward_factor, 1.0)"
+    brk = _STREAK_BREAK[args.kind]
+
+    where, params = [], []
+    if args.codes:
+        codes = [_norm_thscode(c) for c in args.codes.split(",")]
+        where.append("k.thscode IN (%s)" % ",".join("?" for _ in codes))
+        params.extend(codes)
+    if args.start:
+        where.append("k.date >= ?")
+        params.append(args.start)
+    if args.end:
+        where.append("k.date <= ?")
+        params.append(args.end)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    agg = (
+        "arg_min(adj, date) AS start_val, arg_max(adj, date) AS end_val"
+        if price_based
+        else "arg_min(vol, date) AS start_val, arg_max(vol, date) AS end_val"
+    )
+
+    sql = f"""
+WITH px AS (
+  SELECT k.thscode, k.date, {val_expr} AS adj, k.volume AS vol
+  FROM raw_kline_daily k
+  LEFT JOIN calc_adjust_factor_daily a ON a.thscode = k.thscode AND a.date = k.date
+  {where_sql}
+),
+lagged AS (
+  SELECT thscode, date, adj, vol,
+         LAG(adj) OVER (PARTITION BY thscode ORDER BY date) AS prev,
+         LAG(vol) OVER (PARTITION BY thscode ORDER BY date) AS prev_vol
+  FROM px
+),
+flagged AS (
+  SELECT thscode, date, adj, vol,
+         CASE WHEN {brk} THEN 1 ELSE 0 END AS brk
+  FROM lagged
+),
+grouped AS (
+  SELECT thscode, date, adj, vol, brk,
+         SUM(brk) OVER (PARTITION BY thscode ORDER BY date ROWS UNBOUNDED PRECEDING) AS gid
+  FROM flagged
+)
+SELECT g.thscode, s.name, MIN(g.date) AS start_date, MAX(g.date) AS end_date,
+       COUNT(*) AS streak_days, {agg}
+FROM grouped g
+LEFT JOIN dim_symbol s ON s.thscode = g.thscode
+WHERE g.brk = 0
+GROUP BY g.thscode, s.name, g.gid
+HAVING COUNT(*) >= {int(args.min)}
+ORDER BY streak_days DESC, g.thscode, start_date
+LIMIT {int(args.limit)}
+"""
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        df = con.execute(sql, params).fetchdf()
+    finally:
+        con.close()
+
+    if df.empty:
+        print(f"⚠️ 未找到「{_STREAK_LABEL[args.kind]}」≥{args.min} 天的区间")
+        return 0
+
+    label = _STREAK_LABEL[args.kind]
+    if price_based:
+        df["total_pct"] = (df["end_val"] / df["start_val"] - 1.0) * 100.0
+        df = df.rename(columns={"start_val": "start_price", "end_val": "end_price"})
+        show = df[["thscode", "name", "start_date", "end_date", "streak_days",
+                   "start_price", "end_price", "total_pct"]].copy()
+        show["total_pct"] = show["total_pct"].map(lambda v: f"{v:+.1f}%")
+        show["start_price"] = show["start_price"].map(lambda v: f"{v:.2f}")
+        show["end_price"] = show["end_price"].map(lambda v: f"{v:.2f}")
+    else:
+        df = df.rename(columns={"start_val": "start_vol", "end_val": "end_vol"})
+        show = df[["thscode", "name", "start_date", "end_date", "streak_days",
+                   "start_vol", "end_vol"]].copy()
+        show["start_vol"] = show["start_vol"].map(lambda v: f"{v:,.0f}")
+        show["end_vol"] = show["end_vol"].map(lambda v: f"{v:,.0f}")
+
+    print(f"== {label} ≥{args.min}天 的区间（共 {len(df)} 段，按连续天数降序，前 {args.limit}）==")
+    print(show.to_string(index=False))
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"\n✅ 已落盘 {len(df)} 段: {out}")
+
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:
@@ -279,6 +409,19 @@ def main() -> int:
     ss = sub.add_parser("sync-symbols", help="刷新 dim_symbol 证券维度表（symbols 子命令依赖）")
     ss.add_argument("--db")
 
+    sk = sub.add_parser("streaks", help="全市场连续区间扫描（连续上涨/下跌/放量/缩量）")
+    sk.add_argument("kind", choices=["up", "down", "vol-up", "vol-down"],
+                    help="区间类型: up=连续上涨 down=连续下跌 vol-up=连续放量 vol-down=连续缩量")
+    sk.add_argument("--min", type=int, default=3, help="最少连续天数（默认 3）")
+    sk.add_argument("--start", help="YYYY-MM-DD 起始日期（含）")
+    sk.add_argument("--end", help="YYYY-MM-DD 结束日期（含）")
+    sk.add_argument("--adjust", default="forward", choices=["none", "forward"],
+                    help="涨跌判定用价: forward=前复权价(默认,推荐) none=未复权收盘价")
+    sk.add_argument("--codes", help="限定 thscode，逗号分隔（默认全市场）")
+    sk.add_argument("--limit", type=int, default=20, help="输出前 N 段（默认 20）")
+    sk.add_argument("--out", help="落盘 CSV 路径（可选）")
+    sk.add_argument("--db")
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -290,6 +433,7 @@ def main() -> int:
         "symbols": cmd_symbols,
         "status": cmd_status,
         "sync-symbols": cmd_sync_symbols,
+        "streaks": cmd_streaks,
     }[args.cmd](args)
 
 
