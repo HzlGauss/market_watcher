@@ -22,6 +22,16 @@ from app.utils import log
 # 同花顺日期均为 Asia/Shanghai 00:00，统一用 +8 时区格式化，避免机器时区差异
 _SH_TZ = timezone(timedelta(hours=8))
 
+# 场内基金（ETF/LOF）代码号段：沪 51/56/58，深 15/16/18。
+# 同花顺按资产域拆分端点——A 股行情与基金场内行情分属 a-share / fund 两套接口，
+# ETF 代码传给 a-share 端点会报 1002 Unknown thscode，必须先按号段分流。
+_ETF_CODE_PREFIXES = ("51", "56", "58", "15", "16", "18")
+
+
+def _is_etf_code(code: str) -> bool:
+    """6 位代码是否为场内基金（ETF/LOF），按号段判断。"""
+    return str(code).strip().startswith(_ETF_CODE_PREFIXES)
+
 
 def _api_key() -> str:
     """读取同花顺 API Key（空则上层直接短路）。"""
@@ -110,15 +120,33 @@ def _ymd_to_ms(date: str) -> int:
 def fetch_snapshot(thscodes: list[str]) -> dict[str, dict]:
     """批量实时快照，返回 {ticker: item}。
 
+    A 股走 /api/a-share/prices/snapshot（批量）；ETF/LOF 走
+    /api/fund/market/snapshot（仅支持单只，逐只请求后合并）。
+    混传 ETF 到 a-share 快照会让整批 1002 失败，故按号段先分流。
+
     item 字段: thscode/ticker/last_price/price_change/price_change_ratio_pct/
                open_price/high_price/low_price/prev_price/volume/turnover
     """
     if not thscodes:
         return {}
-    data = _get("/api/a-share/prices/snapshot", {"thscodes": ",".join(thscodes)})
-    if not data:
-        return {}
-    return {str(it.get("ticker", "")): it for it in (data.get("item") or [])}
+    a_share = [ts for ts in thscodes if not _is_etf_code(str(ts).split(".", 1)[0])]
+    etfs = [ts for ts in thscodes if _is_etf_code(str(ts).split(".", 1)[0])]
+
+    out: dict[str, dict] = {}
+
+    if a_share:
+        data = _get("/api/a-share/prices/snapshot", {"thscodes": ",".join(a_share)})
+        if data:
+            for it in data.get("item") or []:
+                out[str(it.get("ticker", ""))] = it
+
+    for ts in etfs:
+        data = _get("/api/fund/market/snapshot", {"thscode": ts})
+        if data:
+            for it in data.get("item") or []:
+                out[str(it.get("ticker", ""))] = it
+
+    return out
 
 
 # ============================================================
@@ -132,14 +160,20 @@ def fetch_daily_kline(code: str, market: str = "", days: int = 60, adjust: str =
     """
     start = datetime.now(_SH_TZ) - timedelta(days=int(days) * 2 + 5)  # 覆盖周末/节假日冗余
     end = datetime.now(_SH_TZ)
+    c = str(code).strip()
+    # ETF/LOF/封闭基金号段（51/56/58/15/16/18 开头）走基金场内历史行情端点；
+    # 该端点仅 ETF 支持历史、固定前复权且不接受 adjust 参数。
+    is_etf = _is_etf_code(c)
     params = {
         "thscode": thscode(code, market),
         "interval": "1d",
         "start": int(start.timestamp() * 1000),
         "end": int(end.timestamp() * 1000),
-        "adjust": adjust,
     }
-    data = _get("/api/a-share/prices/historical", params)
+    path = "/api/fund/market/historical" if is_etf else "/api/a-share/prices/historical"
+    if not is_etf:
+        params["adjust"] = adjust
+    data = _get(path, params)
     if not data:
         return []
     items = sorted((data.get("item") or []), key=lambda x: x.get("date_ms", 0))
