@@ -20,9 +20,11 @@
     py tools/marketdb_local.py daily 600519.SH --adjust forward --start 2025-01-01
     py tools/marketdb_local.py panel --start 2026-01-01 --end 2026-01-31 --out out/panel.csv
 
-数据源: 同花顺 marketdb 包（pip install -e C:/work/code/Financial-API/python）。
+数据源: 同花顺 marketdb 包（pip install -e <Financial-API/python>；源码目录用 MARKETDB_SRC
+环境变量或 .env 配置，默认 C:/work/code/Financial-API/python）。
 API Key 走环境变量 HITHINK_FINANCE_API_KEY（snowball .env 已配置，自动注入）。
 库文件默认 data/market.duckdb（可用环境变量 MARKETDB_DB_PATH 覆盖）。
+跨环境: data/market.duckdb 已 gitignore，新环境需 bootstrap 落库（子命令缺库时会打印完整引导）。
 
 注意: marketdb 只覆盖历史行情/面板，**不覆盖** trading-days / limit-up-pool /
 dragon-tiger-list 等特色数据实时端点 —— 涨跌停/龙虎榜/日历仍走 app/hithink.py REST。
@@ -48,9 +50,17 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# marketdb 源码目录（同花顺 Financial-API monorepo，本机已 clone）
-_FINANCE_PY = Path(os.environ.get("MARKETDB_SRC", "C:/work/code/Financial-API/python"))
+# marketdb 默认源码目录（同花顺 Financial-API monorepo）
+_DEFAULT_FINANCE_PY = "C:/work/code/Financial-API/python"
 _DEFAULT_DB = _ROOT / "data" / "market.duckdb"
+
+
+def _finance_py() -> Path:
+    """marketdb 源码目录：优先 MARKETDB_SRC 环境变量（.env 或系统），否则用默认本机路径。
+
+    必须在 _load_key()（load_env 注入 .env 变量）之后调用，否则 .env 里的 MARKETDB_SRC 不生效。
+    """
+    return Path(os.environ.get("MARKETDB_SRC", _DEFAULT_FINANCE_PY))
 
 
 def _db_path(explicit: str | None = None) -> Path:
@@ -74,12 +84,13 @@ def _ensure_installed() -> bool:
         return True
     except ImportError:
         pass
-    if not _FINANCE_PY.exists():
-        print(f"❌ 未找到 marketdb 源码目录: {_FINANCE_PY}")
-        print("   请设置环境变量 MARKETDB_SRC 指向 Financial-API/python，或 clone 到默认路径。")
+    src = _finance_py()
+    if not src.exists():
+        print(f"❌ 未找到 marketdb 源码目录: {src}")
+        print("   请在 .env 或系统环境变量设置 MARKETDB_SRC 指向 Financial-API/python，或 clone 到默认路径。")
         return False
-    print(f"==> 安装 marketdb（pip install -e {_FINANCE_PY}）...")
-    r = subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(_FINANCE_PY)])
+    print(f"==> 安装 marketdb（pip install -e {src}）...")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(src)])
     return r.returncode == 0
 
 
@@ -113,6 +124,27 @@ def _norm_thscode(code: str) -> str:
     if c[:1] in ("8", "4", "92"):
         return f"{c}.BJ"
     return c
+
+
+def _bootstrap_guide() -> str:
+    """新环境本地库缺失时的落库引导（data/market.duckdb 已 gitignore，跨环境需手动落库）。"""
+    _load_key()  # 确保 .env 的 MARKETDB_SRC 已注入，引导文案准确（幂等）
+    src = _finance_py()
+    return f"""本地库不存在（data/market.duckdb 已 gitignore，不进 git，新环境需手动落库一次）：
+
+  1. 前置条件
+     - .env 配置 HITHINK_FINANCE_API_KEY（下载 Parquet 需要）
+     - marketdb 源码目录存在（当前读取: {src}）
+       缺失时在 .env 或系统环境变量设置 MARKETDB_SRC 指向 Financial-API/python
+
+  2. 落库（装 marketdb + 建库 + 全量同步）
+     py tools/marketdb_local.py bootstrap
+
+  3. 补证券维度表（bootstrap 的 auto-sync 不自动同步 dim_symbol）
+     py tools/marketdb_local.py sync-symbols
+
+  注意: 全量同步连续下载两个大 Parquet 易触发同花顺全局限流(429)，
+        失败等 1~2 分钟重跑 bootstrap 即可（auto-sync 会续传，不重复下）。"""
 
 
 # ---------------------------------------------------------------- 子命令
@@ -155,7 +187,7 @@ def cmd_daily(args) -> int:
     _load_key()
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     try:
         from marketdb import MarketDB
@@ -179,7 +211,7 @@ def cmd_panel(args) -> int:
     _load_key()
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     try:
         from marketdb import MarketDB
@@ -203,7 +235,7 @@ def cmd_symbols(args) -> int:
     _load_key()
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     try:
         from marketdb import MarketDB
@@ -226,7 +258,7 @@ def cmd_status(args) -> int:
     _load_key()
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     _cli("status", db=db)
     return 0
@@ -237,7 +269,7 @@ def cmd_sync_symbols(args) -> int:
     _load_key()
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     r = _cli("sync-symbols", db=db)
     return r.returncode
@@ -270,7 +302,7 @@ def cmd_streaks(args) -> int:
     """
     db = _db_path(args.db)
     if not db.exists():
-        print(f"❌ 本地库不存在: {db}（先运行 bootstrap）")
+        print(_bootstrap_guide())
         return 1
     try:
         import duckdb
