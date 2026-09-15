@@ -17,15 +17,14 @@ analyze_golden_pit.py（白马）或 stock-analysis（通用）细看。
     板块/行业  板块或行业名（如 创业板 / 科创板 / 沪深300 / 中证500 / 半导体 / 化工）
     输出数量    输出候选数量上限（可选，默认 20）
 
-数据源: 成分股池（app.board_pool：指数成分 akshare + 东财 clist 板块/行业，核心不依赖
-MX_APIKEY）+ 新浪日 K 线（fetch_historical_kline）。妙想（MX_APIKEY）可选，用于 top
-候选估值/基本面快查。
+数据源: 成分股池（app.board_pool：指数成分 akshare + 东财 clist 板块/行业 + 同花顺概念
+板块）+ 新浪日 K 线（fetch_historical_kline）。top 候选估值/基本面用同花顺（ROE/净利
+同比/当前估值，需 HITHINK_FINANCE_API_KEY）+ 妙想 PB 历史分位（可选）。核心不依赖 MX_APIKEY。
 """
 import logging
 import os
 import re
 import sys
-import time
 from pathlib import Path
 
 # 强制 UTF-8 输出 + 禁用 akshare/tqdm 进度条
@@ -270,21 +269,41 @@ def _find_col_value(tables, *keywords) -> float | None:
     return None
 
 
+def _hithink_fundamental(code: str) -> dict:
+    """同花顺当前估值 + 最新财报指标（PE/PB/ROE/净利同比/营收同比），不依赖 MX_APIKEY。"""
+    f = {"pe": None, "pb": None, "roe": None, "profit_growth": None, "revenue_growth": None}
+    try:
+        from app import hithink
+        vals = hithink.fetch_valuations_snapshot([code])
+        if vals:
+            f["pe"] = vals[0].get("pe_ttm")
+            f["pb"] = vals[0].get("pb_mrq")
+    except Exception:
+        pass
+    try:
+        from app import hithink
+        ind = hithink.fetch_financial_indicators(code)
+        f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
+        f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
+        f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
+    except Exception:
+        pass
+    return f
+
+
 def _fetch_fundamental(mx, name: str, code: str) -> dict:
-    """妙想结构化查询 → {pb_pct, roe, profit_growth}，失败字段为 None。"""
-    f = {"pb_pct": None, "roe": None, "profit_growth": None}
-    try:
-        tables = mx.query_structured(f"{name} {code} 市净率 历史分位")
-        f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
-    except Exception:
-        pass
-    time.sleep(0.4)
-    try:
-        tables = mx.query_structured(f"{name} {code} 最新财报 净利润 同比增长 ROE")
-        f["profit_growth"] = _find_col_value(tables, "净利润", "同比")
-        f["roe"] = _find_col_value(tables, "ROE")
-    except Exception:
-        pass
+    """同花顺（ROE/净利同比/当前估值，主源）+ 妙想（PB 历史分位，兜底）→ dict。
+
+    mx 为 None（无 MX_APIKEY）时仅同花顺字段可用；同花顺估值端点不含历史分位，故 pb_pct 仍走妙想。
+    """
+    f = {"pb_pct": None, "roe": None, "profit_growth": None, "pb": None, "pe": None}
+    f.update(_hithink_fundamental(code))
+    if mx is not None:
+        try:
+            tables = mx.query_structured(f"{name} {code} 市净率 历史分位")
+            f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
+        except Exception:
+            pass
     return f
 
 
@@ -318,24 +337,23 @@ def _fundamental_check(results, top: int) -> None:
     try:
         from app.config import Config
         from app.utils import load_env
-        from app.miaoxiang import MXClient
     except Exception:
         return
+    mx = None
     try:
         load_env(_ROOT)
         config = Config(_ROOT / "watchlist_config.json")
         keys = config.mx_apikeys
-        if not keys:
-            print("\n  （未配置 MX_APIKEY，跳过基本面/估值门槛；可对单只运行 analyze_golden_pit.py 细看）")
-            return
-        mx = MXClient(keys)
+        if keys:
+            from app.miaoxiang import MXClient
+            mx = MXClient(keys)
     except Exception:
-        return
+        mx = None
 
     n_fund = min(top, len(results), 10)
     print()
     print("=" * 72)
-    print(f"基本面/估值确定性门槛（前 {n_fund} 名，妙想）")
+    print(f"基本面/估值确定性门槛（前 {n_fund} 名，同花顺 + 妙想分位）")
     print("=" * 72)
     print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
     print("  " + "-" * 68)
@@ -350,6 +368,7 @@ def _fundamental_check(results, top: int) -> None:
         print(f"  {r['code']:<8}{r['name']:<10}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label} {note}")
     print()
     print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
+    print("  （ROE/净利同比/当前估值由同花顺直供；PB 历史分位需 MX_APIKEY，缺失时显示 --）")
     print("  仅 ✅通过 才值得进一步看买点；❌/⚠️/待查 建议排除或人工补查后观望。")
 
 

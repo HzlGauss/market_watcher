@@ -10,6 +10,8 @@
    → 精确东财板块名（``b:BKxxxx``），避免模糊匹配命中「非白酒」「磷肥及磷化工」等子板块/反义词。
 4. 行业/概念板块：东方财富 clist 板块列表（``m:90 t:2`` 行业 / ``t:3`` 概念）按名称模糊匹配兜底
    → 板块成分（``b:BKxxxx``）。绕开 akshare ``stock_board_industry_*_em`` 的 push2 易断连接口。
+5. 同花顺概念/行业板块：``ths-index-list`` + ``constituents/ths-stock-list``，补充东财未覆盖的
+   概念板块（需 HITHINK_FINANCE_API_KEY，无 key 时静默跳过）。
 
 核心不依赖 MX_APIKEY。
 """
@@ -222,6 +224,69 @@ def _pool_from_priority(key: str) -> dict[str, dict]:
     return pool
 
 
+# ---------------------------------------------------------------- 同花顺概念/行业板块
+
+# tag -> {板块名: thscode}，进程内缓存（一次拉全量，避免逐次请求）
+_ths_board_cache: dict[str, dict[str, str]] = {}
+
+
+def _ths_boards(tag: str) -> dict[str, str]:
+    """同花顺指数目录 → {板块名: thscode}。tag: cn_concept/industry。"""
+    global _ths_board_cache
+    if tag not in _ths_board_cache:
+        try:
+            from app import hithink
+            items = hithink.fetch_ths_index_list(tag)
+        except Exception:
+            items = []
+        _ths_board_cache[tag] = {
+            str(it.get("name", "")).strip(): str(it.get("thscode", "")).strip()
+            for it in items
+            if it.get("name") and it.get("thscode")
+        }
+    return _ths_board_cache[tag]
+
+
+def _match_ths_board(key: str) -> tuple[str, str] | None:
+    """在同花顺概念 + 行业目录里匹配板块名，返回 (thscode, name)。精确→前缀→包含。"""
+    for tag in ("cn_concept", "industry"):
+        boards = _ths_boards(tag)
+        for name, ts in boards.items():
+            if name == key:
+                return ts, name
+        for name, ts in boards.items():
+            if name.startswith(key):
+                return ts, name
+        for name, ts in boards.items():
+            if key in name:
+                return ts, name
+    return None
+
+
+def _pool_from_ths_board(key: str) -> dict[str, dict]:
+    """同花顺概念/行业板块 → 成分股池（需 HITHINK_FINANCE_API_KEY）。"""
+    hit = _match_ths_board(key)
+    if not hit:
+        return {}
+    ts, name = hit
+    try:
+        from app import hithink
+        items = hithink.fetch_ths_constituents(ts)
+    except Exception:
+        return {}
+    pool: dict[str, dict] = {}
+    for it in items:
+        code = _norm_code(it.get("ticker"))
+        if not code:
+            continue
+        pool[code] = {
+            "name": str(it.get("name", "")),
+            "industry": name,
+            "source": f"同花顺·{name}",
+        }
+    return pool
+
+
 # ---------------------------------------------------------------- 入口
 
 def resolve_board_pool(query: str) -> dict[str, dict]:
@@ -259,6 +324,11 @@ def resolve_board_pool(query: str) -> dict[str, dict]:
 
     # 4) 行业/概念板块名模糊匹配（精确→前缀→包含，仅作兜底）
     pool = _pool_from_board_name(key)
+    if pool:
+        return _filter_scannable(pool)
+
+    # 5) 同花顺概念/行业板块成分（有 key 时兜底，补充东财未覆盖的概念板块）
+    pool = _pool_from_ths_board(key)
     if pool:
         return _filter_scannable(pool)
 

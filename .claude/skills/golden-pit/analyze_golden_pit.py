@@ -27,7 +27,6 @@ import logging
 import os
 import re
 import sys
-import time
 from pathlib import Path
 
 # 禁用 akshare/tqdm 进度条，避免污染 skill 输出
@@ -249,39 +248,59 @@ def _print_volume(klines):
         print("  ⚠️ 量能数据不足")
 
 
+def _hithink_fundamental(code: str) -> dict:
+    """同花顺当前估值 + 最新财报指标（PE/PB/ROE/净利同比/营收同比），不依赖 MX_APIKEY。"""
+    f = {"pe": None, "pb": None, "roe": None, "profit_growth": None, "revenue_growth": None}
+    try:
+        from app import hithink
+        vals = hithink.fetch_valuations_snapshot([code])
+        if vals:
+            f["pe"] = vals[0].get("pe_ttm")
+            f["pb"] = vals[0].get("pb_mrq")
+    except Exception:
+        pass
+    try:
+        from app import hithink
+        ind = hithink.fetch_financial_indicators(code)
+        f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
+        f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
+        f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
+    except Exception:
+        pass
+    return f
+
+
 def _print_fundamental(mx, code: str, name: str) -> dict:
-    """【4】估值低位 + 基本面：渲染妙想表格 + 抽取关键数字，返回 dict。"""
+    """【4】估值低位 + 基本面：同花顺（当前估值+财报）+ 妙想（历史分位/股息率），返回 dict。"""
     print()
     print("=" * 72)
-    print("【4. 估值低位 + 基本面（妙想）】")
+    print("【4. 估值低位 + 基本面（同花顺 + 妙想分位）】")
     print("=" * 72)
     f = {"pb_pct": None, "pe_pct": None, "pe": None, "pb": None,
          "roe": None, "profit_growth": None, "revenue_growth": None}
+
+    # ---- 同花顺：当前估值 + 财务指标（主源，不依赖 MX_APIKEY）----
+    hf = _hithink_fundamental(code)
+    f.update(hf)
+    print("  同花顺（当前估值 + 最新财报）:")
+    print(f"    PE(TTM) {_f(f['pe'])}  |  PB {_f(f['pb'])}")
+    print(f"    净利同比 {_fpct(f['profit_growth'])}  |  营收同比 {_fpct(f['revenue_growth'])}  |  ROE(加权) {_fpct(f['roe'])}")
+
+    # ---- 妙想：历史分位（PB/PE 分位 + 股息率）——同花顺估值端点不含历史分位 ----
     if mx is None:
-        print("  ⚠️ 未配置 MX_APIKEY，跳过估值/基本面（可配置后重跑）")
-        return f
-    try:
-        tables = mx.query_structured(f"{name} {code} 市盈率 历史分位 市净率 历史分位 股息率")
-        if tables:
-            print(_render_tables(tables))
-            f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
-            f["pe_pct"] = _find_col_value(tables, "市盈率", "百分位")
-            f["pe"] = _find_col_value(tables, "市盈率PE", exclude=("百分位", "分位"))
-            f["pb"] = _find_col_value(tables, "市净率PB", exclude=("百分位", "分位"))
-    except Exception:
-        pass
-    time.sleep(0.4)
-    try:
-        tables = mx.query_structured(f"{name} {code} 最新财报 净利润 营业收入 同比增长 ROE 资产负债率")
-        if tables:
-            print(_render_tables(tables))
-            f["roe"] = _find_col_value(tables, "ROE")
-            f["profit_growth"] = _find_col_value(tables, "净利润", "同比")
-            f["revenue_growth"] = _find_col_value(tables, "营业收入", "同比")
-    except Exception:
-        pass
+        print("  （未配置 MX_APIKEY，PB/PE 历史分位跳过；ROE/净利同比已由同花顺补齐）")
+    else:
+        try:
+            tables = mx.query_structured(f"{name} {code} 市盈率 历史分位 市净率 历史分位 股息率")
+            if tables:
+                print(_render_tables(tables))
+                f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
+                f["pe_pct"] = _find_col_value(tables, "市盈率", "百分位")
+        except Exception:
+            pass
+
     print("  关键数字:")
-    print(f"    PB三年分位 {_fpct(f['pb_pct'])}  |  PE(TTM) {_f(f['pe'])}  |  PB {_f(f['pb'])}")
+    print(f"    PB历史分位 {_fpct(f['pb_pct'])}  |  PE(TTM) {_f(f['pe'])}  |  PB {_f(f['pb'])}")
     print(f"    净利同比 {_fpct(f['profit_growth'])}  |  营收同比 {_fpct(f['revenue_growth'])}  |  ROE {_fpct(f['roe'])}")
     return f
 

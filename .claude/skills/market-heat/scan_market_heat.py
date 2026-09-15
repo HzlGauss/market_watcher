@@ -6,7 +6,8 @@
     2. 拉龙虎榜（东方财富）→ 净买入 / 净卖出排行 + 上榜原因
     3. 行业聚合：涨幅榜+龙虎榜净买入 的行业聚集 = 热点方向；跌幅榜+龙虎榜净卖出 = 避坑方向
     4. 板块资金流佐证：概念/行业板块今日主力净流入 top / 净流出 top
-    5. 情绪面：涨停/跌停家数、龙虎榜净买/净卖额对比
+    5. 关注度雷达（同花顺）：飙升榜 / 热股榜 / 当日异动原因
+    6. 情绪面：涨停/跌停家数、龙虎榜净买/净卖额对比
 
 本脚本只做「取数 + 聚合」，输出结构化数据包；「热点方向 / 避坑方向」结论由 AI 依据 SKILL.md 框架生成。
 
@@ -21,6 +22,7 @@
     - 全市场行情 + 行业: 东财 clist（_fetch_em_clist，push2delay/push2 双 host 回退）
     - 龙虎榜: 同花顺官方金融数据（app.dragon_tiger.fetch_dragon_tiger_list，无 key 回退东财）
     - 板块资金流: 东财数据中心（fetch_sector_fund_flow_rank，行业/概念）
+    - 关注度雷达: 同花顺官方金融数据（飙升榜/热股榜/异动原因，需 HITHINK_FINANCE_API_KEY）
     全部不依赖 MX_APIKEY。
 """
 import os
@@ -246,6 +248,41 @@ def _print_sector_flow(title: str, inflows, outflows):
         print(f"    {_short(f.name, 14):<14} 净流出 {_fmt_yi(f.main_net):>8}  涨跌 {_fmt_pct(f.change_pct)}  主力股 {_short(f.top_stock, 10)}")
 
 
+def _print_attention():
+    """【关注度雷达】飙升榜 / 热股榜 / 当日异动原因（同花顺特色数据）。"""
+    print()
+    print("=" * 72)
+    print("【6b. 关注度雷达（同花顺 · 飙升/热股/异动）】")
+    print("=" * 72)
+    try:
+        from app import hithink
+        sky = hithink.fetch_skyrocket_list("day")
+        hot = hithink.fetch_hot_stock_list("day")
+        anom = hithink.fetch_anomaly_list("")
+    except Exception:
+        sky = hot = anom = []
+    if sky:
+        print("  ── 飙升榜 top10 ──")
+        for s in sky[:10]:
+            print(f"    {str(s.get('ticker', '')).zfill(6)} {_short(s.get('name', ''), 9):<10}"
+                  f" 热度 {_short(str(s.get('heat', '')), 12)}  排名变化 {s.get('rank_change')}")
+    if hot:
+        print("  ── 热股榜 top10 ──")
+        for s in hot[:10]:
+            print(f"    {str(s.get('ticker', '')).zfill(6)} {_short(s.get('name', ''), 9):<10}"
+                  f" 热度 {_short(str(s.get('heat', '')), 12)}")
+    if anom:
+        from collections import Counter
+        tags = Counter(str(a.get("tag_name", "")) for a in anom)
+        print(f"  ── 当日异动 {len(anom)} 条 ──")
+        print("    异动类型: " + " / ".join(f"{t}×{c}" for t, c in tags.most_common()))
+        for a in anom[:6]:
+            kw = "、".join(a.get("keyword_list") or [])[:22]
+            print(f"    {a.get('stock_name', '')} [{a.get('tag_name', '')}] {kw}")
+    if not sky and not hot and not anom:
+        print("  ⚠️ 无关注度数据（无 key 或接口不可达）")
+
+
 # ---------------------------------------------------------------- 主流程
 
 def _parse_args(argv):
@@ -301,6 +338,9 @@ def main():
     industry_in, industry_out = _fetch_sector_flow("行业资金流")
     _print_sector_flow("【6. 板块资金流佐证 · 概念板块（今日）】", concept_in, concept_out)
     _print_sector_flow("【6. 板块资金流佐证 · 行业板块（今日）】", industry_in, industry_out)
+
+    # ---- 关注度雷达（同花顺：飙升榜/热股榜/异动原因）----
+    _print_attention()
 
     # ---- 情绪面 ----
     print()

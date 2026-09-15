@@ -347,6 +347,55 @@ def _print_dt_pool(dt_df):
               f"{_fmt_yi(r['seal']):>10}{_short(r['industry'], 11):<12}")
 
 
+def _print_ladder():
+    """【连板梯队矩阵】近30日最高板演变 + 连板次日晋级率（同花顺 limit-up-ladder）。
+
+    seal_nextday 为 bool（次日是否封板）；最近交易日为 null 跳过，不计入晋级率样本。
+    """
+    print()
+    print("=" * 72)
+    print("【1b. 连板梯队矩阵（近30日 · 同花顺 · 晋级率）】")
+    print("=" * 72)
+    try:
+        from app import hithink
+        data = hithink.fetch_limit_up_ladder()
+    except Exception:
+        data = {}
+    items = (data or {}).get("item") or []
+    if not items:
+        print("  ⚠️ 无连板梯队数据（无 key 或接口不可达）")
+        return
+    board_keys = ("two_board", "three_board", "four_board", "five_board", "six_board", "seven_over")
+
+    print("  近8日最高连板演变:")
+    for day in items[-8:]:
+        boards = day.get("boards") or {}
+        max_n = 0
+        for k in board_keys:
+            for s in (boards.get(k) or []):
+                max_n = max(max_n, _int(s.get("board_num")))
+        bar = "█" * min(max_n, 10)
+        print(f"    {day.get('date', '')}  {max_n}板  {bar}")
+
+    total = sealed = 0
+    for day in items:
+        boards = day.get("boards") or {}
+        for k in board_keys:
+            for s in (boards.get(k) or []):
+                if s.get("seal_nextday") is None:
+                    continue
+                total += 1
+                if s.get("seal_nextday") is True:
+                    sealed += 1
+    if total:
+        rate = sealed / total * 100
+        verdict = ("情绪强（连板晋级率高）" if rate >= 60
+                   else ("情绪中性" if rate >= 40 else "情绪弱（晋级率低，接力差）"))
+        print(f"  近30日连板次日晋级率: {sealed}/{total} = {rate:.0f}%  →  {verdict}")
+    else:
+        print("  次日晋级率: 无样本")
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -388,6 +437,9 @@ def main():
     # 1. 涨停梯队
     tiers, high = _tier_stats(zt_df)
     _print_tiers(tiers, high)
+
+    # 1b. 连板梯队矩阵（近30日 + 晋级率）
+    _print_ladder()
 
     # 2. 炸板率
     _print_break_rate(zt_n, zb_n)

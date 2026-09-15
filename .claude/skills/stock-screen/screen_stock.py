@@ -13,7 +13,9 @@
     py screen_stock.py 今日放量上涨且主力资金净流入 30
     py screen_stock.py 市盈率低于20倍且净利润增长 20
 
-输出: 结构化候选列表（代码/名称/行业/现价/涨跌幅/主力净额/估值状态等）。
+输出: 结构化候选列表（代码/名称/行业/现价/涨跌幅/主力净额/PE-TTM/PB/换手/量比）。
+估值 PE/PB 由同花顺批量估值快照补齐（需 HITHINK_FINANCE_API_KEY，一次请求覆盖全部候选）；
+PB 后附妙想历史分位（可选）。
 """
 import sys
 from pathlib import Path
@@ -63,29 +65,55 @@ def _fmt_pct(v, signed=True):
     return f"{sign}{abs(v):.2f}%" if signed else f"{v:.2f}%"
 
 
+def _fmt_val(v):
+    """估值倍数（PE/PB，可能为负或 None）"""
+    if v is None:
+        return "—"
+    return f"{v:.2f}"
+
+
 def _pad(s, width):
     """按显示宽度左对齐填充（中文按 2 宽度计）"""
     w = sum(2 if ord(c) > 0x1100 else 1 for c in str(s))
     return str(s) + " " * max(0, width - w)
 
 
+def _enrich_valuations(cands):
+    """同花顺批量估值快照 → 给候选补 pe_ttm/pb_mrq（一次请求覆盖全部候选，无需 MX_APIKEY）。"""
+    codes = [str(c.get("code", "")).zfill(6) for c in cands if c.get("code")]
+    if not codes:
+        return
+    try:
+        from app import hithink
+        vals = hithink.fetch_valuations_snapshot(codes)
+    except Exception:
+        return
+    by_code = {str(v.get("ticker", "")).zfill(6): v for v in vals}
+    for c in cands:
+        v = by_code.get(str(c.get("code", "")).zfill(6))
+        if v:
+            c["pe_ttm"] = v.get("pe_ttm")
+            c["pb_mrq"] = v.get("pb_mrq")
+
+
 def _render_candidates(cands):
-    """把 stock_screen_structured 候选列表渲染为表格"""
+    """把 stock_screen_structured 候选列表渲染为表格（估值列由同花顺补齐）"""
     if not cands:
         return "⚠️ 无符合条件的股票\n"
 
     lines = []
     header = (
         f"{'代码':<8} {'名称':<10} {'行业':<10} {'现价':>8} {'涨跌幅':>8} "
-        f"{'主力净额':>10} {'估值':<8} {'换手':>7} {'量比':>6}"
+        f"{'主力净额':>10} {'PE-TTM':>8} {'PB':>7} {'换手':>7} {'量比':>6}"
     )
     lines.append(header)
-    lines.append("-" * 88)
+    lines.append("-" * 96)
 
     for c in cands:
-        val = c.get("valuation_status") or "—"
+        pe = _fmt_val(c.get("pe_ttm"))
+        pb = _fmt_val(c.get("pb_mrq"))
         if c.get("valuation_percentile") is not None:
-            val = f"{val}/{c['valuation_percentile']:.0f}%"
+            pb = f"{pb}/{c['valuation_percentile']:.0f}%"
         lines.append(
             f"{c.get('code', '—'):<8} "
             f"{_pad(c.get('name', '—'), 10)} "
@@ -93,7 +121,8 @@ def _render_candidates(cands):
             f"{str(c.get('price') or '—'):>8} "
             f"{_fmt_pct(c.get('change_pct')):>8} "
             f"{_fmt_amount(c.get('main_net')):>10} "
-            f"{_pad(val, 8)} "
+            f"{pe:>8} "
+            f"{pb:>7} "
             f"{_fmt_pct(c.get('turnover_rate'), signed=False):>7} "
             f"{str(c.get('vol_ratio') or '—'):>6}"
         )
@@ -127,6 +156,7 @@ def main():
 
     cands = mx.stock_screen_structured(keyword, page_size=page_size)
     if cands:
+        _enrich_valuations(cands)
         print(_render_candidates(cands))
         return 0
 

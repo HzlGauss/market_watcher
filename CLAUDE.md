@@ -100,6 +100,9 @@ py .claude/skills/market-watch/scan_market_watch.py
 # Limit-up/down analysis (涨跌停分析：涨停梯队/炸板率/封单/题材/跌停 → 短线情绪周期)
 py .claude/skills/limit-analysis/scan_limit.py [日期YYYYMMDD]
 
+# Auction scan (早盘竞价雷达：个股竞价强弱 + 全市场短线风向标 → 竞价情绪)
+py .claude/skills/auction/scan_auction.py [板块/行业|代码列表] [数量]
+
 # Threshold backtests (阈值历史收益回测：中证1000成分 + 日K线，验证各 skill 打分阈值)
 py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
 py .claude/skills/left-side/backtest_left_side.py [回测日期数]
@@ -131,6 +134,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`etf-screen`** — 全市场 ETF 多维度筛选：按「规模+流动性（硬门槛）→ 动量+趋势 → 估值分位 → 资金流+份额」四维打分，输出候选排名，支持按类型（宽基/行业/主题/债券/跨境/商品/货币）或跟踪方向（半导体/医药/沪深300...）过滤。用户问「有哪些 ETF 值得买/关注」「帮我筛 ETF」「ETF 选哪只」「XX 方向哪个 ETF 好」「有没有低估/资金流入的 ETF」时使用。免费层（东财快照+新浪K线）不依赖 `MX_APIKEY`，估值分位/净申购额走妙想。详见 `.claude/skills/etf-screen/SKILL.md`。
 - **`market-watch`** — 大盘盯盘：拉 8 大核心指数实时行情 + 近 60 日位置 + 全市场广度（涨跌家数/成交额/涨跌停）+ 行业/概念板块领涨领跌 + 两融余额（替代已停披露的北向资金），判断当前大盘强弱与进攻/防守。用户问「今天大盘怎么样」「大盘强不强」「现在该进攻还是防守」「指数什么位置」「市场广度/情绪如何」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-watch/SKILL.md`。
 - **`limit-analysis`** — 涨跌停深度分析：拉最近交易日涨停池/炸板池/跌停池，算涨停梯队（连板高度分层）、炸板率、封单额 TOP、题材归类、跌停池，判断短线情绪周期与主线题材。涨跌停用同花顺/东财精确口径（10%/20%/ST 5%），非 9.9% 近似。用户问「今天多少涨停/跌停」「涨停梯队/连板高度」「炸板率」「谁在涨停、什么题材」「短线情绪怎么样」「空间板是谁」时使用。同花顺主源 + akshare 兜底（无 key 需 `pip install akshare`）。详见 `.claude/skills/limit-analysis/SKILL.md`。
+- **`auction`** — 早盘竞价雷达：拉全市场短线风向标竞价基准 + 自选/持仓/指定板块个股集合竞价快照，算竞价涨跌幅/量比/竞价换手/昨量比/未匹配量，输出「高开强势/低开弱势」分层。用户问「今天竞价怎么样」「早盘竞价强弱」「XX 竞价高开/低开」「竞价能不能追/要不要竞价卖」「竞价情绪怎么样」时使用。仅支持 A 股（自动过滤 ETF/基金），需 `HITHINK_FINANCE_API_KEY`，不依赖 `MX_APIKEY`。详见 `.claude/skills/auction/SKILL.md`。
 
 ## Configuration
 

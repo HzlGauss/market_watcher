@@ -72,6 +72,7 @@ Thumbs.db
 
 # Project specific
 state/*.json
+data/
 monitoring_briefs/*.md
 investment_reports/*.md
 smart_screening/*.md
