@@ -14,7 +14,8 @@
     py query_fund_flow.py 300432 富临精工 3      # 最近3个交易日
     py query_fund_flow.py 159801 3               # ETF，最近3个交易日
 
-输出: 按交易日倒序的表格，单位亿元（+ 净流入 / - 净流出）。
+输出: 顶部「实时行情·量价参考」段（现价/涨跌幅/量比/换手率），
+      下方按交易日倒序的资金流表格，单位亿元（+ 净流入 / - 净流出）。
       主力 = 超大单 + 大单；散户 ≈ 小单。
 """
 import re
@@ -38,7 +39,8 @@ from app.config import Config
 from app.utils import load_env
 from app.miaoxiang import MXClient
 from app.helpers import _detect_market
-from app.data_fetcher import fetch_fund_flow_detail
+from app.data_fetcher import fetch_fund_flow_detail, fetch_quotes
+from app.models import WatchItem, Quote
 from app.analyzer import detect_split_order_from_nets
 
 # 5 档净流入的关键字段名（妙想返回的精确键名）
@@ -111,6 +113,63 @@ def _fmt_amount(v) -> str:
     return f"{v / 1e8:+.2f}"
 
 
+def _f(x, nd=2) -> str:
+    """浮点 -> 定宽字符串（None 显示 --）。"""
+    return f"{x:.{nd}f}" if x is not None else "  --"
+
+
+# 场内基金（ETF/LOF）号段，与 app/hithink.py 一致
+_ETF_PREFIXES = ("51", "56", "58", "15", "16", "18")
+
+
+def _volume_price_label(q: Quote) -> str:
+    """量价配合标签：量比 + 涨跌幅 -> 放量上涨 / 缩量下跌 等（换手率佐证活跃度）。
+
+    量比 = 当日每分钟均量 / 近 5 日每分钟均量：≥1.5 明显放量，<0.8 缩量，0.8~1.5 平量。
+    """
+    if q is None:
+        return ""
+    vr = q.volume_ratio
+    if vr is not None:
+        vol = "放量" if vr >= 1.5 else ("缩量" if vr < 0.8 else "平量")
+    else:
+        vol = "量比N/A"
+    chg = q.change_pct
+    if chg is None:
+        d = ""
+    elif chg >= 0.5:
+        d = "上涨"
+    elif chg <= -0.5:
+        d = "下跌"
+    else:
+        d = "横盘"
+    return f"{vol}{d}" if d else vol
+
+
+def _print_quote(code: str, name: str) -> Quote | None:
+    """实时行情（现价/涨跌幅/量比/换手率），供量价配合判断，不依赖 MX_APIKEY。
+
+    新浪主源 + 腾讯量比/换手率兜底；失败时静默跳过（不影响资金流主流程）。
+    """
+    market = _detect_market(code)
+    is_etf = code.startswith(_ETF_PREFIXES)
+    item = WatchItem(name=name, code=code, market=market, type="ETF" if is_etf else "个股")
+    try:
+        quotes = fetch_quotes([item])
+    except Exception:
+        quotes = []
+    q = quotes[0] if quotes else None
+    if q is None:
+        return None
+    print("=" * 72)
+    print(f"【实时行情 · 量价参考】{q.code} {q.name}")
+    print("=" * 72)
+    print(f"  现价 {_f(q.price, 3)}  涨跌幅 {_f(q.change_pct, 2)}%  "
+          f"量比 {_f(q.volume_ratio, 2)}  换手率 {_f(q.turnover_rate, 2)}%")
+    print(f"  量价配合: {_volume_price_label(q)}（换手率口径：{'ETF·T+0' if is_etf else '个股'}）")
+    return q
+
+
 def _today_row_from_eastmoney(code: str):
     """东方财富实时资金流兜底（妙想实时通道失效时使用）
 
@@ -158,6 +217,9 @@ def main():
     code, name, days = _parse_args(sys.argv)
 
     load_env(_ROOT)
+    # 量比 / 换手率（不依赖 MX_APIKEY，失败静默跳过，不影响资金流主流程）
+    _print_quote(code, name)
+
     config = Config(_ROOT / "watchlist_config.json")
     api_keys = config.mx_apikeys
     if not api_keys:
