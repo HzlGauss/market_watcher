@@ -9,7 +9,7 @@ import logging
 from typing import Dict, List
 
 from .data_pool import SharedDataPool, KLine
-from .technical import fetch_historical_kline
+from . import kline_local
 from .models import Quote, WatchItem
 
 
@@ -115,26 +115,28 @@ class DataFetcherThread(threading.Thread):
             return {}
 
     def _fetch_klines(self) -> Dict[str, List[KLine]]:
-        """获取K线数据（带间隔，避免触发频率限制）"""
+        """获取K线数据（本地 duckdb 优先，缺当日/不可用时远端兜底）"""
         klines = {}
+        local_available = kline_local.available()
 
         for item in self._watch_items:
             try:
-                klines_data = fetch_historical_kline(item.code, item.market, days=60, scale=240)
+                klines_data = kline_local.fetch_daily_hybrid(item.code, item.market, days=60)
                 if klines_data:
                     klines[item.code] = [
-                    KLine(
-                        date=k.date or '',
-                        open=float(k.open or 0),
-                        high=float(k.high or 0),
-                        low=float(k.low or 0),
-                        close=float(k.close or 0),
-                        volume=float(k.volume or 0)
-                    )
-                    for k in klines_data
-                ]
-                # 每次请求后等待，避免触发新浪频率限制
-                time.sleep(0.3)
+                        KLine(
+                            date=k.date or '',
+                            open=float(k.open or 0),
+                            high=float(k.high or 0),
+                            low=float(k.low or 0),
+                            close=float(k.close or 0),
+                            volume=float(k.volume or 0)
+                        )
+                        for k in klines_data
+                    ]
+                # 远端兜底时逐只限速，避免触发新浪频率限制；本地 duckdb 无需
+                if not local_available:
+                    time.sleep(0.3)
             except Exception as e:
                 log.warning(f"获取 {item.code} K线数据失败: {e}")
 

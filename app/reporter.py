@@ -28,6 +28,17 @@ from app.dragon_tiger import (
 # Private Helpers
 # ============================================================
 
+def _fetch_daily_kline(code: str, market: str, days: int = 60):
+    """日K线：优先本地 duckdb（混合补当日），不可用/异常远端兜底。"""
+    try:
+        from app import kline_local
+        return kline_local.fetch_daily_hybrid(code, market, days=days)
+    except Exception:
+        pass
+    from app.technical import fetch_historical_kline
+    return fetch_historical_kline(code, market, days=days, scale=240)
+
+
 def _get_unique_items(config: Config) -> list[WatchItem]:
     """Merge watchlist and holdings to get unique list of items for fetching"""
     watchlist = config.watch_items
@@ -124,10 +135,7 @@ def _get_holdings_strategy_signals(
     返回每个持仓的组合策略信号列表。
     网络异常时返回空列表。
     """
-    from app.technical import (
-        fetch_historical_kline,
-        get_technical_summary,
-    )
+    from app.technical import get_technical_summary
     from app.strategy import evaluate_all_strategies, calc_macd_dif_series
     from app.models import TechSnapshot, tech_snapshot_to_summary
     from app.analyzer import _load_scan_history
@@ -150,7 +158,7 @@ def _get_holdings_strategy_signals(
         if not quote:
             return None
 
-        klines = fetch_historical_kline(h.code, h.market, days=60)
+        klines = _fetch_daily_kline(h.code, h.market)
         if not klines:
             return None
 
@@ -263,7 +271,6 @@ def _get_holdings_tech_analysis(
     网络异常时返回空列表。
     """
     from app.technical import (
-        fetch_historical_kline,
         calc_support_resistance,
         analyze_volume_price,
         calc_rsi,
@@ -293,7 +300,7 @@ def _get_holdings_tech_analysis(
             return None
 
         # 获取 60 日 K 线（MACD 需要至少 35 天，RSI 需要 15 天，60 天留足余量）
-        klines = fetch_historical_kline(h.code, h.market, days=60)
+        klines = _fetch_daily_kline(h.code, h.market)
         if not klines:
             return None
 
@@ -3916,7 +3923,6 @@ def _weekly_return_pct(klines: list) -> float | None:
 def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: float | None) -> dict | None:
     """计算单个标的的周度数据，返回 dict 或 None（K线/行情缺失）"""
     from app.technical import (
-        fetch_historical_kline,
         get_technical_summary,
         calc_support_resistance,
         calc_composite_score,
@@ -3925,7 +3931,7 @@ def _build_weekly_item(item: WatchItem, quote: Quote | None, benchmark_return: f
         MarketRegime,
     )
 
-    klines = fetch_historical_kline(item.code, item.market, days=60)
+    klines = _fetch_daily_kline(item.code, item.market)
     if not klines:
         return None
 
@@ -4010,7 +4016,6 @@ def generate_weekly_review(config: Config) -> Path | None:
         fetch_stock_margin_detail,
     )
     from app.helpers import is_a_share_stock
-    from app.technical import fetch_historical_kline
 
     log.info("Generating weekly review...")
 
@@ -4030,10 +4035,10 @@ def generate_weekly_review(config: Config) -> Path | None:
     benchmark_return = None
     if benchmark_item:
         benchmark_return = _weekly_return_pct(
-            fetch_historical_kline(benchmark_item.code, benchmark_item.market, days=60))
+            _fetch_daily_kline(benchmark_item.code, benchmark_item.market))
     if benchmark_return is None:
         for idx in index_items:
-            ik = fetch_historical_kline(idx.code, idx.market, days=60)
+            ik = _fetch_daily_kline(idx.code, idx.market)
             if ik:
                 wr = _weekly_return_pct(ik)
                 if wr is not None:
@@ -4064,7 +4069,7 @@ def generate_weekly_review(config: Config) -> Path | None:
     if benchmark_item is not None and benchmark_return is not None:
         data_lines.append(f"- **基准: {benchmark_item.name} 近5日 {benchmark_return:+.2f}%**")
     for idx in index_items:
-        ik = fetch_historical_kline(idx.code, idx.market, days=60)
+        ik = _fetch_daily_kline(idx.code, idx.market)
         wr = _weekly_return_pct(ik)
         if wr is not None:
             data_lines.append(f"- {idx.name}({idx.code}): 近5日 {wr:+.2f}%")
