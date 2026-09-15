@@ -12,6 +12,7 @@
     panel               读全市场日K面板并落盘 CSV（--start/--end/--out）
     symbols             列出本地证券表（可按 --exchange/--asset-type 过滤）
     status              查看库状态（各表行数 + 最大日期）
+    sync                增量同步：只跑 auto-sync（自动判断 skip/incremental/full），不装依赖不重建库
     sync-symbols        刷新 dim_symbol 证券维度表（symbols 子命令依赖）
     streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
 
@@ -275,6 +276,21 @@ def cmd_sync_symbols(args) -> int:
     return r.returncode
 
 
+def cmd_sync(args) -> int:
+    """增量同步：只跑 auto-sync（自动判断 skip/incremental/full），不装依赖、不重建库。"""
+    _load_key()
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import marketdb  # noqa: F401
+    except ImportError:
+        print("❌ marketdb 未安装（先运行 bootstrap）")
+        return 1
+    return _cli("auto-sync", db=db).returncode
+
+
 # ---------------------------------------------------------------- streaks
 
 _STREAK_LABEL = {
@@ -438,6 +454,9 @@ def main() -> int:
     st = sub.add_parser("status", help="库状态")
     st.add_argument("--db")
 
+    sy = sub.add_parser("sync", help="增量同步（只 auto-sync，自动判断 skip/incremental/full）")
+    sy.add_argument("--db")
+
     ss = sub.add_parser("sync-symbols", help="刷新 dim_symbol 证券维度表（symbols 子命令依赖）")
     ss.add_argument("--db")
 
@@ -464,6 +483,7 @@ def main() -> int:
         "panel": cmd_panel,
         "symbols": cmd_symbols,
         "status": cmd_status,
+        "sync": cmd_sync,
         "sync-symbols": cmd_sync_symbols,
         "streaks": cmd_streaks,
     }[args.cmd](args)
