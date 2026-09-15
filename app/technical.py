@@ -6,6 +6,8 @@
 """
 
 from __future__ import annotations
+import random
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -36,8 +38,88 @@ def estimate_full_day_volume(quote: Quote) -> Optional[float]:
 # K线数据获取
 # ============================================================
 
+# 腾讯分钟K线（ifzq.gtimg.cn/appstock/app/kline/mkline）
+_TENCENT_KLINE_API = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+_TENCENT_MINUTE_KEY = {1: "m1", 5: "m5", 15: "m15", 30: "m30", 60: "m60"}
+_TENCENT_KLINE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://stockapp.finance.qq.com/",
+}
+
+
+def _tencent_symbol(code: str, market: str) -> str:
+    """6 位代码 → 腾讯 K 线 symbol（sh601899 / sz159915）。"""
+    m = str(market or "").lower()
+    return f"{m}{code}" if m in ("sh", "sz") else f"sh{code}"
+
+
+def _sina_kline_get(url: str, retries: int = 0):
+    """新浪 K 线请求，可选指数退避 + 抖动重试（应对 456 限流）。
+
+    日线不重试（失败立即走同花顺兜底，避免拖慢）；分钟线重试 2 次，
+    因为分钟线无同花顺兜底，而 456 是临时限流，退避重试通常能救回。
+    """
+    resp = sina_client.get(url)
+    for attempt in range(retries):
+        if resp is not None:
+            break
+        delay = 2.0 * (2 ** attempt) + random.uniform(0, 1.0)
+        log.warning(f"新浪K线请求失败(疑似456限流)，{delay:.1f}s 后重试({attempt + 1}/{retries})...")
+        time.sleep(delay)
+        resp = sina_client.get(url)
+    return resp
+
+
+def _fetch_tencent_minute_kline(code: str, market: str, scale: int, days: int) -> list[KlineData]:
+    """腾讯分钟 K 线（ifzq.gtimg.cn，浏览器 UA + Referer + 指数退避重试）。
+
+    作为新浪 456 限流后的第二分钟线源。东方财富 push2his 从本机被 TCP 重置
+    （RemoteDisconnected），akshare 的分钟接口同样打该主机、故不可用；腾讯
+    ifzq.gtimg.cn 分钟线实测可用。失败返回空列表。
+    """
+    key = _TENCENT_MINUTE_KEY.get(scale, "m5")
+    bars_per_day = 240 // scale if scale else 48
+    lmt = max(days * bars_per_day, 120)
+    sym = _tencent_symbol(code, market)
+    url = f"{_TENCENT_KLINE_API}?param={sym},{key},,{lmt}"
+    for attempt in range(3):
+        try:
+            resp = sina_client._session.get(url, headers=_TENCENT_KLINE_HEADERS, timeout=10)
+            if resp is None:
+                raise RuntimeError("empty response")
+            payload = resp.json()
+        except Exception:
+            payload = None
+        if payload:
+            node = ((payload.get("data") or {}).get(sym) or {})
+            bars = node.get(key) or []
+            if bars:
+                results: list[KlineData] = []
+                for bar in bars:
+                    if not isinstance(bar, (list, tuple)) or len(bar) < 6:
+                        continue
+                    ts = str(bar[0])
+                    # 腾讯 m5 时间形如 YYYYMMDDHHmm，转成可读格式
+                    date = (
+                        f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:00"
+                        if len(ts) >= 12 else ts
+                    )
+                    results.append(KlineData(
+                        date=date, open=_sf(bar[1]), close=_sf(bar[2]),
+                        high=_sf(bar[3]), low=_sf(bar[4]), volume=_sf(bar[5]),
+                    ))
+                if results:
+                    return results
+        if attempt < 2:
+            delay = 1.0 * (2 ** attempt) + random.uniform(0, 0.8)
+            time.sleep(delay)
+    return []
+
+
 def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 240) -> list[KlineData]:
-    """获取K线数据（新浪主源 + AKShare 兜底）
+    """获取K线数据（多源兜底）
+
+    日线：新浪 → 同花顺 → AKShare；分钟线：新浪(退避重试) → 腾讯 → AKShare。
 
     Args:
         code: 股票代码
@@ -64,7 +146,7 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
         f"&ma=no&datalen={datalen}"
     )
 
-    resp = sina_client.get(url)
+    resp = _sina_kline_get(url, retries=2 if scale < 240 else 0)
     if resp is not None:
         try:
             data = resp.json()
@@ -106,7 +188,13 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
         except Exception as e:
             log.warning(f"同花顺K线数据获取失败 {code}: {e}")
 
-    # 新浪/同花顺均失败，尝试 AKShare 兜底
+    # 分钟线：新浪失败后先走腾讯分钟线（东财 push2his 从本机被 TCP 重置，不可用）
+    if scale < 240:
+        tencent_k = _fetch_tencent_minute_kline(code, market, scale, days)
+        if tencent_k:
+            return tencent_k
+
+    # 新浪/同花顺/东财均失败，尝试 AKShare 兜底
     try:
         import akshare as ak
         # ETF/LOF 基金代码需用 fund_etf_* 接口（stock_zh_a_* 只支持股票，会报 NoneType 错误）
