@@ -28,15 +28,32 @@ from app.dragon_tiger import (
 # Private Helpers
 # ============================================================
 
+_KL_CACHE: dict = {}
+_KL_CACHE_TTL = 60.0  # 秒：同一份报告内复用，跨报告自动过期
+
+
 def _fetch_daily_kline(code: str, market: str, days: int = 60):
-    """日K线：优先本地 duckdb（混合补当日），不可用/异常远端兜底。"""
+    """日K线：优先本地 duckdb（混合补当日），不可用/异常远端兜底。
+
+    短 TTL 进程内缓存：同一份报告里 tech 分析、策略信号、自选技术多处重复拉同一只日K，
+    避免对本地库/远端重复请求 2-3 次；跨报告（间隔分钟级）自动过期重取。
+    """
+    import time
+    key = (code, market, days)
+    hit = _KL_CACHE.get(key)
+    if hit is not None and time.time() - hit[0] < _KL_CACHE_TTL:
+        return hit[1]
+    out = None
     try:
         from app import kline_local
-        return kline_local.fetch_daily_hybrid(code, market, days=days)
+        out = kline_local.fetch_daily_hybrid(code, market, days=days)
     except Exception:
-        pass
-    from app.technical import fetch_historical_kline
-    return fetch_historical_kline(code, market, days=days, scale=240)
+        out = None
+    if out is None:
+        from app.technical import fetch_historical_kline
+        out = fetch_historical_kline(code, market, days=days, scale=240)
+    _KL_CACHE[key] = (time.time(), out)
+    return out
 
 
 def _get_unique_items(config: Config) -> list[WatchItem]:
@@ -610,7 +627,8 @@ def _build_report(data_section: str, llm_content: str | None) -> str:
     """拼接数据区 + 分析区为完整报告"""
     if llm_content:
         return f"{data_section}\n\n{SEPARATOR}\n\n## AI 分析\n\n{llm_content}"
-    return data_section
+    return (f"{data_section}\n\n{SEPARATOR}\n\n## AI 分析\n\n"
+            f"> ⚠️ AI 分析未生成（LLM 未启用或调用失败），以下数据区仅供参考。")
 
 
 def _save_report(content: str, title: str, report_dir: Path) -> Path:
@@ -707,6 +725,9 @@ def generate_morning_brief(config: Config) -> Path | None:
     morning_news = fetch_market_news(start_hour=0, end_hour=9, max_count=15)
     all_items = _get_unique_items(config)
     quotes = fetch_quotes_rich(all_items)
+    if not quotes:
+        log.warning("早报：行情拉取为空，跳过本次报告生成")
+        return None
 
     # 2. Build data section (shown in report)
     # 加载前日收盘缓存（晚报运行时保存的）
@@ -2306,29 +2327,36 @@ def _format_market_sector_section(
              sorted(holding_industries.items(), key=lambda x: len(x[1]), reverse=True)[:5])}"
         )
 
-    # 板块轮动（日环比）
+    # 板块轮动（日环比）：按日期持久化历史，同一天多次生成报告也能对上最近一个历史交易日
     if sector_boards:
         from datetime import datetime as _dt
         from pathlib import Path as _Pth
         import json
         rot_path = _Pth(__file__).resolve().parent.parent / "state" / "sector_history.json"
-        prev_sectors = {}
+        today_str = _dt.now().strftime("%Y-%m-%d")
+        history: dict = {}
         if rot_path.exists():
             try:
                 with open(rot_path, "r", encoding="utf-8") as f:
-                    prev_data = json.load(f)
-                today_str = _dt.now().strftime("%Y-%m-%d")
-                if prev_data.get("_date") != today_str:
-                    prev_sectors = {it["name"]: it["change_pct"] for it in prev_data.get("sectors", [])}
+                    history = json.load(f)
             except Exception:
-                pass
-        # 保存当日数据
+                history = {}
+        # 兼容旧单日格式 {_date, sectors} → {date: {name: change_pct}}
+        if isinstance(history.get("sectors"), list):
+            legacy_date = history.get("_date", "")
+            history = {legacy_date: {it["name"]: it["change_pct"] for it in history["sectors"]}} if legacy_date else {}
+        # 今日快照 + 最近一个历史交易日
+        today_map = {sb.name: sb.change_pct for sb in sector_boards[:30]}
+        prev_sectors: dict = {}
+        for d in sorted(history.keys()):
+            if d and d < today_str:
+                prev_sectors = history[d]
+        # 保存当日快照（幂等覆盖今日槽位，保留历史）
         try:
             rot_path.parent.mkdir(parents=True, exist_ok=True)
+            history[today_str] = today_map
             with open(rot_path, "w", encoding="utf-8") as f:
-                json.dump({"_date": _dt.now().strftime("%Y-%m-%d"),
-                           "sectors": [{"name": sb.name, "change_pct": sb.change_pct}
-                                      for sb in sector_boards[:30]]}, f, ensure_ascii=False)
+                json.dump(history, f, ensure_ascii=False)
         except Exception:
             pass
         # 计算轮动
@@ -3189,7 +3217,7 @@ def generate_evening_review(config: Config) -> Path | None:
     prev_state = {}
     try:
         from pathlib import Path
-        state_path = Path(__file__).resolve().parent.parent / "state" / "monitor_state.json"
+        state_path = Path(__file__).resolve().parent.parent / "state" / "market_state.json"
         if state_path.exists():
             import json
             with open(state_path, "r", encoding="utf-8") as f:
@@ -3318,6 +3346,9 @@ def generate_evening_review(config: Config) -> Path | None:
             # 涨跌幅
             if quote and quote.change_pct is not None:
                 parts.append(f"涨跌{quote.change_pct:+.2f}%")
+            # 盈亏（相对成本）
+            if h.get("pnl") is not None:
+                parts.append(f"盈亏{h['pnl']:+.0f}({h['pnl_pct']:+.2f}%)")
             # 量比（使用估算全天量，避免午盘半日量失真）
             if quote and quote.volume and quote.volume > 0:
                 from app.technical import estimate_full_day_volume
@@ -3338,6 +3369,11 @@ def generate_evening_review(config: Config) -> Path | None:
             tech_note = f" [{h['tech']}]" if h.get("tech") else ""
             parts.append(tech_note)
             data_lines.append(" ".join(parts))
+
+        # 总盈亏（相对成本）
+        if total_cost > 0:
+            total_pnl_pct = total_pnl / total_cost * 100
+            data_lines.append(f"\n**总盈亏: {total_pnl:+.0f} 元 ({total_pnl_pct:+.2f}%)，成本 {total_cost:.0f} 元**")
 
         has_rich = any(h.get("quote", {}).pe_ratio is not None for h in holdings_with_analysis)
         if has_rich:
@@ -3700,6 +3736,11 @@ def generate_evening_review(config: Config) -> Path | None:
             if quote.change_pct and abs(quote.change_pct) > 2:
                 info += f" {'走势强劲' if quote.change_pct > 0 else '走势疲软'}"
         llm_lines.append(info)
+
+    if h_results and attr.get("alpha_pnl") is not None:
+        llm_lines.append(
+            f"[持仓归因] 总盈亏{attr['total_pnl']:+.0f}元 = 市场β{attr['beta_pnl']:+.0f} + 选股α{attr['alpha_pnl']:+.0f}"
+        )
 
     if tech_data_evening:
         llm_lines.append("\n[技术分析]")

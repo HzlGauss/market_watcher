@@ -140,7 +140,7 @@ def _check_dragon_tiger_holdings(config, holding_codes: set) -> None:
 
         records = fetch_dragon_tiger_list(max_count=50)
         if not records:
-            _dt_cache = {"date": today, "analyses": None}
+            _dt_cache = {"date": "", "analyses": None}  # 数据未发布，不记日期，下个非交易时段重试
             log.debug("龙虎榜持仓检测: 今日数据尚未发布，跳过")
             return
 
@@ -462,6 +462,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         for q in quotes:
             if q.volume is not None:
                 entry = {"volume": q.volume}
+                if q.change_pct is not None:
+                    entry["change_pct"] = q.change_pct
                 if q.main_net_inflow is not None:
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
@@ -569,6 +571,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         for q in quotes:
             if q.volume is not None:
                 entry: dict = {"volume": q.volume}
+                if q.change_pct is not None:
+                    entry["change_pct"] = q.change_pct
                 if q.main_net_inflow is not None:
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
@@ -636,9 +640,6 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         klines = data_pool.get_klines(q.code)
         if klines:
             klines_map[q.code] = klines
-
-    # Build holdings code set for dragon tiger check
-    holding_codes = {h.code for h in config.holdings}
 
     # Enrich quotes with industry classification
     from app.data_fetcher import enrich_quotes_with_industry, fetch_sector_boards
@@ -808,14 +809,14 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             prev_p = _prev_prices.get(q.code)
             if prev_p and q.price and prev_p > 0 and q.price != prev_p:
                 vel = (q.price - prev_p) / prev_p * 100
-                if abs(vel) >= 0.3:  # 3分钟涨速超过0.3%才显示
+                if abs(vel) >= 0.3:  # 跨扫描周期涨速超过0.3%才显示
                     velocity_items.append((q.name, q.code, vel))
         if velocity_items:
             velocity_items.sort(key=lambda x: x[2], reverse=True)
             from app.presenter import Color
-            print(f"{Color.BOLD}{Color.PURPLE}═══ 涨速排名(3min) ═══{Color.RESET}")
+            print(f"{Color.BOLD}{Color.PURPLE}═══ 涨速排名({config.scan_interval}min) ═══{Color.RESET}")
             top = velocity_items[:5]
-            bot = velocity_items[-5:]
+            bot = [x for x in velocity_items[-5:] if x not in top]
             top_str = "  ".join(f"{Color.RED}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in top)
             bot_str = "  ".join(f"{Color.GREEN}{n}({c}) {v:+.2f}%{Color.RESET}" for n, c, v in bot)
             print(f"  ▲ {top_str}")
@@ -884,6 +885,21 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     # 但告警计数仍计入策略信号，供统计使用
     stats.alert_count += len(strategy_alerts)
 
+    # K线形态检测（追加到告警列表，让形态信号进入控制台/桌面/推送/LLM）
+    from app.technical import detect_candlestick_patterns
+    for q in quotes:
+        kls = klines_map.get(q.code)
+        if not kls:
+            continue
+        patterns = detect_candlestick_patterns(kls)
+        if patterns:
+            existing = next((a for a in alerts if a.code == q.code), None)
+            if existing:
+                for p in patterns:
+                    existing.messages.append(p)
+            else:
+                alerts.append(Alert(code=q.code, name=q.name, messages=list(patterns)))
+
     # Print sentiment and alerts（只展示行情/资金/技术异动，不含策略信号）
     print_sentiment(stats)
     print_alerts(alerts)
@@ -916,20 +932,13 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                 print()
     _run_once_new._last_news_fetch = _last_news_fetch
 
-    # K线形态检测（追加到告警列表）
-    from app.technical import detect_candlestick_patterns
-    for q in quotes:
-        kls = klines_map.get(q.code)
-        if not kls:
-            continue
-        patterns = detect_candlestick_patterns(kls)
-        if patterns:
-            existing = next((a for a in alerts if a.code == q.code), None)
-            if existing:
-                for p in patterns:
-                    existing.messages.append(p)
-            else:
-                alerts.append(Alert(code=q.code, name=q.name, messages=list(patterns)))
+    # 策略信号合并进 alerts：随桌面通知/微信推送/LLM 一起走（控制台已单独展示，不重复）
+    for sa in strategy_alerts:
+        existing = next((a for a in alerts if a.code == sa.code), None)
+        if existing:
+            existing.messages.extend(sa.messages)
+        else:
+            alerts.append(sa)
 
     # 发送桌面通知
     if alerts:
@@ -958,15 +967,6 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             _last_llm_call_time = time.time()  # 记录调用时间，启动冷却
         except Exception as e:
             log.error(f"LLM analysis failed: {e}")
-
-    # Dragon Tiger holdings check (once per day, after market close ≥15:30)
-    # 龙虎榜数据通常在 16:30 后发布，盘中无法获取当日数据
-    now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-    after_close = now.hour >= 15 and now.minute >= 30
-    if after_close and _dt_cache["date"] != today_str:
-        log.info(f"收盘后触发龙虎榜持仓检测 ({today_str})")
-        _check_dragon_tiger_holdings(config, holding_codes)
 
     # Push alerts if enabled (with LLM result for richer notification)
     if config.push_enabled and alerts:
@@ -1014,6 +1014,8 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
         for q in quotes:
             if q.volume is not None:
                 entry: dict = {"volume": q.volume}
+                if q.change_pct is not None:
+                    entry["change_pct"] = q.change_pct
                 if q.main_net_inflow is not None:
                     entry["main_net_inflow"] = q.main_net_inflow
                     if q.amount and q.amount > 0:
@@ -1187,6 +1189,12 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
                     reason = "Weekend closed" if now.weekday() >= 5 else "Non-trading hours"
                     log.info(f"Paused: {reason} ({now.strftime('%H:%M')})")
                     first_run = False
+                # Dragon Tiger holdings check (once per day, after market close ≥15:30)
+                # 龙虎榜数据通常在 16:30 后发布，盘中无法获取当日数据，故放在非交易时段触发
+                after_close = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
+                if after_close and _dt_cache["date"] != now.strftime("%Y-%m-%d"):
+                    log.info(f"收盘后触发龙虎榜持仓检测 ({now.strftime('%Y-%m-%d')})")
+                    _check_dragon_tiger_holdings(config, holding_codes)
 
             _wait_until_next_slot(config.scan_interval)
 

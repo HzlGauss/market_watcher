@@ -838,7 +838,8 @@ def _find_volume_clusters(klines: list[KlineData], num_clusters: int = 3) -> lis
     return clusters
 
 
-def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> SupportResistance:
+def calc_support_resistance(klines: list[KlineData], lookback: int = 20,
+                            price: Optional[float] = None) -> SupportResistance:
     """计算支撑位、压力位和 ATR（增强版）
 
     综合多种方法：
@@ -850,6 +851,8 @@ def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> Supp
     Args:
         klines: K线数据（按时间升序）
         lookback: 回看天数
+        price: 现价（可选）。给定后主支撑/压力取「现价下方最近支撑 / 上方最近压力」，
+            而非 min/max 最宽区间（否则盈亏比、挂单价被最宽带系统性夸大）。
 
     Returns:
         SupportResistance 包含多种支撑压力位
@@ -891,6 +894,15 @@ def calc_support_resistance(klines: list[KlineData], lookback: int = 20) -> Supp
 
     support = min(valid_supports) if valid_supports else None
     resistance = max(valid_resistances) if valid_resistances else None
+
+    # 给了现价则改用「最近可执行位」：下方最近支撑 / 上方最近压力，避免最宽带失真。
+    if price and price > 0:
+        below = [s for s in valid_supports if s < price]
+        above = [r for r in valid_resistances if r > price]
+        if below:
+            support = max(below)
+        if above:
+            resistance = min(above)
 
     return SupportResistance(
         support=round(support, 3) if support else None,
@@ -1514,8 +1526,15 @@ def detect_gap(klines: list[KlineData], current_price: float, current_open: floa
     if len(klines) < 2 or current_open <= 0:
         return GapInfo()
 
-    yesterday = klines[-2]
-    if yesterday.close is None or yesterday.close <= 0:
+    # 「昨收」应为上一交易日的收盘：日线即 klines[-2]；分钟线需跳过当日 bar，
+    # 找昨日最后一根（否则连续两根 5 分钟 bar 会被误判成跳空）。
+    today = (klines[-1].date or "")[:10]
+    yesterday = None
+    for k in reversed(klines[:-1]):
+        if (k.date or "")[:10] != today:
+            yesterday = k
+            break
+    if yesterday is None or yesterday.close is None or yesterday.close <= 0:
         return GapInfo()
 
     prev_close = yesterday.close

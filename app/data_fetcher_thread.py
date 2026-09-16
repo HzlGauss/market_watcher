@@ -117,7 +117,6 @@ class DataFetcherThread(threading.Thread):
     def _fetch_klines(self) -> Dict[str, List[KLine]]:
         """获取K线数据（本地 duckdb 优先，缺当日/不可用时远端兜底）"""
         klines = {}
-        local_available = kline_local.available()
 
         for item in self._watch_items:
             try:
@@ -129,14 +128,14 @@ class DataFetcherThread(threading.Thread):
                             open=float(k.open or 0),
                             high=float(k.high or 0),
                             low=float(k.low or 0),
-                            close=float(k.close or 0),
+                            close=float(k.close),
                             volume=float(k.volume or 0)
                         )
                         for k in klines_data
+                        if k.close is not None
                     ]
-                # 远端兜底时逐只限速，避免触发新浪频率限制；本地 duckdb 无需
-                if not local_available:
-                    time.sleep(0.3)
+                # 逐只限速：hybrid 即便本地有库也会远端补当日缺口（盘中 gap>0），避免触发新浪频率限制
+                time.sleep(0.3)
             except Exception as e:
                 log.warning(f"获取 {item.code} K线数据失败: {e}")
 

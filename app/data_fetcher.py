@@ -49,7 +49,7 @@ def _parse_float(val: str | None) -> Optional[float]:
     if val is None:
         return None
     val = str(val).strip()
-    if not val or val == "0.000":
+    if not val:
         return None
     try:
         return float(val)

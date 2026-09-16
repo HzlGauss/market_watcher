@@ -89,7 +89,7 @@ def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     buy_refs = [support] + [c for c in clusters if c < price]
     if quote.low:
         buy_refs.append(quote.low)
-    nearest_below = max(c for c in buy_refs if c < price) if any(c < price for c in buy_refs) else support
+    nearest_below = max(c for c in buy_refs if c < price) if any(c < price for c in buy_refs) else min(support, price)
     buy_p = nearest_below + atr / 4
     buy_p = min(buy_p, price)  # 不高于现价
     # 买入价若高于均价，说明偏贵，下调到均价附近（但不能低于原支撑位）
@@ -100,7 +100,7 @@ def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     sell_refs = [resistance] + [c for c in clusters if c > price]
     if quote.high:
         sell_refs.append(quote.high)
-    nearest_above = min(c for c in sell_refs if c > price) if any(c > price for c in sell_refs) else resistance
+    nearest_above = min(c for c in sell_refs if c > price) if any(c > price for c in sell_refs) else max(resistance, price)
     sell_p = nearest_above - atr / 4
     sell_p = max(sell_p, price)  # 不低于现价
     # 卖出价若低于均价，说明偏便宜，上调到均价附近（但不能高于原压力位）
@@ -153,6 +153,7 @@ class T0MonitorThread(threading.Thread):
         self._last_signal_time: Dict[str, float] = {}   # 信号冷却计时
         # 5分钟K线缓存：{code: (klines, fetch_time)}
         self._klines_cache: Dict[str, tuple[List[KlineData], float]] = {}
+        self._stop_event = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -169,6 +170,9 @@ class T0MonitorThread(threading.Thread):
         """停止线程"""
         log.info("做T监控线程停止中...")
         self._running = False
+        self._stop_event.set()
+        # 最多等一个扫描间隔+缓冲，避免残留扫描/推送
+        self.join(timeout=self._interval + 5)
 
     def run(self):
         """线程主循环"""
@@ -178,9 +182,8 @@ class T0MonitorThread(threading.Thread):
             except Exception as e:
                 log.error(f"做T监控扫描失败: {e}")
 
-            # 等待下一次扫描
-            if self._running:
-                time.sleep(self._interval)
+            # 用 Event.wait 替代 sleep：stop() 可立即打断，不残留一轮
+            self._stop_event.wait(self._interval)
 
         log.info("做T监控线程已停止")
 
@@ -251,8 +254,13 @@ class T0MonitorThread(threading.Thread):
     def _evaluate_signal(self, item: WatchItem, quote: Quote,
                          t0_klines: List[KlineData]) -> Optional[T0Signal]:
         """评估单个标的的做T信号（基于5分钟K线）"""
-        # 计算支撑压力位
-        sr = calc_support_resistance(t0_klines, lookback=40)
+        # 获取当前价格
+        price = quote.price or quote.pre_close or 0
+        if price <= 0:
+            return None
+
+        # 计算支撑压力位（传现价，取下方最近支撑/上方最近压力，避免最宽带失真）
+        sr = calc_support_resistance(t0_klines, lookback=40, price=price)
 
         if sr.support is None or sr.resistance is None:
             return None
@@ -260,19 +268,17 @@ class T0MonitorThread(threading.Thread):
         # 计算技术指标（基于5分钟K线）
         tech = get_technical_summary(quote, t0_klines)
 
-        # 获取当前价格
-        price = quote.price or quote.pre_close or 0
-
-        if price <= 0:
-            return None
-
-        # 计算盈亏比
+        # 计算盈亏比：买入侧 reward=上方空间/risk=下方空间，卖出侧反过来。
         upside = sr.resistance - price   # 到压力的空间
         downside = price - sr.support    # 到支撑的空间
         if downside > 0:
-            risk_reward = round(upside / downside, 2)
+            risk_reward = round(upside / downside, 2)   # 买入盈亏比
         else:
             risk_reward = 0.0  # 价格已跌破支撑
+        if upside > 0:
+            sell_risk_reward = round(downside / upside, 2)  # 卖出盈亏比
+        else:
+            sell_risk_reward = 0.0  # 价格已突破压力
 
         # 区间宽度至少需要覆盖交易成本 + 有利润空间
         range_width = sr.resistance - sr.support
@@ -289,9 +295,8 @@ class T0MonitorThread(threading.Thread):
 
         # 窄幅震荡过滤（回测：此状态下胜率45.6%，均收益-0.32%）
         from app.technical import detect_market_regime
-        tech_temp = get_technical_summary(quote, t0_klines)
-        regime_t0 = detect_market_regime(tech_temp, price, sr.atr)
-        if regime_t0.regime == "窄幅震荡":
+        regime = detect_market_regime(tech, price, sr.atr)
+        if regime.regime == "窄幅震荡":
             return None
 
         # 计算建议挂单价格
@@ -301,7 +306,7 @@ class T0MonitorThread(threading.Thread):
         buy_reasons = self._check_buy_conditions(quote, tech, sr, price, risk_reward, intrabar)
 
         # 判断卖出信号
-        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, risk_reward, intrabar)
+        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, sell_risk_reward, intrabar)
 
         # 判断信号：选条件数更多的一方，附带概率和空间评估
         buy_count = len(buy_reasons)
@@ -319,8 +324,6 @@ class T0MonitorThread(threading.Thread):
         MIN_RR_SELL = 0.15 if res_confluence >= 2 else (0.2 if res_confluence >= 1 else 0.3)
 
         # 市场状态自适应：趋势市调整 RR 阈值
-        from app.technical import detect_market_regime
-        regime = detect_market_regime(tech, price, sr.atr)
         if regime.regime == "趋势上涨":
             MIN_RR_BUY = max(0.10, MIN_RR_BUY - 0.05)  # 顺势买入门槛更低
             MIN_RR_SELL = min(0.40, MIN_RR_SELL + 0.10)  # 逆势卖出门槛更高
@@ -332,9 +335,9 @@ class T0MonitorThread(threading.Thread):
         COOLDOWN_SEC = 300
         now_ts = time.time()
 
-        # 计算概率和空间
-        buy_prob = round(buy_count / BUY_TOTAL * 100) if buy_count > 0 else 0
-        sell_prob = round(sell_count / SELL_TOTAL * 100) if sell_count > 0 else 0
+        # 计算概率和空间（真实条件数略高于 BUY_TOTAL/SELL_TOTAL，clamp 到 100 防超）
+        buy_prob = min(100, round(buy_count / BUY_TOTAL * 100)) if buy_count > 0 else 0
+        sell_prob = min(100, round(sell_count / SELL_TOTAL * 100)) if sell_count > 0 else 0
         upside_pct = round((sr.resistance - price) / price * 100, 1) if price > 0 else 0
         downside_pct = round((price - sr.support) / price * 100, 1) if price > 0 else 0
 
@@ -383,8 +386,8 @@ class T0MonitorThread(threading.Thread):
             return sig
 
         if sell_count > buy_count and sell_reasons:
-            if risk_reward < MIN_RR_SELL:
-                log.debug(f"{item.name}: 卖出条件{sell_count}个但RR={risk_reward}<{MIN_RR_SELL}(压力{res_confluence}重)，跳过")
+            if sell_risk_reward < MIN_RR_SELL:
+                log.debug(f"{item.name}: 卖出条件{sell_count}个但RR={sell_risk_reward}<{MIN_RR_SELL}(压力{res_confluence}重)，跳过")
                 return None
             if in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY:
                 log.info(f"{item.name}: 卖出信号冷却中(上次为买入，{now_ts-last_ts:.0f}秒前)")
@@ -392,10 +395,10 @@ class T0MonitorThread(threading.Thread):
             conflict_note = ""
             if buy_count >= sell_count - 1 and buy_count >= 4:
                 conflict_note = "⚠️多空分歧(买卖条件接近) "
-            reason = conflict_note + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+            reason = conflict_note + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
             sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
                            reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                           risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
             self._last_signal_time[item.code] = now_ts
             return sig
 
@@ -403,23 +406,23 @@ class T0MonitorThread(threading.Thread):
         if buy_reasons and sell_reasons:
             buy_has_divergence = any("背离" in r for r in buy_reasons)
             sell_has_divergence = any("背离" in r for r in sell_reasons)
-            if buy_has_divergence and not sell_has_divergence and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
+            if buy_has_divergence and not sell_has_divergence and risk_reward >= MIN_RR_BUY and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
                 reason = "⚠️多空分歧(背离偏多) " + _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
                 sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
                                reason=reason, price=price, support=sr.support, resistance=sr.resistance,
                                risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
                 self._last_signal_time[item.code] = now_ts
                 return sig
-            if sell_has_divergence and not buy_has_divergence and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
-                reason = "⚠️多空分歧(背离偏空) " + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+            if sell_has_divergence and not buy_has_divergence and sell_risk_reward >= MIN_RR_SELL and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
+                reason = "⚠️多空分歧(背离偏空) " + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
                 sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
                                reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                               risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                               risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
                 self._last_signal_time[item.code] = now_ts
                 return sig
 
         # 仅一侧有信号（也需要 RR 过滤）
-        if buy_reasons and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
+        if buy_reasons and risk_reward >= MIN_RR_BUY and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
             reason = _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
             sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
                            reason=reason, price=price, support=sr.support, resistance=sr.resistance,
@@ -427,11 +430,11 @@ class T0MonitorThread(threading.Thread):
             self._last_signal_time[item.code] = now_ts
             return sig
 
-        if sell_reasons and risk_reward >= min(MIN_RR_BUY, MIN_RR_SELL) and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
-            reason = _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", risk_reward)
+        if sell_reasons and sell_risk_reward >= MIN_RR_SELL and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
+            reason = _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
             sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
                            reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                           risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
             self._last_signal_time[item.code] = now_ts
             return sig
 
@@ -598,9 +601,9 @@ class T0MonitorThread(threading.Thread):
             if deviation <= -1.5:
                 reasons.append(f"MA20乖离{deviation:.1f}%(远离均线，均值回归动力强)")
 
-        # 条件9：MA20趋势向上（MA20 > MA60，中长线偏多背景）
+        # 条件9：MA20趋势向上（5分钟级别，MA20≈100分钟均线 > MA60≈5小时均线）
         if tech.ma20 and tech.ma60 and tech.ma20 > tech.ma60:
-            reasons.append("MA20>MA60(中长期趋势偏多，回调做多胜率高)")
+            reasons.append("MA20>MA60(日内均线偏多，回调做多胜率高)")
 
         # 条件10：筹码峰支撑（现价接近下方密集成交区 + 多级支撑参考）
         clusters = sr.volume_clusters or []
@@ -733,9 +736,9 @@ class T0MonitorThread(threading.Thread):
             if deviation >= 1.5:
                 reasons.append(f"MA20乖离+{deviation:.1f}%(远离均线，均值回归压力大)")
 
-        # 条件9：MA20趋势向下（MA20 < MA60，中长线偏空）
+        # 条件9：MA20趋势向下（5分钟级别，MA20≈100分钟均线 < MA60≈5小时均线）
         if tech.ma20 and tech.ma60 and tech.ma20 < tech.ma60:
-            reasons.append("MA20<MA60(偏空)")
+            reasons.append("MA20<MA60(日内均线偏空)")
 
         # 条件10：筹码峰压力（现价接近上方密集成交区 + 多级压力参考）
         clusters = sr.volume_clusters or []

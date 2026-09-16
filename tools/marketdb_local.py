@@ -344,7 +344,8 @@ def _board_of(code) -> str:
 
 
 def query_streaks(kind: str, min_days: int = 3, start: str | None = None,
-                  end: str | None = None, codes: list[str] | None = None,
+                  end: str | None = None, end_after: str | None = None,
+                  codes: list[str] | None = None,
                   limit: int = 20, db=None, adjust: str = "forward",
                   ma: int = 20, window: int = 20):
     """全市场/指定代码池「连续区间」扫描，返回 pandas DataFrame。
@@ -390,6 +391,13 @@ def query_streaks(kind: str, min_days: int = 3, start: str | None = None,
         params.append(end)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+    # end_after 过滤「结束日 ≥ X」的已完成区间（聚合后 HAVING，非输入日期边界），
+    # 供初筛/回测做近端过滤：保证短近的区间（如刚开始跌 2~3 天）不被 ORDER BY+LIMIT 截掉。
+    having_extra = ""
+    if end_after:
+        having_extra = " AND MAX(g.date) >= ?"
+        params.append(end_after)
+
     agg = (
         "arg_min(adj, date) AS start_val, arg_max(adj, date) AS end_val"
         if price_based
@@ -426,7 +434,7 @@ FROM grouped g
 LEFT JOIN dim_symbol s ON s.thscode = g.thscode
 WHERE g.brk = 0
 GROUP BY g.thscode, s.name, g.gid
-HAVING COUNT(*) >= {int(min_days)}
+HAVING COUNT(*) >= {int(min_days)}{having_extra}
 ORDER BY streak_days DESC, g.thscode, start_date
 LIMIT {int(limit)}
 """
@@ -529,7 +537,8 @@ def prescreen_codes(codes, kinds, min_days: int = 2, lookback_days: int = 3,
     result: set[str] = set()
     got_any = False
     for kind in kinds:
-        df = query_streaks(kind, min_days=min_days, codes=list(codes), limit=limit, db=db_path)
+        df = query_streaks(kind, min_days=min_days, codes=list(codes), limit=limit,
+                           end_after=cutoff.isoformat(), db=db_path)
         if df is None:
             continue
         got_any = True
@@ -599,7 +608,8 @@ def prescreen_pool(pool, kinds, min_pool: int = 40, label: str = "", db=None) ->
 
 
 def backtest_streaks(kind: str, min_days: int = 3, horizons: tuple[int, ...] = (5, 10, 20),
-                     db=None, adjust: str = "forward", ma: int = 20, window: int = 20):
+                     db=None, adjust: str = "forward", ma: int = 20, window: int = 20,
+                     start: str | None = None, end: str | None = None):
     """对指定 streak kind 做「信号 → 未来 H 交易日收益」事件研究回测，返回 pandas DataFrame。
 
     对每条结束于 end_date 的 streak（连续天数 ≥ min_days），取 end_date 之后第 H 个交易日的
@@ -607,6 +617,9 @@ def backtest_streaks(kind: str, min_days: int = 3, horizons: tuple[int, ...] = (
     该 horizon 记为 NaN（自动排除停牌/退市/接近库最新日的样本）。返回列：
     thscode / start_date / end_date / days / end_val / f{H} / ret{H}。无库/无 duckdb 返回
     None，无匹配返回空 DataFrame。
+
+    start/end 按「streak 结束日 end_date」过滤样本（区间历史仍用全量计算，保证区间不被
+    截断），用于分段看信号在不同时间区间的有效性（regime 依赖）。
 
     注意：这是「事后漂移」事件研究，非逐日择时回测；不含交易成本，且用当前在库证券
     （有幸存者偏差）。每条连续段聚合为一行（无段内重复），但样本在时间上高度相关（同一
@@ -628,6 +641,15 @@ def backtest_streaks(kind: str, min_days: int = 3, horizons: tuple[int, ...] = (
         f"LEAD(adj, {h}) OVER (PARTITION BY thscode ORDER BY date) AS f{h}" for h in horizons
     )
     fcols = ", ".join(f"f.f{h}" for h in horizons)
+
+    bw, bparams = [], []
+    if start:
+        bw.append("s.end_date >= ?")
+        bparams.append(start)
+    if end:
+        bw.append("s.end_date <= ?")
+        bparams.append(end)
+    bwhere = ("WHERE " + " AND ".join(bw)) if bw else ""
 
     sql = f"""
 WITH px AS (
@@ -666,11 +688,12 @@ fwd AS (
 SELECT s.thscode, s.start_date, s.end_date, s.days, s.end_val, {fcols}
 FROM streaks s
 JOIN fwd f ON f.thscode = s.thscode AND f.date = s.end_date
+{bwhere}
 ORDER BY s.end_date
 """
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        df = con.execute(sql).fetchdf()
+        df = con.execute(sql, bparams).fetchdf()
     finally:
         con.close()
     for h in horizons:
@@ -678,8 +701,11 @@ ORDER BY s.end_date
     return df
 
 
-def _baseline_fwd(db_path, horizons, val_expr) -> dict:
-    """全市场无条件 forward return 基准（同期对照），返回 {h: (n, win%, mean%, median%)}。"""
+def _baseline_fwd(db_path, horizons, val_expr, start=None, end=None) -> dict:
+    """全市场无条件 forward return 基准（同期对照），返回 {h: (n, win%, mean%, median%)}。
+
+    start/end 过滤基准日 date 区间，使基准与信号回测同窗（regime 对照不串期）。
+    """
     leads = ", ".join(
         f"LEAD(adj, {h}) OVER (PARTITION BY thscode ORDER BY date) / adj - 1.0 AS r{h}"
         for h in horizons
@@ -689,11 +715,20 @@ def _baseline_fwd(db_path, horizons, val_expr) -> dict:
         f"100.0*AVG(r{h}) AS mean{h}, 100.0*MEDIAN(r{h}) AS med{h}"
         for h in horizons
     )
+    where, params = [], []
+    if start:
+        where.append("k.date >= ?")
+        params.append(start)
+    if end:
+        where.append("k.date <= ?")
+        params.append(end)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     sql = f"""
 WITH px AS (
   SELECT k.thscode, k.date, {val_expr} AS adj
   FROM raw_kline_daily k
   LEFT JOIN calc_adjust_factor_daily a ON a.thscode = k.thscode AND a.date = k.date
+  {where_sql}
 ),
 fwd AS (
   SELECT {leads} FROM px
@@ -706,7 +741,7 @@ SELECT {sel} FROM fwd
         return {}
     con = duckdb.connect(str(db_path), read_only=True)
     try:
-        df = con.execute(sql).fetchdf()
+        df = con.execute(sql, params).fetchdf()
     finally:
         con.close()
     out = {}
@@ -737,17 +772,20 @@ def cmd_streaks_backtest(args) -> int:
     elif args.kind == "new-high":
         label = f"{label}({args.window}日)"
 
-    base = _baseline_fwd(db, horizons, val_expr)
+    base = _baseline_fwd(db, horizons, val_expr, start=args.start, end=args.end)
 
     print(f"== streaks 回测：{label}（kind={args.kind}，{args.adjust}复权）==")
     print(f"   未来 {list(horizons)} 交易日；每格 = 胜率% / 均收益% / 中位收益%")
+    if getattr(args, "start", None) or getattr(args, "end", None):
+        print(f"   样本按 streak 结束日过滤：{args.start or '...'} ~ {args.end or '...'}")
     print()
 
     print(f"  {'min':>3} {'N':>7} | " + " | ".join(f"fut{h} 胜/均/中" for h in horizons))
     print("  " + "-" * (18 + 22 * len(horizons)))
     for mn in mins:
         df = backtest_streaks(args.kind, min_days=mn, horizons=horizons, db=db,
-                              adjust=args.adjust, ma=args.ma, window=args.window)
+                              adjust=args.adjust, ma=args.ma, window=args.window,
+                              start=args.start, end=args.end)
         if df is None or df.empty:
             print(f"  {mn:>3} {0:>7} | " + " | ".join("-- / -- / --" for _ in horizons))
             continue
@@ -773,27 +811,42 @@ def cmd_streaks_backtest(args) -> int:
     print("  ⚠️ 事件研究非逐日择时：不含交易成本、用当前在库证券（幸存者偏差）；样本在时间上")
     print("     高度相关、且不同 --min 互相嵌套（N 不能直接读显著性），仅供粗判信号方向。")
 
-    if getattr(args, "by_board", False):
-        bdf = backtest_streaks(args.kind, min_days=mins[0], horizons=horizons, db=db,
-                               adjust=args.adjust, ma=args.ma, window=args.window)
-        if bdf is not None and not bdf.empty:
-            bdf["board"] = bdf["thscode"].map(_board_of)
-            print()
-            print(f"  ── 分板块（min_days={mins[0]}，{label}）──")
-            print(f"  {'板块':<6} {'N':>7} | " + " | ".join(f"fut{h} 胜/均/中" for h in horizons))
-            print("  " + "-" * (18 + 22 * len(horizons)))
-            for board in ("主板", "创业板", "科创板", "北交所"):
-                sub = bdf[bdf["board"] == board]
-                if sub.empty:
-                    continue
-                cells = []
-                for h in horizons:
-                    s = sub[f"ret{h}"].dropna()
-                    if s.empty:
-                        cells.append("-- / -- / --")
-                    else:
-                        cells.append(f"{(s > 0).mean()*100.0:.1f} / {s.mean()*100.0:+.2f} / {s.median()*100.0:+.2f}")
-                print(f"  {board:<6} {len(sub):>7} | " + " | ".join(cells))
+    def _cells(sub):
+        out = []
+        for h in horizons:
+            s = sub[f"ret{h}"].dropna()
+            if s.empty:
+                out.append("-- / -- / --")
+            else:
+                out.append(f"{(s > 0).mean()*100.0:.1f} / {s.mean()*100.0:+.2f} / {s.median()*100.0:+.2f}")
+        return out
+
+    if getattr(args, "by_board", False) or getattr(args, "by_year", False):
+        sdf = backtest_streaks(args.kind, min_days=mins[0], horizons=horizons, db=db,
+                               adjust=args.adjust, ma=args.ma, window=args.window,
+                               start=args.start, end=args.end)
+        if sdf is not None and not sdf.empty:
+            head = " | ".join(f"fut{h} 胜/均/中" for h in horizons)
+            if getattr(args, "by_board", False):
+                sdf["board"] = sdf["thscode"].map(_board_of)
+                print()
+                print(f"  ── 分板块（min_days={mins[0]}，{label}）──")
+                print(f"  {'板块':<6} {'N':>7} | " + head)
+                print("  " + "-" * (18 + 22 * len(horizons)))
+                for board in ("主板", "创业板", "科创板", "北交所"):
+                    sub = sdf[sdf["board"] == board]
+                    if sub.empty:
+                        continue
+                    print(f"  {board:<6} {len(sub):>7} | " + " | ".join(_cells(sub)))
+            if getattr(args, "by_year", False):
+                sdf["year"] = sdf["end_date"].map(lambda d: str(d)[:4])
+                print()
+                print(f"  ── 分年（min_days={mins[0]}，{label}，按 streak 结束年）──")
+                print(f"  {'年份':<6} {'N':>7} | " + head)
+                print("  " + "-" * (18 + 22 * len(horizons)))
+                for yr in sorted(sdf["year"].unique()):
+                    sub = sdf[sdf["year"] == yr]
+                    print(f"  {yr:<6} {len(sub):>7} | " + " | ".join(_cells(sub)))
     return 0
 
 
@@ -917,7 +970,10 @@ def main() -> int:
                     help="涨跌判定用价（默认 forward 前复权）")
     sb.add_argument("--ma", type=int, default=20, help="above-ma 均线周期（默认 20）")
     sb.add_argument("--window", type=int, default=20, help="new-high 新高窗口（默认 20 日）")
+    sb.add_argument("--start", help="仅回测「结束日 ≥ 此日期」的 streak（YYYY-MM-DD，分段看 regime）")
+    sb.add_argument("--end", help="仅回测「结束日 ≤ 此日期」的 streak（YYYY-MM-DD）")
     sb.add_argument("--by-board", action="store_true", help="追加按板块（主板/创业板/科创板/北交所）分组收益")
+    sb.add_argument("--by-year", action="store_true", help="追加按 streak 结束年分组的收益（看信号逐年有效性）")
     sb.add_argument("--db")
 
     args = p.parse_args()
