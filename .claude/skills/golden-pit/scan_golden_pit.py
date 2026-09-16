@@ -17,7 +17,7 @@ analyze_golden_pit.py 细看。
     --full    跳过本地库 streaks 初筛，全池逐股拉新浪 K 线（更慢但召回最全）
 
 数据源: akshare 指数成分股（index_stock_cons，需 pip install akshare）
-+ 新浪日 K 线（fetch_historical_kline）。妙想（MX_APIKEY）可选，用于 top 候选基本面快查。
++ 本地 duckdb 日 K 线（前复权，缺该标的才回退新浪）。妙想（MX_APIKEY）可选，用于 top 候选基本面快查。
 """
 import logging
 import os
@@ -45,12 +45,12 @@ logging.disable(logging.WARNING)
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_turnover_map
 from app.technical import (
-    fetch_historical_kline,
     calc_sma,
     calc_rsi,
     calc_macd,
     calc_kdj,
 )
+from app.kline_local import fetch_daily_local_first
 
 
 # 候选池指数（代码 -> 白马成色分）：上证50(超大盘) > 沪深300(大盘蓝筹) > 中证红利(高股息白马)
@@ -475,7 +475,7 @@ def main():
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
-            klines = fetch_historical_kline(code, market, days=250, scale=240)
+            klines = fetch_daily_local_first(code, market, days=250)
             if not klines or len(klines) < 60:
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))

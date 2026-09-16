@@ -110,3 +110,18 @@ def fetch_daily_hybrid(code: str, market: str, days: int = 60) -> list[KlineData
     except Exception:
         pass
     return local
+
+
+def fetch_daily_local_first(code: str, market: str, days: int = 60) -> list[KlineData]:
+    """批量扫描日K：纯本地读（前复权），本地无该标的才远端兜底；不补当日缺口。
+
+    与 ``fetch_daily_hybrid`` 的区别：不做「今日 - 本地最新日」的缺口远端补拉，
+    避免批量扫描（几十~几百只）时对远端连续发起 datalen 小请求、再次触发新浪限流。
+    筛选/打分的「深度回撤/箱体/均线/量能」只需历史日K到最近一次同步即可，
+    当日实时变化由行情快照（东财 turnover_map）另行提供。
+    """
+    local = fetch_daily(code, market, days)
+    if local:
+        return local
+    from .technical import fetch_historical_kline
+    return fetch_historical_kline(code, market, days=days, scale=240)

@@ -16,7 +16,8 @@
 数据源（按优先级）:
     - 实时快照: 新浪财经（价格/高低开收/均价VWAP/成交额）+ 腾讯（量比/换手率/内外盘/委比）
     - 当日资金流: 东方财富分钟级 fflow（主力/超大/大/中/小 5 档）
-    - 日 K 线 / 5 分钟 K 线: 新浪（AKShare 兜底）
+    - 日 K 线: 本地 duckdb（marketdb，前复权，混合补当日）优先，新浪/AKShare 兜底
+    - 5 分钟 K 线: 新浪（AKShare 兜底）
     - 近 5 日资金流趋势: 妙想 Miaoxiang（可选，需 MX_APIKEY；无 key 时跳过）
 
 输出: 分 5 段——实时快照 / 当日资金流 / 近N日K线+趋势 / 近5日资金流趋势 / 做T测算。
@@ -143,7 +144,18 @@ def _fetch_realtime(code: str, name: str) -> Quote | None:
 
 
 def _fetch_daily_klines(code: str, market: str, days: int) -> list[KlineData]:
-    """近 N 日日 K 线（按日期升序）。"""
+    """近 N 日日 K 线（按日期升序）：本地 duckdb 优先（前复权 + 混合补当日），不可用远端兜底。
+
+    本地 marketdb 有全市场 10 年日K，盘中缺当日 bar 由远端补；库不存在/未装 marketdb/
+    查询失败时自动回退新浪（避免 456 限流时无数据可用）。
+    """
+    try:
+        from app import kline_local
+        out = kline_local.fetch_daily_hybrid(code, market, days=days)
+        if out:
+            return out
+    except Exception:
+        pass
     return fetch_historical_kline(code, market, days=days, scale=240)
 
 

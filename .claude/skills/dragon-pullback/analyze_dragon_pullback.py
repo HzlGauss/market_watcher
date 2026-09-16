@@ -54,11 +54,11 @@ from app.models import WatchItem, Quote, FundFlowDetail, KlineData
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_quotes, fetch_fund_flow_detail
 from app.technical import (
-    fetch_historical_kline,
     calc_sma,
     calc_support_resistance,
     get_technical_summary,
 )
+from app.kline_local import fetch_daily_hybrid
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -571,7 +571,7 @@ def main():
         return 1
 
     # ---- 日 K 线（核心数据源）----
-    klines = fetch_historical_kline(code, market, days=days, scale=240)
+    klines = fetch_daily_hybrid(code, market, days=days)
     if not klines:
         print(f"❌ 未查到 {code} 日 K 线数据")
         return 1

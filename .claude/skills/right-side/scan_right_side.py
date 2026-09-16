@@ -17,7 +17,7 @@
     输出数量    输出候选数量上限（可选，默认 20）
 
 数据源: 成分股池（app.board_pool：指数成分 akshare + 东财 clist 板块/行业，核心不依赖
-MX_APIKEY）+ 新浪日 K 线（fetch_historical_kline）。妙想（MX_APIKEY）可选，用于 top
+MX_APIKEY）+ 本地 duckdb 日 K 线（前复权，缺该标的才回退新浪）。妙想（MX_APIKEY）可选，用于 top
 候选主力资金快查。
 """
 import logging
@@ -47,10 +47,10 @@ from app.board_pool import resolve_board_pool
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_turnover_map
 from app.technical import (
-    fetch_historical_kline,
     calc_sma,
     calc_macd,
 )
+from app.kline_local import fetch_daily_local_first
 
 
 def _f(x, nd=2) -> str:
@@ -376,7 +376,7 @@ def main():
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
-            klines = fetch_historical_kline(code, market, days=120, scale=240)
+            klines = fetch_daily_local_first(code, market, days=120)
             if not klines or len(klines) < 60:
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))

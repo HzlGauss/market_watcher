@@ -16,7 +16,7 @@
     --sync    先增量同步本地 marketdb 到最新（可能触发下载，遇 429 限流会失败）
     --full    跳过本地库 streaks 初筛，全池逐股拉新浪 K 线（更慢但召回最全）
 
-数据源: 成分股池（app.board_pool）+ 新浪日 K 线（fetch_historical_kline）。
+数据源: 成分股池（app.board_pool）+ 本地 duckdb 日 K 线（前复权，缺该标的才回退新浪）。
 核心不依赖 MX_APIKEY，纯技术维度，不做基本面门槛。
 """
 import logging
@@ -50,10 +50,10 @@ logging.disable(logging.WARNING)
 from app.board_pool import resolve_board_pool
 from app.helpers import _detect_market
 from app.technical import (
-    fetch_historical_kline,
     detect_box_regime,
     calc_support_resistance,
 )
+from app.kline_local import fetch_daily_local_first
 
 
 # ---------------------------------------------------------------- 阈值（适中档）
@@ -249,7 +249,7 @@ def main():
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
-            klines = fetch_historical_kline(code, market, days=250, scale=240)
+            klines = fetch_daily_local_first(code, market, days=250)
             if not klines or len(klines) < 60:
                 continue
             r = _score_support_box(code, stock, klines)

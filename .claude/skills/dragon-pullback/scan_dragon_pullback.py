@@ -16,7 +16,7 @@ analyze_dragon_pullback.py 细看。
     输出数量   输出的候选数量上限（可选，默认 20）
 
 数据源: 涨停股池（同花顺官方金融数据，无 key 回退 akshare stock_zt_pool_em）+ 日 K 线
-（fetch_historical_kline，新浪→同花顺→akshare）。核心不依赖 MX_APIKEY。
+（本地 duckdb 前复权，缺该标的才回退新浪→同花顺→akshare）。核心不依赖 MX_APIKEY。
 """
 import logging
 import os
@@ -53,7 +53,8 @@ logging.disable(logging.WARNING)
 from app.helpers import _detect_market
 from app.models import KlineData
 from app.data_fetcher import fetch_turnover_map
-from app.technical import fetch_historical_kline, calc_sma
+from app.technical import calc_sma
+from app.kline_local import fetch_daily_local_first
 
 
 def _f(x, nd=2) -> str:
@@ -401,7 +402,7 @@ def main():
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
-            klines = fetch_historical_kline(code, market, days=60, scale=240)
+            klines = fetch_daily_local_first(code, market, days=60)
             if not klines or len(klines) < 20:
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))

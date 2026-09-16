@@ -53,13 +53,13 @@ from app.models import WatchItem
 from app.helpers import _detect_market
 from app.data_fetcher import fetch_quotes
 from app.technical import (
-    fetch_historical_kline,
     calc_sma,
     calc_rsi,
     calc_macd,
     calc_kdj,
     calc_support_resistance,
 )
+from app.kline_local import fetch_daily_hybrid
 
 INDICES = [("000016", "上证50"), ("000300", "沪深300"), ("000922", "中证红利")]
 
@@ -537,7 +537,7 @@ def main():
         price = None
 
     # ---- 日 K 线（核心数据源）----
-    klines = fetch_historical_kline(code, market, days=days, scale=240)
+    klines = fetch_daily_hybrid(code, market, days=days)
     if not klines or len(klines) < 60:
         print(f"❌ 未查到 {code} 足够日 K 线数据（需 ≥60 根）")
         return 1
