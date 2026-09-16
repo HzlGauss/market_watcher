@@ -173,6 +173,104 @@ def _fetch_hithink(kind: str, date: str):
     return None
 
 
+# ---------------------------------------------------------------- 本地库兜底
+
+def _board_limit_pct(code: str, name: str) -> float:
+    """涨跌停幅度（%）：ST 5 / 主板 10 / 创业科创 20 / 北交所 30。"""
+    if "ST" in (name or "").upper():
+        return 5.0
+    c = (code or "").zfill(6)
+    if c.startswith(("68", "30")):
+        return 20.0
+    if c.startswith(("8", "4", "92")):
+        return 30.0
+    return 10.0
+
+
+def _detect_limit_ups_local(date: str):
+    """本地库兜底：用未复权涨幅 + 涨跌停制度重建涨停池（含连板数）。
+
+    供同花顺/东财涨停池均失败时使用。封板资金/所属行业本地无数据（置 None/空），
+    炸板池/跌停池无法重建。返回 pandas DataFrame（东财兼容列名），失败返回 None。
+    """
+    try:
+        from tools.marketdb_local import db_max_date, market_db_path
+    except Exception:
+        return None
+    maxd = db_max_date()
+    if not maxd:
+        return None
+    # 目标日 = min(请求日, 本地最大日)；本地库落后于请求日时按库内最新
+    target = maxd  # YYYY-MM-DD
+    if date:
+        req = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+        if req < maxd:
+            target = req
+    db_file = market_db_path()
+    if not db_file.exists():
+        return None
+    start = (datetime.date.fromisoformat(target) - datetime.timedelta(days=60)).isoformat()
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_file), read_only=True)
+    except Exception:
+        return None
+    try:
+        rows = con.execute("""
+            SELECT k.thscode, s.name, k.date, k.close
+            FROM raw_kline_daily k
+            LEFT JOIN dim_symbol s ON s.thscode = k.thscode
+            WHERE k.date >= ? AND k.date <= ?
+            ORDER BY k.thscode, k.date
+        """, [start, target]).fetchall()
+    except Exception:
+        con.close()
+        return None
+    con.close()
+
+    from collections import defaultdict
+    by_code = defaultdict(list)
+    names = {}
+    for thscode, name, d, close in rows:
+        by_code[thscode].append((d, close))
+        names[thscode] = name or ""
+
+    target_d = datetime.date.fromisoformat(target)
+    records = []
+    for thscode, seq in by_code.items():
+        code6 = str(thscode).split(".")[0].zfill(6)
+        name = names.get(thscode, "")
+        limit = _board_limit_pct(code6, name)
+        sub = [(d, c) for (d, c) in seq if d <= target_d]
+        if not sub:
+            continue
+        last_date, last_close = sub[-1]
+        if last_date != target_d or last_close is None or last_close <= 0:
+            continue
+        # 从目标日向前数连续涨停（一字板 open=high=low=close 同样命中，仅用 close 判定）
+        consec = 0
+        for i in range(len(sub) - 1, 0, -1):
+            c = sub[i][1]
+            prev_close = sub[i - 1][1]
+            if prev_close is None or prev_close <= 0 or c is None:
+                break
+            limit_price = round(prev_close * (1.0 + limit / 100.0), 2)
+            if c >= limit_price - 0.001:
+                consec += 1
+            else:
+                break
+        if consec >= 1:
+            records.append({
+                "代码": code6,
+                "名称": name,
+                "连板数": consec,
+                "涨停统计": f"{consec}/{consec}",
+                "封板资金": None,
+                "所属行业": "",
+            })
+    return _df_from_records(records, ["代码", "名称", "连板数", "涨停统计", "封板资金", "所属行业"])
+
+
 # ---------------------------------------------------------------- 聚合
 
 def _tier_stats(zt_df):
@@ -267,11 +365,14 @@ def _print_tiers(tiers, high):
                   f"{h['stat']:>8}{_fmt_yi(h['seal']):>10}{_short(h['industry'], 11):<12}")
 
 
-def _print_break_rate(zt_n, zb_n):
+def _print_break_rate(zt_n, zb_n, zb_known=True):
     print()
     print("=" * 72)
     print("【2. 炸板率】")
     print("=" * 72)
+    if not zb_known:
+        print("  ⚠️ 炸板池数据缺失（本地兜底/接口不可达），炸板率不可算")
+        return
     denom = zt_n + zb_n
     if denom == 0:
         print("  ⚠️ 无涨跌停数据")
@@ -420,15 +521,29 @@ def main():
             import akshare as ak
         except ImportError:
             ak = None
-        if ak is None:
-            print("❌ 同花顺与 akshare 均不可用（pip install akshare 或配置 HITHINK_FINANCE_API_KEY）")
-            return 1
-        if zt_df is None:
-            zt_df = _fetch_pool(ak.stock_zt_pool_em, date, "涨停池")
-        if zb_df is None:
-            zb_df = _fetch_pool(ak.stock_zt_pool_zbgc_em, date, "炸板池")
-        if dt_df is None:
-            dt_df = _fetch_pool(ak.stock_zt_pool_dtgc_em, date, "跌停池")
+        if ak is not None:
+            if zt_df is None:
+                zt_df = _fetch_pool(ak.stock_zt_pool_em, date, "涨停池")
+            if zb_df is None:
+                zb_df = _fetch_pool(ak.stock_zt_pool_zbgc_em, date, "炸板池")
+            if dt_df is None:
+                dt_df = _fetch_pool(ak.stock_zt_pool_dtgc_em, date, "跌停池")
+
+    # 本地库兜底：涨停池仍缺失时，用未复权涨幅 + 涨跌停制度重建（炸板/跌停不可重建）
+    if zt_df is None:
+        zt_df = _detect_limit_ups_local(date)
+        if zt_df is not None and not getattr(zt_df, "empty", True):
+            try:
+                from tools.marketdb_local import db_max_date
+                _md = db_max_date() or "?"
+            except Exception:
+                _md = "?"
+            print(f"\n  ⚠️ 涨停池为本地库兜底重建（未复权涨幅 + 涨跌停制度；封单/题材/炸板/跌停不可得，数据截至 {_md}）")
+            print("     可先 py tools/marketdb_local.py sync 或恢复 API 后重跑。")
+
+    if zt_df is None and zb_df is None and dt_df is None:
+        print("❌ 同花顺、东财 akshare 与本地库均不可用（配置 HITHINK_FINANCE_API_KEY 或 pip install akshare，或先落库 marketdb）")
+        return 1
 
     zt_n = len(zt_df) if zt_df is not None else 0
     zb_n = len(zb_df) if zb_df is not None else 0
@@ -442,7 +557,7 @@ def main():
     _print_ladder()
 
     # 2. 炸板率
-    _print_break_rate(zt_n, zb_n)
+    _print_break_rate(zt_n, zb_n, zb_known=(zb_df is not None))
 
     # 3. 封单额 TOP
     _print_seal_top(_seal_top(zt_df))

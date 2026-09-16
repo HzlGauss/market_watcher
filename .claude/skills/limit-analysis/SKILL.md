@@ -52,6 +52,7 @@ py .claude/skills/limit-analysis/scan_limit.py 20260911   # 指定交易日
 ## 注意事项
 
 - **数据源**：涨停池/炸板池/跌停池（同花顺官方金融数据，需 `.env` 配置 `HITHINK_FINANCE_API_KEY`；无 key 回退东财 `stock_zt_pool_em` 等，需 `pip install akshare`）；连板梯队矩阵（同花顺 `limit-up-ladder`，需 key，无 key 时跳过【1b】）。**不依赖 `MX_APIKEY`**。
+- **本地库兜底**：涨停池在同花顺 + 东财均失败时，改用本地 marketdb 重建（未复权涨幅 + 涨跌停制度：主板 10% / 创业科创 20% / 北交所 30% / ST 5%），能给出「连板数」，但无封单额/题材，且炸板/跌停不可重建；数据截至本地库最大日期（可 `py tools/marketdb_local.py sync` 更新）。
 - **精确口径**：涨跌停由同花顺/东财精确判定（主板 10%、创业板/科创板 20%、ST 5%），彻底替代 `market-heat` 的 9.9% 近似。
 - **数据保留期**：同花顺源无保留期限制；akshare 涨停池只保留约 2 周，本 skill 只查当日/最近交易日，不受影响。
 - **非交易时段**：显示最近交易日的收盘涨停数据（节假日顺延）。

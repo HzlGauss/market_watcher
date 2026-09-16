@@ -33,6 +33,7 @@ dragon-tiger-list 等特色数据实时端点 —— 涨跌停/龙虎榜/日历�
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
@@ -67,6 +68,11 @@ def _finance_py() -> Path:
 def _db_path(explicit: str | None = None) -> Path:
     p = explicit or os.environ.get("MARKETDB_DB_PATH")
     return Path(p).expanduser() if p else _DEFAULT_DB
+
+
+def market_db_path(db=None) -> Path:
+    """本地库 DuckDB 文件路径（对外公开，供 skill 直接 duckdb.connect 读 raw 表）。"""
+    return _db_path(db)
 
 
 def _load_key() -> None:
@@ -278,17 +284,7 @@ def cmd_sync_symbols(args) -> int:
 
 def cmd_sync(args) -> int:
     """增量同步：只跑 auto-sync（自动判断 skip/incremental/full），不装依赖、不重建库。"""
-    _load_key()
-    db = _db_path(args.db)
-    if not db.exists():
-        print(_bootstrap_guide())
-        return 1
-    try:
-        import marketdb  # noqa: F401
-    except ImportError:
-        print("❌ marketdb 未安装（先运行 bootstrap）")
-        return 1
-    return _cli("auto-sync", db=db).returncode
+    return sync_db(args.db)
 
 
 # ---------------------------------------------------------------- streaks
@@ -298,49 +294,100 @@ _STREAK_LABEL = {
     "down": "连续下跌",
     "vol-up": "连续放量",
     "vol-down": "连续缩量",
+    "vol-price-up": "量价齐升",
+    "vol-price-down": "量价齐缩",
+    "above-ma": "连续站稳均线",
+    "new-high": "连续创新高",
 }
 
-# kind -> 断点条件（True=断点，即中断当前连续段）
+# kind -> 断点条件（True=断点，即中断当前连续段）。above-ma/new-high 的断点引用 px 里的
+# 窗口列（ma / prev_max），由 query_streaks 按 --ma / --window 动态生成，不在此表里。
 _STREAK_BREAK = {
     "up": "prev IS NULL OR adj <= prev",
     "down": "prev IS NULL OR adj >= prev",
     "vol-up": "prev_vol IS NULL OR vol <= prev_vol",
     "vol-down": "prev_vol IS NULL OR vol >= prev_vol",
+    "vol-price-up": "prev IS NULL OR NOT (adj > prev AND vol > prev_vol)",
+    "vol-price-down": "prev IS NULL OR NOT (adj < prev AND vol < prev_vol)",
 }
 
 
-def cmd_streaks(args) -> int:
-    """全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法：断点标记→累计求和→分组聚合）。
+def _streak_spec(kind: str, val_expr: str, ma: int = 20, window: int = 20) -> tuple[str, str, str]:
+    """返回 (px_extra, px_col, brk) —— px 里需额外计算的窗口列、列名、断点条件。
 
-    借鉴 DuckDB 窗口函数「连续区间」技巧：LAG() 取前一行 → CASE 标记断点 →
-    SUM() OVER() 生成组号 → GROUP BY 组号聚合出每段起止日期与持续天数。
-    涨跌判定默认用前复权价（close*forward_factor），除权除息日不会误判断点。
+    above-ma/new-high 需要窗口列（AVG/MAX），其余 kind 直接查 _STREAK_BREAK。
+    px_extra 里的窗口函数引用 px 源表列 k.thscode/k.date 与 val_expr。
     """
-    db = _db_path(args.db)
-    if not db.exists():
-        print(_bootstrap_guide())
-        return 1
+    if kind == "above-ma":
+        ma_n = int(ma)
+        px_extra = (f"AVG({val_expr}) OVER (PARTITION BY k.thscode ORDER BY k.date "
+                    f"ROWS BETWEEN {ma_n - 1} PRECEDING AND CURRENT ROW) AS ma")
+        return px_extra, "ma", "ma IS NULL OR adj < ma"
+    if kind == "new-high":
+        win_n = int(window)
+        px_extra = (f"MAX({val_expr}) OVER (PARTITION BY k.thscode ORDER BY k.date "
+                    f"ROWS BETWEEN {win_n} PRECEDING AND 1 PRECEDING) AS prev_max")
+        return px_extra, "prev_max", "prev_max IS NULL OR adj <= prev_max"
+    return "", "", _STREAK_BREAK[kind]
+
+
+def _board_of(code) -> str:
+    """6 位代码 → 板块（主板/创业板/科创板/北交所），供回测分组用。"""
+    c = str(code).zfill(6)
+    if c.startswith("68"):
+        return "科创板"
+    if c.startswith("30"):
+        return "创业板"
+    if c.startswith(("4", "8", "92")):
+        return "北交所"
+    return "主板"
+
+
+def query_streaks(kind: str, min_days: int = 3, start: str | None = None,
+                  end: str | None = None, codes: list[str] | None = None,
+                  limit: int = 20, db=None, adjust: str = "forward",
+                  ma: int = 20, window: int = 20):
+    """全市场/指定代码池「连续区间」扫描，返回 pandas DataFrame。
+
+    窗口函数三步法（断点标记→累计求和→分组聚合）：LAG() 取前一行（above-ma/new-high 取窗口
+    列）→ CASE 标记断点 → SUM() OVER() 生成组号 → GROUP BY 组号聚合出每段起止日期与持续天数。
+
+    返回列: thscode / name / start_date / end_date / streak_days / start_val / end_val
+    （量/涨跌/均线/新高类 start_val/end_val 为前复权价，可另算 total_pct）。无库/无 duckdb
+    返回 None，无匹配返回空 DataFrame。
+
+    语义（已定死，供 skill 批量初筛引用）:
+      - 涨跌/站稳/新高判定用前复权价 close*forward_factor（除权除息日不误判断点）；adjust='none' 用未复权收盘。
+      - 「连续」指连续有交易行：停牌日无行、既不累计也不中断（按有行日连算）。
+      - 每段区间 = 该证券一条连续满足条件的交易日序列；同一证券可有多段（断点分界）。
+      - vol-price-up/down = 量价齐升/齐缩（当日价与量同向，二者需同时成立）。
+      - above-ma：adj >= MA{ma} 即「站稳」，跌破即断点；MA 为窗口 AVG（ROWS N-1 PRECEDING）。
+      - new-high：adj > 前 {window} 日最高价即「创新高」，否则断点（窗口 MAX，排除当日）。
+      - above-ma/new-high 首 N-1 行窗口不完整用部分值（对「最近仍在状态」的近端初筛无影响）。
+    """
+    db_path = _db_path(db)
+    if not db_path.exists():
+        return None
     try:
         import duckdb
     except ImportError:
-        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
-        return 1
+        return None
 
-    price_based = args.kind in ("up", "down")
-    val_expr = "k.close" if args.adjust == "none" else "k.close * COALESCE(a.forward_factor, 1.0)"
-    brk = _STREAK_BREAK[args.kind]
+    price_based = kind not in ("vol-up", "vol-down")
+    val_expr = "k.close" if adjust == "none" else "k.close * COALESCE(a.forward_factor, 1.0)"
+    px_extra, px_col, brk = _streak_spec(kind, val_expr, ma, window)
 
     where, params = [], []
-    if args.codes:
-        codes = [_norm_thscode(c) for c in args.codes.split(",")]
-        where.append("k.thscode IN (%s)" % ",".join("?" for _ in codes))
-        params.extend(codes)
-    if args.start:
+    if codes:
+        norms = [_norm_thscode(c) for c in codes]
+        where.append("k.thscode IN (%s)" % ",".join("?" for _ in norms))
+        params.extend(norms)
+    if start:
         where.append("k.date >= ?")
-        params.append(args.start)
-    if args.end:
+        params.append(start)
+    if end:
         where.append("k.date <= ?")
-        params.append(args.end)
+        params.append(end)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     agg = (
@@ -349,15 +396,16 @@ def cmd_streaks(args) -> int:
         else "arg_min(vol, date) AS start_val, arg_max(vol, date) AS end_val"
     )
 
+    lagged_extra = f", {px_col}" if px_col else ""
     sql = f"""
 WITH px AS (
-  SELECT k.thscode, k.date, {val_expr} AS adj, k.volume AS vol
+  SELECT k.thscode, k.date, {val_expr} AS adj, k.volume AS vol{"," + px_extra if px_extra else ""}
   FROM raw_kline_daily k
   LEFT JOIN calc_adjust_factor_daily a ON a.thscode = k.thscode AND a.date = k.date
   {where_sql}
 ),
 lagged AS (
-  SELECT thscode, date, adj, vol,
+  SELECT thscode, date, adj, vol{lagged_extra},
          LAG(adj) OVER (PARTITION BY thscode ORDER BY date) AS prev,
          LAG(vol) OVER (PARTITION BY thscode ORDER BY date) AS prev_vol
   FROM px
@@ -378,21 +426,403 @@ FROM grouped g
 LEFT JOIN dim_symbol s ON s.thscode = g.thscode
 WHERE g.brk = 0
 GROUP BY g.thscode, s.name, g.gid
-HAVING COUNT(*) >= {int(args.min)}
+HAVING COUNT(*) >= {int(min_days)}
 ORDER BY streak_days DESC, g.thscode, start_date
-LIMIT {int(args.limit)}
+LIMIT {int(limit)}
 """
-    con = duckdb.connect(str(db), read_only=True)
+    con = duckdb.connect(str(db_path), read_only=True)
     try:
         df = con.execute(sql, params).fetchdf()
     finally:
         con.close()
+    return df
 
-    if df.empty:
+
+def db_max_date(db=None) -> str | None:
+    """本地库 raw_kline_daily 最大日期（YYYY-MM-DD），无库/无行/无 duckdb 返回 None。"""
+    db_path = _db_path(db)
+    if not db_path.exists():
+        return None
+    try:
+        import duckdb
+    except ImportError:
+        return None
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            row = con.execute("SELECT MAX(date) FROM raw_kline_daily").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    d = row[0]
+    return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+
+
+def _latest_trade_day_str() -> str:
+    """最近交易日 YYYY-MM-DD（app.hithink.fetch_trade_days 优先，退回今天/上一工作日）。"""
+    try:
+        from app import hithink
+        days = hithink.fetch_trade_days()
+        if days:
+            today = datetime.date.today().strftime("%Y%m%d")
+            past = [d for d in days if d <= today]
+            d = (past or days)[-1]
+            return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    except Exception:
+        pass
+    today = datetime.date.today()
+    while today.weekday() >= 5:
+        today -= datetime.timedelta(days=1)
+    return today.strftime("%Y-%m-%d")
+
+
+def db_freshness(db=None) -> dict:
+    """本地库新鲜度: {max_date, latest_trade_date, behind_days, stale}。
+
+    max_date=None 表示本地库不存在/为空。behind_days 为自然日差（含周末/节假日），
+    仅作「是否落后于最近交易日」的粗判；盘中当日数据本来就不会在库（收盘后才同步）。
+    """
+    maxd = db_max_date(db)
+    latest = _latest_trade_day_str()
+    r = {"max_date": maxd, "latest_trade_date": latest, "behind_days": 0, "stale": False}
+    if maxd is None:
+        return r
+    md = datetime.date.fromisoformat(maxd)
+    lt = datetime.date.fromisoformat(latest)
+    behind = (lt - md).days
+    r["behind_days"] = max(0, behind)
+    r["stale"] = behind > 0
+    return r
+
+
+def db_freshness_note(db=None) -> str:
+    """新鲜度提示文案（skill 初筛时打印）。无库返回空串（不打扰）。"""
+    f = db_freshness(db)
+    if f["max_date"] is None:
+        return ""
+    if f["stale"]:
+        return (f"  ⚠️ 本地库最新 {f['max_date']}，落后最近交易日 {f['latest_trade_date']}"
+                f" 约 {f['behind_days']} 天；streaks 初筛按此快照，今日/盘中新信号以新浪实时复核为准"
+                f"（可先 py tools/marketdb_local.py sync 同步）。")
+    return f"  ℹ️ 本地库已最新（{f['max_date']}）。"
+
+
+def prescreen_codes(codes, kinds, min_days: int = 2, lookback_days: int = 3,
+                    db=None, limit: int = 10000) -> set[str] | None:
+    """对给定代码池做 streaks 初筛，返回处于指定连续区间状态的 6 位代码集合。
+
+    语义: 只保留「streak 结束日距本地库最新日期 ≤ lookback_days 天」的区间（即最近仍在
+    该状态，而非很久以前）；多 kinds 取并集。返回 6 位代码（与 board_pool 键一致，去交易所
+    后缀）。无库/无 duckdb/查询失败返回 None（调用方应回退全池）。
+    """
+    db_path = _db_path(db)
+    if not db_path.exists():
+        return None
+    maxd = db_max_date(db_path)
+    if maxd is None:
+        return None
+    cutoff = datetime.date.fromisoformat(maxd) - datetime.timedelta(days=lookback_days)
+
+    result: set[str] = set()
+    got_any = False
+    for kind in kinds:
+        df = query_streaks(kind, min_days=min_days, codes=list(codes), limit=limit, db=db_path)
+        if df is None:
+            continue
+        got_any = True
+        if df.empty:
+            continue
+        for _, row in df.iterrows():
+            ed = row["end_date"]
+            if hasattr(ed, "date"):
+                ed = ed.date()
+            if ed >= cutoff:
+                result.add(str(row["thscode"]).split(".")[0])
+    return result if got_any else None
+
+
+def sync_db(db=None) -> int:
+    """增量同步（auto-sync，自动判断 skip/incremental/full）。不装依赖、不重建库。"""
+    _load_key()
+    db_path = _db_path(db)
+    if not db_path.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import marketdb  # noqa: F401
+    except ImportError:
+        print("❌ marketdb 未安装（先运行 bootstrap）")
+        return 1
+    return _cli("auto-sync", db=db_path).returncode
+
+
+def sync_db_echo(db=None) -> None:
+    """增量同步并打印结果（skill --sync 复用）。失败不抛出，只提示后继续按现有库跑。"""
+    try:
+        print("==> 增量同步本地 marketdb（auto-sync）...")
+        rc = sync_db(db)
+        print("    " + ("✅ 同步完成" if rc == 0 else f"⚠️ 同步退出码 {rc}，继续按现有库跑"))
+    except Exception as e:
+        print(f"    ⚠️ 同步失败: {e}")
+
+
+def prescreen_pool(pool, kinds, min_pool: int = 40, label: str = "", db=None) -> tuple:
+    """对 board_pool 形态的 {6位代码: 股票dict} 做 streaks 初筛，返回 (缩减后池, 提示文案)。
+
+    仅池 ≥min_pool 时启用；无本地库/查询失败/初筛后过少均回退全池（宁多勿漏）。初筛是
+    recall 优化、非 precision 过滤：只缩小「逐股拉新浪K线」的范围，最终打分仍逐股用新浪
+    实时复核，故本地库过期（如盘中当日数据不在库）只影响初筛范围、不改变单股结论。
+    label 用于提示文案（如「连续下跌/缩量」），缺省用 kinds 拼。
+    """
+    if len(pool) < min_pool:
+        return pool, ""
+    try:
+        note = db_freshness_note(db)
+    except Exception:
+        return pool, ""
+    try:
+        cands = prescreen_codes(list(pool.keys()), kinds, min_days=2, db=db)
+    except Exception:
+        return pool, note
+    if not cands:
+        return pool, note + "\n  ℹ️ 本地库 streaks 初筛无候选，回退全池逐股检测。"
+    reduced = {c: s for c, s in pool.items() if c in cands}
+    if len(reduced) < 3:
+        return pool, note + "\n  ℹ️ 初筛后过少，回退全池逐股检测。"
+    label = label or "/".join(kinds)
+    note += (f"\n  ℹ️ 本地库 streaks 初筛：{len(pool)} → {len(reduced)} 只"
+             f"（{label}），逐股细看范围已缩小。")
+    return reduced, note
+
+
+def backtest_streaks(kind: str, min_days: int = 3, horizons: tuple[int, ...] = (5, 10, 20),
+                     db=None, adjust: str = "forward", ma: int = 20, window: int = 20):
+    """对指定 streak kind 做「信号 → 未来 H 交易日收益」事件研究回测，返回 pandas DataFrame。
+
+    对每条结束于 end_date 的 streak（连续天数 ≥ min_days），取 end_date 之后第 H 个交易日的
+    前复权价算 forward return（H ∈ horizons）。future 价用 LEAD(adj, H)，未来不足 H 行的样本
+    该 horizon 记为 NaN（自动排除停牌/退市/接近库最新日的样本）。返回列：
+    thscode / start_date / end_date / days / end_val / f{H} / ret{H}。无库/无 duckdb 返回
+    None，无匹配返回空 DataFrame。
+
+    注意：这是「事后漂移」事件研究，非逐日择时回测；不含交易成本，且用当前在库证券
+    （有幸存者偏差）。每条连续段聚合为一行（无段内重复），但样本在时间上高度相关（同一
+    市场环境、同期涨跌同向），且不同 min_days 的样本互相嵌套，N 不能直接读显著性，仅作
+    信号方向与强度的粗判。
+    """
+    db_path = _db_path(db)
+    if not db_path.exists():
+        return None
+    try:
+        import duckdb
+    except ImportError:
+        return None
+
+    val_expr = "k.close" if adjust == "none" else "k.close * COALESCE(a.forward_factor, 1.0)"
+    px_extra, px_col, brk = _streak_spec(kind, val_expr, ma, window)
+    lagged_extra = f", {px_col}" if px_col else ""
+    leads = ", ".join(
+        f"LEAD(adj, {h}) OVER (PARTITION BY thscode ORDER BY date) AS f{h}" for h in horizons
+    )
+    fcols = ", ".join(f"f.f{h}" for h in horizons)
+
+    sql = f"""
+WITH px AS (
+  SELECT k.thscode, k.date, {val_expr} AS adj, k.volume AS vol{"," + px_extra if px_extra else ""}
+  FROM raw_kline_daily k
+  LEFT JOIN calc_adjust_factor_daily a ON a.thscode = k.thscode AND a.date = k.date
+),
+lagged AS (
+  SELECT thscode, date, adj, vol{lagged_extra},
+         LAG(adj) OVER (PARTITION BY thscode ORDER BY date) AS prev,
+         LAG(vol) OVER (PARTITION BY thscode ORDER BY date) AS prev_vol
+  FROM px
+),
+flagged AS (
+  SELECT thscode, date, adj,
+         CASE WHEN {brk} THEN 1 ELSE 0 END AS brk
+  FROM lagged
+),
+grouped AS (
+  SELECT thscode, date, adj, brk,
+         SUM(brk) OVER (PARTITION BY thscode ORDER BY date ROWS UNBOUNDED PRECEDING) AS gid
+  FROM flagged
+),
+streaks AS (
+  SELECT thscode, MIN(date) AS start_date, MAX(date) AS end_date, COUNT(*) AS days,
+         arg_max(adj, date) AS end_val
+  FROM grouped
+  WHERE brk = 0
+  GROUP BY thscode, gid
+  HAVING COUNT(*) >= {int(min_days)}
+),
+fwd AS (
+  SELECT thscode, date, {leads}
+  FROM px
+)
+SELECT s.thscode, s.start_date, s.end_date, s.days, s.end_val, {fcols}
+FROM streaks s
+JOIN fwd f ON f.thscode = s.thscode AND f.date = s.end_date
+ORDER BY s.end_date
+"""
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        df = con.execute(sql).fetchdf()
+    finally:
+        con.close()
+    for h in horizons:
+        df[f"ret{h}"] = df[f"f{h}"] / df["end_val"] - 1.0
+    return df
+
+
+def _baseline_fwd(db_path, horizons, val_expr) -> dict:
+    """全市场无条件 forward return 基准（同期对照），返回 {h: (n, win%, mean%, median%)}。"""
+    leads = ", ".join(
+        f"LEAD(adj, {h}) OVER (PARTITION BY thscode ORDER BY date) / adj - 1.0 AS r{h}"
+        for h in horizons
+    )
+    sel = ", ".join(
+        f"COUNT(r{h}) AS n{h}, 100.0*AVG((r{h}>0)::INT) AS win{h}, "
+        f"100.0*AVG(r{h}) AS mean{h}, 100.0*MEDIAN(r{h}) AS med{h}"
+        for h in horizons
+    )
+    sql = f"""
+WITH px AS (
+  SELECT k.thscode, k.date, {val_expr} AS adj
+  FROM raw_kline_daily k
+  LEFT JOIN calc_adjust_factor_daily a ON a.thscode = k.thscode AND a.date = k.date
+),
+fwd AS (
+  SELECT {leads} FROM px
+)
+SELECT {sel} FROM fwd
+"""
+    try:
+        import duckdb
+    except ImportError:
+        return {}
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        df = con.execute(sql).fetchdf()
+    finally:
+        con.close()
+    out = {}
+    for h in horizons:
+        out[h] = (int(df[f"n{h}"][0]), float(df[f"win{h}"][0]),
+                  float(df[f"mean{h}"][0]), float(df[f"med{h}"][0]))
+    return out
+
+
+def cmd_streaks_backtest(args) -> int:
+    """streaks 信号 → 未来 N 交易日收益 回测（事件研究，非逐日择时）。"""
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb  # noqa: F401
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+
+    horizons = tuple(int(x) for x in (args.horizons or "5,10,20").split(",") if x.strip())
+    mins = [int(x) for x in (args.min or "3").split(",") if x.strip()]
+    val_expr = "k.close" if args.adjust == "none" else "k.close * COALESCE(a.forward_factor, 1.0)"
+    label = _STREAK_LABEL[args.kind]
+    if args.kind == "above-ma":
+        label = f"{label}(MA{args.ma})"
+    elif args.kind == "new-high":
+        label = f"{label}({args.window}日)"
+
+    base = _baseline_fwd(db, horizons, val_expr)
+
+    print(f"== streaks 回测：{label}（kind={args.kind}，{args.adjust}复权）==")
+    print(f"   未来 {list(horizons)} 交易日；每格 = 胜率% / 均收益% / 中位收益%")
+    print()
+
+    print(f"  {'min':>3} {'N':>7} | " + " | ".join(f"fut{h} 胜/均/中" for h in horizons))
+    print("  " + "-" * (18 + 22 * len(horizons)))
+    for mn in mins:
+        df = backtest_streaks(args.kind, min_days=mn, horizons=horizons, db=db,
+                              adjust=args.adjust, ma=args.ma, window=args.window)
+        if df is None or df.empty:
+            print(f"  {mn:>3} {0:>7} | " + " | ".join("-- / -- / --" for _ in horizons))
+            continue
+        cells = []
+        for h in horizons:
+            s = df[f"ret{h}"].dropna()
+            if s.empty:
+                cells.append("-- / -- / --")
+            else:
+                win = (s > 0).mean() * 100.0
+                cells.append(f"{win:.1f} / {s.mean()*100.0:+.2f} / {s.median()*100.0:+.2f}")
+        print(f"  {mn:>3} {len(df):>7} | " + " | ".join(cells))
+
+    if base:
+        cells = []
+        for h in horizons:
+            _, win, mean, med = base[h]
+            cells.append(f"{win:.1f} / {mean:+.2f} / {med:+.2f}")
+        print(f"  {'基':>3} {'-':>7} | " + " | ".join(cells) + "   ← 全市场无条件基准")
+
+    print()
+    print("  解读：胜率/均收益高于基准 = 该信号对未来 H 日有正向预测力；低于 = 反向/均值回归。")
+    print("  ⚠️ 事件研究非逐日择时：不含交易成本、用当前在库证券（幸存者偏差）；样本在时间上")
+    print("     高度相关、且不同 --min 互相嵌套（N 不能直接读显著性），仅供粗判信号方向。")
+
+    if getattr(args, "by_board", False):
+        bdf = backtest_streaks(args.kind, min_days=mins[0], horizons=horizons, db=db,
+                               adjust=args.adjust, ma=args.ma, window=args.window)
+        if bdf is not None and not bdf.empty:
+            bdf["board"] = bdf["thscode"].map(_board_of)
+            print()
+            print(f"  ── 分板块（min_days={mins[0]}，{label}）──")
+            print(f"  {'板块':<6} {'N':>7} | " + " | ".join(f"fut{h} 胜/均/中" for h in horizons))
+            print("  " + "-" * (18 + 22 * len(horizons)))
+            for board in ("主板", "创业板", "科创板", "北交所"):
+                sub = bdf[bdf["board"] == board]
+                if sub.empty:
+                    continue
+                cells = []
+                for h in horizons:
+                    s = sub[f"ret{h}"].dropna()
+                    if s.empty:
+                        cells.append("-- / -- / --")
+                    else:
+                        cells.append(f"{(s > 0).mean()*100.0:.1f} / {s.mean()*100.0:+.2f} / {s.median()*100.0:+.2f}")
+                print(f"  {board:<6} {len(sub):>7} | " + " | ".join(cells))
+    return 0
+
+
+def cmd_streaks(args) -> int:
+    """全市场「连续上涨/下跌/放量/缩量」区间扫描（CLI 入口，复用 query_streaks）。"""
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb  # noqa: F401
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+
+    codes = [c for c in (args.codes or "").split(",") if c] or None
+    df = query_streaks(args.kind, min_days=args.min, start=args.start, end=args.end,
+                       codes=codes, limit=args.limit, db=db, adjust=args.adjust,
+                       ma=args.ma, window=args.window)
+    if df is None or df.empty:
         print(f"⚠️ 未找到「{_STREAK_LABEL[args.kind]}」≥{args.min} 天的区间")
         return 0
 
+    price_based = args.kind not in ("vol-up", "vol-down")
     label = _STREAK_LABEL[args.kind]
+    if args.kind == "above-ma":
+        label = f"{label}(MA{args.ma})"
+    elif args.kind == "new-high":
+        label = f"{label}({args.window}日)"
     if price_based:
         df["total_pct"] = (df["end_val"] / df["start_val"] - 1.0) * 100.0
         df = df.rename(columns={"start_val": "start_price", "end_val": "end_price"})
@@ -460,18 +890,35 @@ def main() -> int:
     ss = sub.add_parser("sync-symbols", help="刷新 dim_symbol 证券维度表（symbols 子命令依赖）")
     ss.add_argument("--db")
 
-    sk = sub.add_parser("streaks", help="全市场连续区间扫描（连续上涨/下跌/放量/缩量）")
-    sk.add_argument("kind", choices=["up", "down", "vol-up", "vol-down"],
-                    help="区间类型: up=连续上涨 down=连续下跌 vol-up=连续放量 vol-down=连续缩量")
+    sk = sub.add_parser("streaks", help="全市场连续区间扫描（上涨/下跌/放量/缩量/量价齐升/量价齐缩/站稳均线/创新高）")
+    sk.add_argument("kind", choices=["up", "down", "vol-up", "vol-down",
+                                     "vol-price-up", "vol-price-down", "above-ma", "new-high"],
+                    help="区间类型: up=连续上涨 down=连续下跌 vol-up=连续放量 vol-down=连续缩量 "
+                         "vol-price-up=量价齐升 vol-price-down=量价齐缩 above-ma=连续站稳均线 new-high=连续创新高")
     sk.add_argument("--min", type=int, default=3, help="最少连续天数（默认 3）")
     sk.add_argument("--start", help="YYYY-MM-DD 起始日期（含）")
     sk.add_argument("--end", help="YYYY-MM-DD 结束日期（含）")
     sk.add_argument("--adjust", default="forward", choices=["none", "forward"],
                     help="涨跌判定用价: forward=前复权价(默认,推荐) none=未复权收盘价")
+    sk.add_argument("--ma", type=int, default=20, help="above-ma 的均线周期（默认 20）")
+    sk.add_argument("--window", type=int, default=20, help="new-high 的新高回看窗口（默认 20 日）")
     sk.add_argument("--codes", help="限定 thscode，逗号分隔（默认全市场）")
     sk.add_argument("--limit", type=int, default=20, help="输出前 N 段（默认 20）")
     sk.add_argument("--out", help="落盘 CSV 路径（可选）")
     sk.add_argument("--db")
+
+    sb = sub.add_parser("streaks-backtest", help="streaks 信号 → 未来 N 日收益回测（事件研究）")
+    sb.add_argument("kind", choices=["up", "down", "vol-up", "vol-down",
+                                     "vol-price-up", "vol-price-down", "above-ma", "new-high"],
+                    help="streak 类型（同 streaks）")
+    sb.add_argument("--min", default="3", help="最少连续天数，可逗号分隔多个（默认 3）")
+    sb.add_argument("--horizons", default="5,10,20", help="未来交易日，逗号分隔（默认 5,10,20）")
+    sb.add_argument("--adjust", default="forward", choices=["none", "forward"],
+                    help="涨跌判定用价（默认 forward 前复权）")
+    sb.add_argument("--ma", type=int, default=20, help="above-ma 均线周期（默认 20）")
+    sb.add_argument("--window", type=int, default=20, help="new-high 新高窗口（默认 20 日）")
+    sb.add_argument("--by-board", action="store_true", help="追加按板块（主板/创业板/科创板/北交所）分组收益")
+    sb.add_argument("--db")
 
     args = p.parse_args()
     if not args.cmd:
@@ -486,6 +933,7 @@ def main() -> int:
         "sync": cmd_sync,
         "sync-symbols": cmd_sync_symbols,
         "streaks": cmd_streaks,
+        "streaks-backtest": cmd_streaks_backtest,
     }[args.cmd](args)
 
 

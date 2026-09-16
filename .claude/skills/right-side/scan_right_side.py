@@ -309,21 +309,42 @@ def _flow_check(results, top: int) -> None:
     print("  说明: 右侧追的是「资金 + 趋势」共振，主力近5日净流入更稳；净流出则追高风险大，谨慎。")
 
 
+# ---------------------------------------------------------------- 本地库 streaks 初筛
+
+def _prescreen(pool: dict, kinds: list, min_pool: int = 40) -> tuple[dict, str]:
+    """本地 marketdb streaks 初筛（实现见 tools.marketdb_local.prescreen_pool）。"""
+    from tools.marketdb_local import prescreen_pool
+    return prescreen_pool(pool, kinds, min_pool=min_pool, label="量价齐升/创新高")
+
+
+def _sync_local_db() -> None:
+    """--sync 时先增量同步本地 marketdb（可能触发下载，遇到 429 限流会失败）。"""
+    from tools.marketdb_local import sync_db_echo
+    sync_db_echo()
+
+
 # ---------------------------------------------------------------- 主流程
 
 def _parse_args(argv):
     if not argv[1:]:
-        return None, 20
+        return None, 20, False, False
     query = argv[1].strip()
     top = 20
+    sync = False
+    full = False
     for a in argv[2:]:
-        if a.strip().isdigit():
-            top = max(5, min(int(a.strip()), 50))
-    return query, top
+        a = a.strip()
+        if a.isdigit():
+            top = max(5, min(int(a), 50))
+        elif a == "--sync":
+            sync = True
+        elif a in ("--full", "--no-prescreen"):
+            full = True
+    return query, top, sync, full
 
 
 def main():
-    query, top = _parse_args(sys.argv)
+    query, top, sync, full = _parse_args(sys.argv)
     if not query:
         print(__doc__)
         return 2
@@ -332,12 +353,20 @@ def main():
     print(f"右侧选股扫描（板块/行业: {query}）")
     print("=" * 72)
 
+    if sync:
+        _sync_local_db()
+
     pool = resolve_board_pool(query)
     if not pool:
         print(f"❌ 无法解析「{query}」的成分股池（板块/行业名未匹配或数据源不可达）")
         print("   支持: 指数(沪深300/中证500/中证1000/上证50) / 板(创业板/科创板) / 行业(半导体/化工/白酒...)")
         return 1
     print(f"  成分股池: {len(pool)} 只（已剔除北交所/B股等无新浪K线的标的）")
+
+    if not full:
+        pool, prescreen_note = _prescreen(pool, ["vol-price-up", "new-high"])
+        if prescreen_note:
+            print(prescreen_note)
 
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~3 分钟）...")

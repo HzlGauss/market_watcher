@@ -9,10 +9,12 @@
 analyze_golden_pit.py 细看。
 
 用法:
-    py .claude/skills/golden-pit/scan_golden_pit.py [输出数量]
+    py .claude/skills/golden-pit/scan_golden_pit.py [输出数量] [--sync] [--full]
 
 参数:
     输出数量   输出的候选数量上限（可选，默认 20）
+    --sync    先增量同步本地 marketdb 到最新（可能触发下载，遇 429 限流会失败）
+    --full    跳过本地库 streaks 初筛，全池逐股拉新浪 K 线（更慢但召回最全）
 
 数据源: akshare 指数成分股（index_stock_cons，需 pip install akshare）
 + 新浪日 K 线（fetch_historical_kline）。妙想（MX_APIKEY）可选，用于 top 候选基本面快查。
@@ -412,28 +414,57 @@ def _fundamental_check(results, top: int) -> None:
     print("  仅 ✅通过 才对单只跑 analyze_golden_pit.py 细看买点/止损；❌/⚠️/待查 建议排除或人工补查后观望。")
 
 
+# ---------------------------------------------------------------- 本地库 streaks 初筛
+
+def _prescreen(pool: dict, kinds: list, min_pool: int = 40) -> tuple[dict, str]:
+    """本地 marketdb streaks 初筛（实现见 tools.marketdb_local.prescreen_pool）。"""
+    from tools.marketdb_local import prescreen_pool
+    return prescreen_pool(pool, kinds, min_pool=min_pool, label="连续下跌/缩量")
+
+
+def _sync_local_db() -> None:
+    """--sync 时先增量同步本地 marketdb（可能触发下载，遇到 429 限流会失败）。"""
+    from tools.marketdb_local import sync_db_echo
+    sync_db_echo()
+
+
 # ---------------------------------------------------------------- 主流程
 
 def _parse_args(argv):
     top = 20
+    sync = False
+    full = False
     for a in argv[1:]:
-        if a.strip().isdigit():
-            top = max(5, min(int(a.strip()), 50))
-    return top
+        a = a.strip()
+        if a.isdigit():
+            top = max(5, min(int(a), 50))
+        elif a == "--sync":
+            sync = True
+        elif a in ("--full", "--no-prescreen"):
+            full = True
+    return top, sync, full
 
 
 def main():
-    top = _parse_args(sys.argv)
+    top, sync, full = _parse_args(sys.argv)
 
     print("=" * 72)
     print("黄金坑批量扫描（沪深300 ∪ 上证50 ∪ 中证红利）")
     print("=" * 72)
+
+    if sync:
+        _sync_local_db()
 
     pool = _build_pool()
     if not pool:
         print("❌ 未获取到指数成分候选池（akshare 未装 / 网络异常）")
         return 1
     print(f"  候选池: {len(pool)} 只白马/蓝筹成分股")
+
+    if not full:
+        pool, prescreen_note = _prescreen(pool, ["down", "vol-down"])
+        if prescreen_note:
+            print(prescreen_note)
 
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 2~4 分钟）...")
