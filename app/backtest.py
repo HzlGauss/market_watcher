@@ -90,12 +90,67 @@ def per_horizon(fn):
     return {f"fut{h}": fn(f"fut{h}") for h in HORIZONS}
 
 
-def summarize(cands, base, slices):
+def random_baseline(base_by_date, cand_count_by_date, k=200, seed=42):
+    """同频率随机信号基准（蒙特卡洛）。
+
+    每个历史日期 T，随机抽「与真实信号候选数相同」的股票，算其未来收益均值；
+    重复 k 次，得到「随机选股」的期望收益分布。用于剥离信号的真实选股 edge
+    与「市场 β / 运气」——真实信号均值 vs 随机均值 = 净 edge。
+
+    Args:
+        base_by_date:       {date_str: [fut dicts]}  当日宇宙的未来收益
+        cand_count_by_date: {date_str: int}          真实信号当日候选数
+    Returns:
+        {fut{h}: {"avg":.., "std":.., "n_runs":..} or None}
+    """
+    import random
+    rng = random.Random(seed)
+    run_means = {h: [] for h in HORIZONS}
+    for _ in range(k):
+        run_vals = {h: [] for h in HORIZONS}
+        for T, n in cand_count_by_date.items():
+            day = base_by_date.get(T) or []
+            if n <= 0 or not day:
+                continue
+            picks = rng.sample(day, min(n, len(day)))
+            for h in HORIZONS:
+                run_vals[h].extend(p.get(h) for p in picks if p.get(h) is not None)
+        for h in HORIZONS:
+            if run_vals[h]:
+                run_means[h].append(sum(run_vals[h]) / len(run_vals[h]))
+    out = {}
+    for h in HORIZONS:
+        v = run_means[h]
+        if v:
+            m = sum(v) / len(v)
+            sd = (sum((x - m) ** 2 for x in v) / len(v)) ** 0.5
+            out[f"fut{h}"] = {"avg": round(m, 2), "std": round(sd, 2), "n_runs": len(v)}
+        else:
+            out[f"fut{h}"] = None
+    return out
+
+
+def _edge(sig, rnd):
+    """真实信号 - 随机基准 = 净 edge；|edge| > 2×随机 std 记 `*`（粗略显著性）。"""
+    out = {}
+    for h in HORIZONS:
+        s = sig.get(f"fut{h}")
+        r = rnd.get(f"fut{h}")
+        if s and r and s.get("avg") is not None and r.get("avg") is not None:
+            e = round(s["avg"] - r["avg"], 2)
+            out[f"fut{h}"] = {"edge": e, "sig": "*" if abs(e) > 2 * (r.get("std") or 0) else ""}
+        else:
+            out[f"fut{h}"] = None
+    return out
+
+
+def summarize(cands, base, slices, base_by_date=None, cand_count_by_date=None):
     """汇总统计。
 
     cands: list[dict]，每个候选含 ``fut5/fut10/fut20`` 及特征字段。
     base:  list[dict(int->pct)]，同期基准（全体或候选来源池）的未来收益。
     slices: {name: predicate(r)->bool}，自定义阈值维度切片。
+    base_by_date/cand_count_by_date: 可选，传入则附「随机基准」与「净 edge」。
     """
     out = {"n": len(cands), "n_base": len(base)}
     out["baseline"] = {f"fut{h}": _stat_pure([f.get(h) for f in base if f.get(h) is not None])
@@ -104,6 +159,9 @@ def summarize(cands, base, slices):
     for name, fn in slices.items():
         rows = [r for r in cands if fn(r)]
         out[name] = per_horizon(lambda k: stat(rows, k))
+    if base_by_date is not None and cand_count_by_date is not None:
+        out["random"] = random_baseline(base_by_date, cand_count_by_date)
+        out["edge"] = _edge(out["all"], out["random"])
     return out
 
 
@@ -119,6 +177,15 @@ def print_report(report, sections):
         return "  ".join(_fmt(s, h) for h in H)
 
     print(f"基准(n={report['n_base']}): " + "  ".join(_fmt(report["baseline"], h) for h in H))
+    if "random" in report:
+        rnd = report["random"]
+        print("随机基准(同频率): " + "  ".join(
+            f"{h}:{rnd[h]['avg']:+.1f}%±{rnd[h]['std']:.1f}"
+            if rnd.get(h) else f"{h}:--" for h in H))
+        if "edge" in report:
+            print("净 edge(真实-随机): " + "  ".join(
+                f"{h}:{report['edge'][h]['edge']:+.1f}%{report['edge'][h]['sig']}"
+                if report["edge"].get(h) else f"{h}:--" for h in H))
     for sec in sections:
         if sec in report:
             print(f"  {sec:<16} {_row(report[sec])}")

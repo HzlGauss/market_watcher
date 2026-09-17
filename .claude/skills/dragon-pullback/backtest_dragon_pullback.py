@@ -90,8 +90,10 @@ def main():
     stocks, kcache = load_universe_klines(days=250)
 
     cands, base = [], []
+    base_by_date, cand_count_by_date = {}, {}
     for T in dates:
         T_str = _dstr(T)
+        day_futs, day_cands = [], 0
         for code in stocks:
             klines = kcache.get(code)
             if not klines:
@@ -108,6 +110,7 @@ def main():
                 continue
             fut = future_returns(klines, T_str, close_T)
             base.append(fut)  # 基准：近 LOOKBACK 日有涨停的票
+            day_futs.append(fut)
             wave = _find_first_wave(kT)
             if wave is None:
                 continue
@@ -123,7 +126,10 @@ def main():
             for h in HORIZONS:
                 r[f"fut{h}"] = fut.get(h)
             cands.append(r)
-        print(f"  {T_str}: 涨停股 {len(base)} 只 -> 候选 {len(cands)} 只", file=sys.stderr)
+            day_cands += 1
+        base_by_date[T_str] = day_futs
+        cand_count_by_date[T_str] = day_cands
+        print(f"  {T_str}: 涨停股 {len(day_futs)} 只 -> 候选 {day_cands} 只", file=sys.stderr)
 
     slices = {
         "strong_ge75": lambda r: r["score"] >= 75,
@@ -142,7 +148,7 @@ def main():
         "fib_ge0.618": lambda r: r["fib"] is not None and r["fib"] >= 0.618,
     }
 
-    report = summarize(cands, base, slices)
+    report = summarize(cands, base, slices, base_by_date, cand_count_by_date)
     report["dates"] = [_dstr(t) for t in dates]
     out = Path(__file__).resolve().parent / "backtest_result.json"
     with open(out, "w", encoding="utf-8") as f:

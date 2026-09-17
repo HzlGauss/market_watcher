@@ -276,8 +276,18 @@ def _print_attention():
         tags = Counter(str(a.get("tag_name", "")) for a in anom)
         print(f"  ── 当日异动 {len(anom)} 条 ──")
         print("    异动类型: " + " / ".join(f"{t}×{c}" for t, c in tags.most_common()))
-        for a in anom[:6]:
-            kw = "、".join(a.get("keyword_list") or [])[:22]
+        # 涨停/跌停的 keyword_list 即「涨停原因/题材」，结构化展示（替代丢弃的 analysis_content）
+        for tag in ("涨停", "跌停"):
+            rows = [a for a in anom if a.get("tag_name") == tag]
+            if rows:
+                print(f"    {tag}原因/题材（top {min(len(rows), 8)}）:")
+                for a in rows[:8]:
+                    kw = "、".join(a.get("keyword_list") or [])
+                    print(f"      {a.get('stock_name', '')}  {kw}")
+        # 其余异动类型（主力流入/大额成交等）简明列出
+        other = [a for a in anom if a.get("tag_name") not in ("涨停", "跌停")][:5]
+        for a in other:
+            kw = "、".join(a.get("keyword_list") or [])[:30]
             print(f"    {a.get('stock_name', '')} [{a.get('tag_name', '')}] {kw}")
     if not sky and not hot and not anom:
         print("  ⚠️ 无关注度数据（无 key 或接口不可达）")

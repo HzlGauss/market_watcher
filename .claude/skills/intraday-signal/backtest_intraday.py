@@ -102,8 +102,10 @@ def main():
     stocks, kcache = _get_universe()
 
     cands, base = [], []
+    base_by_date, cand_count_by_date = {}, {}
     for T in dates:
         T_str = _dstr(T)
+        day_futs, day_cands = [], 0
         for code in stocks:
             klines = kcache.get(code)
             if not klines:
@@ -117,6 +119,7 @@ def main():
                 continue
             fut = future_returns(klines, T_str, close_T)
             base.append(fut)
+            day_futs.append(fut)
 
             # 用 T 日收盘当「现价」，构造最小 Quote 供技术汇总复用
             prev = kT[-2] if len(kT) >= 2 else None
@@ -162,7 +165,10 @@ def main():
             for h in HORIZONS:
                 r[f"fut{h}"] = fut.get(h)
             cands.append(r)
-        print(f"  {T_str}: 宇宙 {len(base)} 只 -> 候选 {len(cands)} 只", file=sys.stderr)
+            day_cands += 1
+        base_by_date[T_str] = day_futs
+        cand_count_by_date[T_str] = day_cands
+        print(f"  {T_str}: 宇宙 {len(day_futs)} 只 -> 候选 {day_cands} 只", file=sys.stderr)
 
     slices = {
         # 抄底：深度回撤核心 + 参考确认项
@@ -183,7 +189,7 @@ def main():
         "score_lt35": lambda r: r["score"] < 35,
     }
 
-    report = summarize(cands, base, slices)
+    report = summarize(cands, base, slices, base_by_date, cand_count_by_date)
     report["dates"] = [_dstr(t) for t in dates]
     out = Path(__file__).resolve().parent / "backtest_result.json"
     with open(out, "w", encoding="utf-8") as f:

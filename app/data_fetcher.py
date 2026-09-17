@@ -1143,7 +1143,8 @@ def fetch_global_markets() -> dict[str, str]:
 # 市场快讯
 # ============================================================
 
-def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> list[MarketNews]:
+def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15,
+                      max_age_hours: int | None = None) -> list[MarketNews]:
     """获取指定时间窗口内的市场快讯
 
     数据源：新浪财经滚动新闻（新浪 API 比东方财富更稳定）
@@ -1152,17 +1153,18 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
         start_hour: 开始小时 (0-23)
         end_hour:   结束小时 (0-23)
         max_count:  最多返回条数
+        max_age_hours: 仅保留最近 N 小时内的新闻（None=不过滤日期，向后兼容）
 
     Returns:
         快讯列表，按时间倒序。网络异常时返回空列表。
     """
     from datetime import datetime
 
-    # 新浪财经滚动新闻 API（lid=2510 = 财经要闻，比 2512 更纯净）
+    # 新浪财经滚动新闻 API（lid=2509 = 7x24 全球快讯，实时更新；2510 已停更勿用）
     url = "https://feed.mix.sina.com.cn/api/roll/get"
     params = {
         "pageid": "153",
-        "lid": "2510",
+        "lid": "2509",
         "num": str(max_count * 3),
         "versionNumber": "1.2.4",
     }
@@ -1221,6 +1223,10 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
             except ValueError:
                 news_time = datetime.now()
 
+        if max_age_hours is not None:
+            age_h = (datetime.now() - news_time).total_seconds() / 3600
+            if age_h < 0 or age_h > max_age_hours:
+                continue
         hour = news_time.hour
         if start_hour <= hour < end_hour:
             news_list.append(MarketNews(
@@ -1235,6 +1241,66 @@ def fetch_market_news(start_hour: int, end_hour: int, max_count: int = 15) -> li
             break
 
     return news_list
+
+
+# ---------------------------------------------------------------- 快讯缓存（盯盘暂存 → skill 复用）
+
+def _news_cache_path():
+    from pathlib import Path
+    return Path(__file__).resolve().parent.parent / "state" / "market_news_cache.json"
+
+
+def _write_market_news_cache(news: list[MarketNews]) -> None:
+    """盯盘拉取的快讯暂存到 state/market_news_cache.json（best-effort，失败静默）。"""
+    import json
+    try:
+        p = _news_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_ts": time.time(),
+            "_time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "items": [{"time": n.time, "title": n.title, "category": n.category,
+                       "content": n.content, "url": n.url} for n in news],
+        }
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def read_market_news_cache(max_age_seconds: int = 900) -> list[MarketNews]:
+    """读盯盘暂存的快讯缓存；新鲜返回缓存列表，过期/不存在/损坏返回 []。"""
+    import json
+    try:
+        p = _news_cache_path()
+        if not p.exists():
+            return []
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if time.time() - float(payload.get("_ts", 0)) > max_age_seconds:
+            return []
+        return [MarketNews(time=it.get("time", ""), title=it.get("title", ""),
+                           category=it.get("category", ""), content=it.get("content", ""),
+                           url=it.get("url", "")) for it in payload.get("items", [])]
+    except Exception:
+        return []
+
+
+def fetch_market_news_cached(start_hour: int, end_hour: int, max_count: int = 15,
+                             max_age_seconds: int = 900,
+                             max_age_hours: int | None = 24) -> list[MarketNews]:
+    """先读盯盘暂存的快讯缓存（新鲜则直接返回），否则实时拉取并写缓存。
+
+    供 skill 复用盯盘拉取的快讯，避免重复请求；缓存缺失/过期时自动回退实时拉取。
+    max_age_hours 默认 24 = 只保留最近 24h 新闻（避免混入历史旧闻）。
+    """
+    cached = read_market_news_cache(max_age_seconds)
+    if cached:
+        return cached
+    news = fetch_market_news(start_hour, end_hour, max_count, max_age_hours=max_age_hours)
+    if news:
+        _write_market_news_cache(news)
+    return news
 
 
 # ============================================================

@@ -51,8 +51,10 @@ def main():
     stocks, kcache = load_universe_klines(days=500)
 
     cands, base = [], []
+    base_by_date, cand_count_by_date = {}, {}
     for T in dates:
         T_str = _dstr(T)
+        day_futs, day_cands = [], 0
         for code in stocks:
             klines = kcache.get(code)
             if not klines:
@@ -65,6 +67,7 @@ def main():
                 continue
             fut = future_returns(klines, T_str, close_T)
             base.append(fut)
+            day_futs.append(fut)
             try:
                 r = _score_candidate(code, {"name": stocks[code], "source": ""}, kT)
             except Exception:
@@ -74,7 +77,10 @@ def main():
             for h in HORIZONS:
                 r[f"fut{h}"] = fut.get(h)
             cands.append(r)
-        print(f"  {T_str}: 宇宙 {len(base)} 只 -> 左侧候选 {len(cands)} 只", file=sys.stderr)
+            day_cands += 1
+        base_by_date[T_str] = day_futs
+        cand_count_by_date[T_str] = day_cands
+        print(f"  {T_str}: 宇宙 {len(day_futs)} 只 -> 左侧候选 {day_cands} 只", file=sys.stderr)
 
     slices = {
         "strong_ge75": lambda r: r["score"] >= 75,
@@ -95,7 +101,7 @@ def main():
         "pattern_stop": lambda r: r["pattern"],
     }
 
-    report = summarize(cands, base, slices)
+    report = summarize(cands, base, slices, base_by_date, cand_count_by_date)
     report["dates"] = [_dstr(t) for t in dates]
     out = Path(__file__).resolve().parent / "backtest_result.json"
     with open(out, "w", encoding="utf-8") as f:

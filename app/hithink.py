@@ -11,6 +11,7 @@ API Key 从环境变量 HITHINK_FINANCE_API_KEY 按次读取（避免模块 impo
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -414,6 +415,50 @@ def fetch_index_kline(index_thscode: str, days: int = 250) -> list[dict]:
     return out[-int(days):]
 
 
+_ROMAN_TAIL = re.compile(r"(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|II|III|IV|V|VI)$")
+
+
+def _industry_base_name(name: str) -> str:
+    """去掉申万行业名末尾的罗马数字等级后缀（白酒Ⅱ→白酒、保险Ⅱ→保险）。"""
+    return _ROMAN_TAIL.sub("", str(name or "").strip()).strip()
+
+
+def industry_index_catalog() -> dict[str, str]:
+    """同花顺行业指数目录 {行业名: thscode}（约 320 个申万行业节点，随取随用）。"""
+    out: dict[str, str] = {}
+    for it in fetch_ths_index_list("industry"):
+        name = str(it.get("name") or "").strip()
+        code = str(it.get("thscode") or "").strip()
+        if name and code:
+            out[name] = code
+    return out
+
+
+def match_industry_index(industry_name: str) -> dict | None:
+    """个股所属行业名（东财 f100，申万口径）→ 同花顺行业指数。
+
+    匹配顺序：去罗马后缀精确 → 原始精确 → 双向包含（取指数名最短的最具体节点）。
+    返回 {"thscode": ..., "index_name": ...}；无匹配返回 None。
+    """
+    name = str(industry_name or "").strip()
+    if not name:
+        return None
+    catalog = industry_index_catalog()
+    if not catalog:
+        return None
+    base = _industry_base_name(name)
+    if base in catalog:
+        return {"thscode": catalog[base], "index_name": base}
+    if name in catalog:
+        return {"thscode": catalog[name], "index_name": name}
+    cands = [n for n in catalog if base in n or n in base]
+    if cands:
+        cands.sort(key=len)
+        n = cands[0]
+        return {"thscode": catalog[n], "index_name": n}
+    return None
+
+
 # ============================================================
 # 特色数据（连板梯队 / 异动 / 飙升 / 热股）
 # ============================================================
@@ -433,10 +478,16 @@ def fetch_anomaly_list(tag_codes: str = "") -> list[dict]:
 
 
 def fetch_anomaly_stock(thscodes: list[str]) -> list[dict]:
-    """按 thscode 批量查询当日个股异动原因（1–50 只）。"""
+    """按代码批量查询当日个股异动原因（1–50 只）。
+
+    接受 6 位裸代码或带后缀的 thscode（002163 或 002163.SZ 均可），
+    内部统一去后缀后重新拼 thscode，避免二次加后缀成 002163.SZ.SZ。
+    """
     if not thscodes:
         return []
-    codes = [thscode(c) for c in thscodes]
+    codes = [thscode(str(c).split(".", 1)[0].strip()) for c in thscodes if str(c).split(".", 1)[0].strip()]
+    if not codes:
+        return []
     data = _get("/api/a-share/special-data/anomaly-analysis-stock", {"thscodes": ",".join(codes)})
     return list(data.get("item") or []) if data else []
 

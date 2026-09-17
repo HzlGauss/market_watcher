@@ -717,12 +717,12 @@ def generate_morning_brief(config: Config) -> Path | None:
     log.info("Generating morning brief...")
 
     # 1. Fetch data
-    from app.data_fetcher import fetch_global_markets, fetch_market_news
+    from app.data_fetcher import fetch_global_markets, fetch_market_news_cached
     global_data = fetch_global_markets()
     # 妙想优先获取早间要闻，新浪兜底
     from app.miaoxiang import fetch_news_for_report
     mx_morning_news = fetch_news_for_report(config, "今日A股早间要闻 政策 利好 风险")
-    morning_news = fetch_market_news(start_hour=0, end_hour=9, max_count=15)
+    morning_news = fetch_market_news_cached(start_hour=0, end_hour=9, max_count=15)
     all_items = _get_unique_items(config)
     quotes = fetch_quotes_rich(all_items)
     if not quotes:
@@ -1042,11 +1042,11 @@ def generate_midday_review(config: Config) -> Path | None:
     all_quotes = [q for q in quotes if q.change_pct is not None]
     from app.data_fetcher import fetch_market_breadth
     _, stats = analyze(all_quotes, {}, config, market_breadth=fetch_market_breadth())
-    from app.data_fetcher import fetch_market_news
+    from app.data_fetcher import fetch_market_news_cached
     # 妙想优先获取上午快讯，新浪兜底
     from app.miaoxiang import fetch_news_for_report
     mx_midday_news = fetch_news_for_report(config, "上午A股盘面 热点板块 异动 原因")
-    morning_news = fetch_market_news(start_hour=9, end_hour=12, max_count=10)
+    morning_news = fetch_market_news_cached(start_hour=9, end_hour=12, max_count=10)
 
     # 2. Build data section
     data_lines = []
@@ -3237,11 +3237,11 @@ def generate_evening_review(config: Config) -> Path | None:
     except Exception:
         pass
 
-    from app.data_fetcher import fetch_market_news
+    from app.data_fetcher import fetch_market_news_cached
     # 妙想优先获取盘中快讯，新浪兜底
     from app.miaoxiang import fetch_news_for_report
     mx_day_news = fetch_news_for_report(config, "今日A股收盘 重要新闻 政策 影响")
-    day_news = fetch_market_news(start_hour=9, end_hour=16, max_count=10)
+    day_news = fetch_market_news_cached(start_hour=9, end_hour=16, max_count=10)
 
     # 获取龙虎榜数据
     dragon_tiger_summary = None

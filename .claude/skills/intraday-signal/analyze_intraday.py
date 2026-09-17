@@ -43,9 +43,17 @@ from app.config import Config
 from app.utils import load_env
 from app.models import WatchItem, Quote, FundFlowDetail, KlineData
 from app.helpers import _detect_market
-from app.data_fetcher import fetch_quotes, fetch_fund_flow_detail
+from app.data_fetcher import (
+    fetch_quotes,
+    fetch_fund_flow_detail,
+    fetch_major_indices,
+    fetch_market_news_cached,
+    fetch_stock_industry_map,
+    _fetch_em_clist,
+)
 from app.technical import (
     fetch_historical_kline,
+    calc_rsi,
     calc_support_resistance,
     get_technical_summary,
     detect_market_regime,
@@ -56,6 +64,11 @@ from app.technical import (
 from app.t0_monitor import _compute_suggested_prices
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# 大盘环境层常量（【0 环境层】，只做环境过滤，非买卖信号）
+_FS_ALL_A = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"   # 东财 clist 全 A 股
+_EM_BREADTH_FIELDS = "f12,f14,f3,f6"               # f3=涨跌幅 f6=成交额
+_ENV_INDICES = ("上证指数", "深证成指", "创业板指", "沪深300")
 
 
 # ---------------------------------------------------------------- 解析工具
@@ -513,6 +526,243 @@ def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
     print(f"  → 判定: {verdict}")
 
 
+# ---------------------------------------------------------------- 环境层
+
+def _market_stance(idx_chgs: list[float], up_ratio: float | None) -> str:
+    """由核心指数平均涨跌 + 上涨占比，给一个环境强弱标签（供 AI 过滤仓位，非硬信号）。"""
+    if not idx_chgs and up_ratio is None:
+        return "数据不足"
+    avg = sum(idx_chgs) / len(idx_chgs) if idx_chgs else None
+    parts = []
+    if avg is not None:
+        if avg >= 0.5:
+            parts.append("指数偏强")
+        elif avg <= -0.5:
+            parts.append("指数偏弱")
+        else:
+            parts.append("指数平盘")
+    if up_ratio is not None:
+        if up_ratio >= 60:
+            parts.append("普涨")
+        elif up_ratio <= 35:
+            parts.append("普跌")
+        else:
+            parts.append("分化")
+    return " / ".join(parts) if parts else "数据不足"
+
+
+def _print_market_env():
+    """【0 环境层】轻量大环境：核心指数涨跌 + 市场广度（涨跌家数/成交额）。
+
+    环境过滤层，非买卖信号：大盘趋势下跌 → 买入类动作(建/加/抄底)降级、卖出类(减/清)升级；
+    大盘普涨 → 反之。拉取失败静默降级，不阻塞个股数据。
+    """
+    print()
+    print("=" * 72)
+    print("【0. 大盘环境（环境过滤层，非买卖信号）】")
+    print("=" * 72)
+
+    idx_chgs: list[float] = []
+    idx_parts: list[str] = []
+    try:
+        for q in fetch_major_indices():
+            if q.name in _ENV_INDICES:
+                idx_parts.append(f"{q.name} {_f(q.change_pct, 2)}%")
+                if q.change_pct is not None:
+                    idx_chgs.append(q.change_pct)
+    except Exception:
+        idx_parts = []
+
+    up = down = flat = 0
+    total_amount = 0.0
+    try:
+        raw = _fetch_em_clist(_FS_ALL_A, _EM_BREADTH_FIELDS, fid="f3")
+        for it in raw:
+            chg = _num(it.get("f3"))
+            if chg is None:
+                continue
+            if chg > 0:
+                up += 1
+            elif chg < 0:
+                down += 1
+            else:
+                flat += 1
+            total_amount += _num(it.get("f6")) or 0.0
+    except Exception:
+        raw = []
+
+    if not idx_parts and not (up + down + flat):
+        print("  ⚠️ 大盘环境数据不可达（跳过环境层）")
+        return
+
+    if idx_parts:
+        print("  指数: " + "  ".join(idx_parts))
+    total = up + down + flat
+    if total:
+        if total < 4500:  # 全 A 股约 5000+，分页被截断时广度数据不可信
+            print(f"  ⚠️ 广度数据不完整（仅 {total} 只，分页截断），上涨占比不可用")
+        else:
+            ratio = up / total * 100
+            print(f"  广度: 上涨 {up} / 下跌 {down} / 平盘 {flat}  （上涨占比 {ratio:.0f}%）"
+                  f"  成交额 {total_amount / 1e8:.0f} 亿")
+            print(f"  环境强弱: {_market_stance(idx_chgs, ratio)}")
+
+
+def _fetch_stock_news(code: str, limit: int = 5) -> list[dict]:
+    """东财个股新闻（curl_cffi 浏览器指纹直连东财搜索 JSONP，绕过 akshare 的 `\\u3000` regex bug）。
+
+    东财对普通 requests 只回「股票搜索(passportWeb)」降级结果，需 curl_cffi impersonate
+    才能拿到新闻正文(cmsArticleWebOld)。返回 [{"title", "date", "media"}...] 最新在上；
+    无 curl_cffi / 失败返回 []。
+    """
+    import json as _json
+    import time as _time
+    try:
+        from curl_cffi import requests as _creq
+    except Exception:
+        return []
+
+    url = "https://search-api-web.eastmoney.com/search/jsonp"
+    inner = {
+        "uid": "", "keyword": code, "type": ["cmsArticleWebOld"],
+        "client": "web", "clientType": "web", "clientVersion": "curr",
+        "param": {"cmsArticleWebOld": {
+            "searchScope": "default", "sort": "default",
+            "pageIndex": 1, "pageSize": max(limit, 5),
+            "preTag": "<em>", "postTag": "</em>"}},
+    }
+    params = {
+        "cb": f"cb_{int(_time.time() * 1000)}",
+        "param": _json.dumps(inner, ensure_ascii=False),
+        "_": str(int(_time.time() * 1000)),
+    }
+    try:
+        resp = _creq.get(url, params=params, impersonate="chrome")
+    except Exception:
+        return []
+    text = getattr(resp, "text", "") or ""
+    start, end = text.find("("), text.rfind(")")
+    if start == -1 or end == -1:
+        return []
+    try:
+        payload = _json.loads(text[start + 1:end])
+    except Exception:
+        return []
+    items = ((payload.get("result") or {}).get("cmsArticleWebOld")) or []
+    out = []
+    for it in items[:limit]:
+        title = str(it.get("title") or "")
+        for tag in ("<em>", "</em>"):
+            title = title.replace(tag, "")
+        out.append({"title": title.strip(),
+                    "date": str(it.get("date") or "").strip(),
+                    "media": str(it.get("mediaName") or "").strip()})
+    return out
+
+
+def _print_news_risk(code: str, name: str):
+    """【0b 盘中消息风险层】拉大盘快讯 + 个股新闻标题，供 AI 判突发利好/利空。
+
+    只做风险提示：突发利空 → 一票否决抄底/追涨；突发利好 → 仍看量价是否确认。
+    不自动判新闻情绪（噪音大），拉取失败静默跳过。
+    """
+    print()
+    print("=" * 72)
+    print("【0b. 盘中消息 · 风险提示层（大盘快讯 + 个股新闻，供判突发利好/利空）】")
+    print("=" * 72)
+
+    # 大盘快讯（复用盯盘快讯缓存，新浪滚动快讯；缓存缺失时自动回退实时拉取）
+    try:
+        mkt = fetch_market_news_cached(0, 24, max_count=6)
+        if mkt:
+            print(f"  大盘快讯（前 {len(mkt)} 条，最新在上）：")
+            for n in mkt:
+                print(f"    - [{n.time}] {n.title[:60]}")
+        else:
+            print("  ⚠️ 大盘快讯无数据")
+    except Exception:
+        print("  ⚠️ 大盘快讯拉取失败")
+
+    # 个股新闻（东财搜索，针对减持/问询/业绩预告等个股级突发）
+    news = _fetch_stock_news(code)
+    if news:
+        print(f"  个股新闻（前 {len(news)} 条，最新在上）：")
+        for n in news:
+            print(f"    - [{n['date'][:16]}] {n['title'][:60]}")
+    else:
+        print("  ⚠️ 个股新闻拉取失败/无数据")
+
+
+def _print_industry(code: str):
+    """【0c 行业走势】个股所属行业（东财 f100 → 同花顺行业指数）的趋势 + 相对强弱。
+
+    环境过滤层，非买卖信号：行业趋势向上 = 个股顺水行舟；行业整体走弱 = 个股再强也难独善其身。
+    拉取失败静默降级，不阻塞个股数据；ETF 无个股行业归属，直接跳过。
+    """
+    if code.startswith(("51", "56", "58", "15", "16", "18")):
+        return  # ETF 无个股行业归属，跳过
+
+    print()
+    print("=" * 72)
+    print("【0c. 行业走势（环境过滤层：所属行业趋势 + 相对强弱）】")
+    print("=" * 72)
+
+    try:
+        from app.hithink import fetch_index_kline, fetch_index_snapshot, match_industry_index
+        ind_map = fetch_stock_industry_map([code])
+        industry = ind_map.get(code)
+        if not industry:
+            print("  ⚠️ 未查到个股所属行业（东财行业分类不可达），跳过行业层")
+            return
+        hit = match_industry_index(industry)
+        if not hit:
+            print(f"  ⚠️ 行业「{industry}」在 同花顺行业指数 中无对应，跳过行业层")
+            return
+        thscode, index_name = hit["thscode"], hit["index_name"]
+        snap = fetch_index_snapshot([thscode]).get(thscode) or {}
+        chg = snap.get("price_change_ratio_pct")
+        kl = fetch_index_kline(thscode, days=60)
+    except Exception as e:
+        print(f"  ⚠️ 行业数据拉取失败，跳过行业层（{type(e).__name__}）")
+        return
+
+    if not kl or len(kl) < 20:
+        print(f"  ⚠️ 行业「{index_name}」K 线数据不足，跳过")
+        return
+
+    closes = [k["close"] for k in kl if k.get("close") is not None]
+    ma5, ma10, ma20 = _ma(closes, 5), _ma(closes, 10), _ma(closes, 20)
+    rsi = calc_rsi(closes, 14)
+    pct5 = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) >= 6 else None
+    pct20 = (closes[-1] - closes[-20]) / closes[-20] * 100 if len(closes) >= 20 else None
+
+    if ma5 is not None and ma10 is not None and ma20 is not None:
+        if ma5 > ma10 > ma20:
+            align = "多头排列"
+        elif ma5 < ma10 < ma20:
+            align = "空头排列"
+        else:
+            align = "均线缠绕"
+    else:
+        align = "数据不足"
+
+    print(f"  行业: {industry}（同花顺指数 {index_name}）  今日涨跌 {_f(chg, 2)}%")
+    print(f"  MA5 {_f(ma5)}  MA10 {_f(ma10)}  MA20 {_f(ma20)}  均线 {align}")
+    print(f"  RSI(14) {_f(rsi, 0)}  |  近5日 {_f(pct5, 2)}%  近20日 {_f(pct20, 2)}%")
+
+    # 相对大盘（vs 沪深300 近20日，供判行业是领涨还是补涨）
+    try:
+        hs = fetch_index_kline("000300.SH", days=60)
+        hc = [k["close"] for k in hs if k.get("close") is not None]
+        if len(hc) >= 20 and pct20 is not None:
+            hs20 = (hc[-1] - hc[-20]) / hc[-20] * 100
+            rel = pct20 - hs20
+            print(f"  相对沪深300: 行业近20日 {pct20:+.1f}% vs 沪深300 {hs20:+.1f}%"
+                  f" → 相对强弱 {rel:+.1f}pp（{'强于' if rel > 0 else '弱于'}大盘）")
+    except Exception:
+        pass
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: py .claude/skills/intraday-signal/analyze_intraday.py <代码> [名称] [天数]")
@@ -529,6 +779,12 @@ def main():
     if q is None:
         print(f"❌ 未获取到 {code} 实时行情（代码无效 / 非交易时段 / 网络异常）")
         return 1
+
+    # ---- 环境层（先自上而下读大盘 + 个股消息 + 行业，再读个股）----
+    _print_market_env()
+    _print_news_risk(code, name)
+    _print_industry(code)
+
     _print_realtime(q)
 
     # ---- 当日资金流（东财分钟级，静默降级）----

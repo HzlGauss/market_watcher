@@ -14,6 +14,8 @@
     status              查看库状态（各表行数 + 最大日期）
     sync                增量同步：只跑 auto-sync（自动判断 skip/incremental/full），不装依赖不重建库
     sync-symbols        刷新 dim_symbol 证券维度表（symbols 子命令依赖）
+    sync-financials     三张报表落库（利润/资产负债/现金流量，同花顺 REST，非 marketdb Parquet）
+    sync-valuation      估值快照逐日累积（PE/PB/PS/PCF，同花顺 REST，历史分位需每日积累）
     streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
 
 用法:
@@ -285,6 +287,222 @@ def cmd_sync_symbols(args) -> int:
 def cmd_sync(args) -> int:
     """增量同步：只跑 auto-sync（自动判断 skip/incremental/full），不装依赖、不重建库。"""
     return sync_db(args.db)
+
+
+# ---------------------------------------------------------------- 三张报表落库
+
+_FIN_COMMON = [("thscode", "VARCHAR"), ("ticker", "VARCHAR"), ("fiscal_year", "INTEGER"),
+               ("fiscal_period", "VARCHAR"), ("period_end", "VARCHAR"), ("report_date", "VARCHAR")]
+
+# 三张报表各自数值列（金额单位为元，每股类为元/股；DOUBLE 足够容纳亿元级精确值）
+_FIN_NUMS = {
+    "fin_income": ["operating_income", "operating_costs", "operating_expenses", "operating_profit",
+                   "profit_total", "net_profit", "parent_holder_net_profit", "basic_eps",
+                   "income_tax_expense", "interest_expenses", "sales_fee", "manage_fee",
+                   "research_and_development_expenses"],
+    "fin_balance": ["assets_total", "total_debt", "holder_equity_total", "total_current_assets",
+                    "non_current_nets_total", "cash", "accounts_receivable"],
+    "fin_cashflow": ["act_cash_flow_net", "invest_cash_flow_net", "financing_cash_flow_net",
+                     "cash_equivalents_net_addition", "pay_dividends_profits_interest_cash",
+                     "pay_fixed_assets_etc_cash"],
+}
+
+
+def _fin_num(v):
+    """数值列安全转换：None/空串 → None，否则 float。"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_fin_tables(con) -> None:
+    """建三张报表表（幂等）。主键语义 (thscode, period_end)，落库时按 thscode 删旧插新。"""
+    for table, nums in _FIN_NUMS.items():
+        cols = [f"{n} {t}" for n, t in _FIN_COMMON] + [f"{n} DOUBLE" for n in nums]
+        con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(cols)})")
+
+
+def _sync_fin_one(con, hithink, ticker: str, period: str, keep: int) -> int:
+    """同步一只股票的三张报表，返回落库总条数（任一表失败不影响其它表）。"""
+    total = 0
+    for table, fn in (("fin_income", hithink.fetch_income_statements),
+                      ("fin_balance", hithink.fetch_balance_sheets),
+                      ("fin_cashflow", hithink.fetch_cash_flow_statements)):
+        try:
+            items = fn(ticker, "", period=period, limit=keep)
+        except Exception:
+            items = []
+        if not items:
+            continue
+        thscode_s = items[0].get("thscode") or _norm_thscode(ticker)
+        con.execute(f"DELETE FROM {table} WHERE thscode = ?", [thscode_s])
+        rows = [[thscode_s, ticker, it.get("fiscal_year"), it.get("fiscal_period"),
+                 it.get("period_end"), it.get("report_date")]
+                + [_fin_num(it.get(n)) for n in _FIN_NUMS[table]]
+                for it in items]
+        cols = [n for n, _ in _FIN_COMMON] + _FIN_NUMS[table]
+        con.executemany(f"INSERT INTO {table} VALUES ({','.join('?' for _ in cols)})", rows)
+        total += len(rows)
+    return total
+
+
+def cmd_sync_financials(args) -> int:
+    """三张报表落库：利润/资产负债/现金流量表（同花顺 Financial-API，季度/年度多期）。
+
+    默认同步前 100 只 A 股（约 300 次请求），--all 全市场、--codes 指定代码。
+    幂等：按 thscode 删旧插新，重跑自愈。
+    """
+    import time
+
+    _load_key()
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+    try:
+        from app import hithink
+    except Exception:
+        print("❌ 无法导入 app.hithink")
+        return 1
+    if not os.environ.get("HITHINK_FINANCE_API_KEY"):
+        print("❌ 未配置 HITHINK_FINANCE_API_KEY（.env 中设置）")
+        return 1
+
+    con = duckdb.connect(str(db))
+    _ensure_fin_tables(con)
+
+    if args.codes:
+        tickers = [c.strip().split(".", 1)[0] for c in args.codes.split(",") if c.strip()]
+    else:
+        tickers = [r[0] for r in con.execute(
+            "SELECT ticker FROM dim_symbol WHERE asset_type='a-share' ORDER BY ticker").fetchall()]
+        if not args.all:
+            if args.limit and args.limit > 0:
+                tickers = tickers[:args.limit]
+
+    if not tickers:
+        print("⚠️ 无目标代码（dim_symbol 为空？先跑 sync-symbols）")
+        con.close()
+        return 0
+
+    print(f"==> 三张报表落库：{len(tickers)} 只（period={args.period}，每只保留 {args.keep} 期）")
+    ok = 0
+    for i, tk in enumerate(tickers, 1):
+        n = _sync_fin_one(con, hithink, tk, args.period, args.keep)
+        ok += 1 if n > 0 else 0
+        if i % 50 == 0 or i == len(tickers):
+            print(f"    进度 {i}/{len(tickers)}，成功 {ok} 只", flush=True)
+        if args.sleep:
+            time.sleep(args.sleep)
+    con.close()
+
+    con = duckdb.connect(str(db), read_only=True)
+    for t in _FIN_NUMS:
+        cnt = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        mx = con.execute(f"SELECT MAX(period_end) FROM {t}").fetchone()[0]
+        print(f"  {t}: {cnt} 行，最新报告期 {mx}")
+    con.close()
+    print(f"✅ 完成：成功落库 {ok}/{len(tickers)} 只")
+    return 0
+
+
+# ---------------------------------------------------------------- 估值逐日累积
+
+_VAL_NUMS = ["pe_ttm", "pe_mrq", "pb_mrq", "ps_ttm", "pcf_ttm"]
+
+
+def _ensure_valuation_table(con) -> None:
+    cols = ["thscode VARCHAR", "ticker VARCHAR", "name VARCHAR", "trade_date VARCHAR"] + \
+           [f"{n} DOUBLE" for n in _VAL_NUMS]
+    con.execute(f"CREATE TABLE IF NOT EXISTS valuation_daily ({', '.join(cols)})")
+
+
+def cmd_sync_valuation(args) -> int:
+    """估值快照逐日累积（同花顺 fetch_valuations_snapshot，批量 100/次）。
+
+    估值无历史回填，历史分位只能从今天起每日收盘后跑一次累积。幂等：按 trade_date 删旧插新，
+    当日重跑自愈（覆盖当天已落库的）。估值允许 null（未披露）或负数（亏损/负现金流），原样保留。
+    """
+    import time as _time
+    from datetime import date as _date
+
+    _load_key()
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+    try:
+        from app import hithink
+    except Exception:
+        print("❌ 无法导入 app.hithink")
+        return 1
+    if not os.environ.get("HITHINK_FINANCE_API_KEY"):
+        print("❌ 未配置 HITHINK_FINANCE_API_KEY（.env 中设置）")
+        return 1
+
+    con = duckdb.connect(str(db))
+    _ensure_valuation_table(con)
+
+    if args.codes:
+        tickers = [c.strip().split(".", 1)[0] for c in args.codes.split(",") if c.strip()]
+    else:
+        tickers = [r[0] for r in con.execute(
+            "SELECT ticker FROM dim_symbol WHERE asset_type='a-share' ORDER BY ticker").fetchall()]
+        if not args.all:
+            if args.limit and args.limit > 0:
+                tickers = tickers[:args.limit]
+
+    if not tickers:
+        print("⚠️ 无目标代码（dim_symbol 为空？先跑 sync-symbols）")
+        con.close()
+        return 0
+
+    trade_date = _date.today().isoformat()
+    con.execute("DELETE FROM valuation_daily WHERE trade_date = ?", [trade_date])
+
+    batch = max(1, min(args.batch, 100))  # 接口一次最多 100 只
+    n_batch = (len(tickers) + batch - 1) // batch
+    print(f"==> 估值快照落库：{len(tickers)} 只（{n_batch} 批，trade_date={trade_date}）")
+    ok = 0
+    for i in range(0, len(tickers), batch):
+        chunk = tickers[i:i + batch]
+        try:
+            items = hithink.fetch_valuations_snapshot(chunk)
+        except Exception:
+            items = []
+        rows = []
+        for it in items or []:
+            thscode_s = it.get("thscode") or _norm_thscode(it.get("ticker") or "")
+            rows.append([thscode_s, it.get("ticker") or "", it.get("name") or "", trade_date]
+                        + [_fin_num(it.get(n)) for n in _VAL_NUMS])
+        if rows:
+            placeholders = ",".join("?" for _ in range(4 + len(_VAL_NUMS)))
+            con.executemany(f"INSERT INTO valuation_daily VALUES ({placeholders})", rows)
+            ok += len(rows)
+        if args.sleep:
+            _time.sleep(args.sleep)
+    con.close()
+
+    con = duckdb.connect(str(db), read_only=True)
+    cnt = con.execute("SELECT COUNT(*) FROM valuation_daily WHERE trade_date = ?", [trade_date]).fetchone()[0]
+    days = con.execute("SELECT COUNT(DISTINCT trade_date) FROM valuation_daily").fetchone()[0]
+    con.close()
+    print(f"  今日落库 {cnt} 条，累计 {days} 个交易日")
+    print(f"✅ 完成：成功落库 {ok}/{len(tickers)} 只")
+    return 0
 
 
 # ---------------------------------------------------------------- streaks
@@ -943,6 +1161,23 @@ def main() -> int:
     ss = sub.add_parser("sync-symbols", help="刷新 dim_symbol 证券维度表（symbols 子命令依赖）")
     ss.add_argument("--db")
 
+    sf = sub.add_parser("sync-financials", help="三张报表落库（利润/资产负债/现金流量，同花顺 Financial-API）")
+    sf.add_argument("--codes", help="逗号分隔代码（如 600519,000858），与 --limit/--all 互斥")
+    sf.add_argument("--limit", type=int, default=100, help="同步前 N 只 A 股（默认 100；0=全部，等价 --all）")
+    sf.add_argument("--all", action="store_true", help="全市场同步（覆盖 --limit）")
+    sf.add_argument("--period", default="quarterly", choices=["quarterly", "annual"], help="报告期口径（默认 quarterly）")
+    sf.add_argument("--keep", type=int, default=8, help="每只股票保留最近 N 期（默认 8）")
+    sf.add_argument("--sleep", type=float, default=0.05, help="每只股票间休眠秒数，限频保护（默认 0.05）")
+    sf.add_argument("--db")
+
+    sv = sub.add_parser("sync-valuation", help="估值快照逐日累积（PE/PB/PS/PCF，同花顺 Financial-API）")
+    sv.add_argument("--codes", help="逗号分隔代码（如 600519,000858），与 --limit/--all 互斥")
+    sv.add_argument("--limit", type=int, default=100, help="同步前 N 只 A 股（默认 100；0=全部，等价 --all）")
+    sv.add_argument("--all", action="store_true", help="全市场同步（覆盖 --limit）")
+    sv.add_argument("--batch", type=int, default=100, help="每批请求只数（接口上限 100，默认 100）")
+    sv.add_argument("--sleep", type=float, default=0.1, help="每批之间休眠秒数，限频保护（默认 0.1）")
+    sv.add_argument("--db")
+
     sk = sub.add_parser("streaks", help="全市场连续区间扫描（上涨/下跌/放量/缩量/量价齐升/量价齐缩/站稳均线/创新高）")
     sk.add_argument("kind", choices=["up", "down", "vol-up", "vol-down",
                                      "vol-price-up", "vol-price-down", "above-ma", "new-high"],
@@ -988,6 +1223,8 @@ def main() -> int:
         "status": cmd_status,
         "sync": cmd_sync,
         "sync-symbols": cmd_sync_symbols,
+        "sync-financials": cmd_sync_financials,
+        "sync-valuation": cmd_sync_valuation,
         "streaks": cmd_streaks,
         "streaks-backtest": cmd_streaks_backtest,
     }[args.cmd](args)
