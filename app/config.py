@@ -451,6 +451,24 @@ class Config:
         value = self._raw.get("做T监控", {}).get("扫描间隔秒", 30)
         return max(10, safe_int(value, 30))
 
+    # ---- 加减仓监控 ----
+
+    @property
+    def position_enabled(self) -> bool:
+        """是否启用加减仓监控（持仓 + 日K周期阶段）"""
+        return self._raw.get("加减仓监控", {}).get("启用", False)
+
+    @property
+    def position_push_enabled(self) -> bool:
+        """是否启用加减仓信号微信推送"""
+        return self._raw.get("加减仓监控", {}).get("推送微信", False)
+
+    @property
+    def position_interval(self) -> int:
+        """加减仓监控扫描节流间隔（秒）"""
+        value = self._raw.get("加减仓监控", {}).get("扫描间隔秒", 300)
+        return max(30, safe_int(value, 300))
+
     # ---- 智能选股 ----
 
     @property

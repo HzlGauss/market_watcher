@@ -1148,11 +1148,19 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
 
     # Start T+0 monitor thread if enabled
     t0_thread = None
-    if hasattr(config, 't0_enabled') and config.t0_enabled:
+    # 做T与加减仓可独立启用：任一开启即起线程，线程内部按开关跳过相应扫描
+    t0_enabled = getattr(config, 't0_enabled', False)
+    position_enabled = getattr(config, 'position_enabled', False)
+    if t0_enabled or position_enabled:
         t0_interval = getattr(config, 't0_interval', 30)
         t0_thread = T0MonitorThread(monitor_items, data_pool, interval=t0_interval,
-                                    enable_sound=True, enable_push=False,
-                                    sessions=config.sessions)
+                                    enable_sound=True,
+                                    enable_push=getattr(config, 't0_push_enabled', False),
+                                    sessions=config.sessions,
+                                    t0_enabled=t0_enabled,
+                                    position_enabled=position_enabled,
+                                    position_push=getattr(config, 'position_push_enabled', False),
+                                    position_interval=getattr(config, 'position_interval', 300))
         t0_thread.start()
 
     # Start background cache for fund flow / volume ratio / turnover rate

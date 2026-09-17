@@ -13,7 +13,7 @@ from typing import List, Optional, Dict
 
 from .data_pool import SharedDataPool, KLine
 from .models import Quote, WatchItem, KlineData
-from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary
+from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary, detect_stage
 from .technical import fetch_historical_kline
 from .http_client import serverchan_client
 
@@ -71,6 +71,56 @@ class T0Signal:
                 f"reason={self.reason}, RR={self.risk_reward:.1f})")
 
 
+class PositionSignal:
+    """加减仓信号（基于日K周期阶段 detect_stage）"""
+    ACTION_ADD = 'add'      # 加仓
+    ACTION_REDUCE = 'reduce'  # 减仓
+
+    def __init__(self, code: str, name: str, action: str, stage: str,
+                 confidence: int, reasons: list[str], price: float):
+        self.code = code
+        self.name = name
+        self.action = action
+        self.stage = stage
+        self.confidence = confidence
+        self.reasons = reasons or []
+        self.price = price
+        self.timestamp = time.time()
+
+    def is_valid(self, max_age: float = 900) -> bool:
+        """判断信号是否有效（默认15分钟内）"""
+        return time.time() - self.timestamp < max_age
+
+    @property
+    def confidence_label(self) -> str:
+        """置信度标签"""
+        return "高" if self.confidence >= 65 else ("中" if self.confidence >= 45 else "低")
+
+    @property
+    def action_label(self) -> str:
+        """醒目标签：右侧加仓 / 左侧埋伏 / 左侧接刀 / 减仓（按阶段区分风险）"""
+        if self.action == self.ACTION_REDUCE:
+            return "🔴 减仓"
+        if self.stage == "启动期":
+            return "🟢 加仓(右侧)"
+        if self.stage == "磨底期":
+            return "🟡 加仓(左侧埋伏)"
+        return "🟠 加仓(左侧接刀·高风险)"
+
+    def __repr__(self):
+        return f"PositionSignal(code={self.code}, action={self.action}, stage={self.stage})"
+
+
+# 周期阶段 → 加减仓动作映射（主升浪/震荡市不发，其余发）
+_STAGE_TO_ACTION = {
+    "启动期": PositionSignal.ACTION_ADD,     # 放量突破启动，右侧加仓
+    "磨底期": PositionSignal.ACTION_ADD,     # 缩量+超卖+抛压衰竭，左侧分批埋伏
+    "下跌期": PositionSignal.ACTION_ADD,     # 仍在下跌，左侧接刀（高风险，轻仓试探）
+    "赶顶期": PositionSignal.ACTION_REDUCE,  # 超买+乖离过大/放天量，止盈减仓
+    "派发期": PositionSignal.ACTION_REDUCE,  # 跌破 MA20 + 高位回落，离场减仓
+}
+
+
 def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     """计算做T的买入/卖出挂单建议价格
 
@@ -122,6 +172,8 @@ class T0MonitorThread(threading.Thread):
 
     # 5分钟K线缓存刷新间隔（秒）
     KLINE_CACHE_TTL = 300
+    # 日K缓存刷新间隔（秒）——加减仓用，日K慢变、无需频繁刷新
+    DAILY_CACHE_TTL = 300
 
     def __init__(self,
                  watch_items: List[WatchItem],
@@ -129,7 +181,11 @@ class T0MonitorThread(threading.Thread):
                  interval: int = 30,
                  enable_sound: bool = True,
                  enable_push: bool = False,
-                 sessions: Optional[dict] = None):
+                 sessions: Optional[dict] = None,
+                 t0_enabled: bool = True,
+                 position_enabled: bool = False,
+                 position_push: bool = False,
+                 position_interval: int = 300):
         """
         初始化做T监控线程
 
@@ -138,8 +194,12 @@ class T0MonitorThread(threading.Thread):
             data_pool: 共享数据池（用于行情价格）
             interval: 扫描间隔（秒），默认30秒
             enable_sound: 是否启用声音提示
-            enable_push: 是否启用微信推送
+            enable_push: 是否启用微信推送（做T信号）
             sessions: 交易时段配置（用于收盘后停止扫描）
+            t0_enabled: 是否启用做T信号扫描（False 时仅做加减仓扫描）
+            position_enabled: 是否启用加减仓监控（持仓 + 日K周期阶段）
+            position_push: 是否启用加减仓信号微信推送
+            position_interval: 加减仓扫描节流间隔（秒），默认300秒
         """
         super().__init__(daemon=True, name="T0Monitor")
         self._watch_items = watch_items
@@ -147,12 +207,20 @@ class T0MonitorThread(threading.Thread):
         self._interval = interval
         self._enable_sound = enable_sound
         self._enable_push = enable_push
+        self._t0_enabled = t0_enabled
         self._sessions = sessions
         self._running = False
         self._last_signals: Dict[str, T0Signal] = {}
         self._last_signal_time: Dict[str, float] = {}   # 信号冷却计时
         # 5分钟K线缓存：{code: (klines, fetch_time)}
         self._klines_cache: Dict[str, tuple[List[KlineData], float]] = {}
+        # 加减仓：日K缓存 + 信号缓存 + 节流计时
+        self._position_enabled = position_enabled
+        self._position_push = position_push
+        self._position_interval = max(30, int(position_interval))
+        self._daily_cache: Dict[str, tuple[List[KlineData], float]] = {}
+        self._last_position_signals: Dict[str, PositionSignal] = {}
+        self._last_position_scan_ts = 0.0
         self._stop_event = threading.Event()
 
     @property
@@ -228,28 +296,35 @@ class T0MonitorThread(threading.Thread):
             log.debug("数据池数据过期，跳过扫描")
             return
 
-        log.debug("开始做T信号扫描...")
+        if self._t0_enabled:
+            log.debug("开始做T信号扫描...")
 
-        signals: list[T0Signal] = []
+            signals: list[T0Signal] = []
 
-        for item in self._watch_items:
-            quote = self._data_pool.get_quote(item.code)
-            if quote is None:
-                continue
+            for item in self._watch_items:
+                quote = self._data_pool.get_quote(item.code)
+                if quote is None:
+                    continue
 
-            # 使用5分钟K线（非共享池中的60分钟K线）
-            # 每个标的首次获取带0.3s间隔
-            t0_klines = self._get_t0_klines(item)
-            if t0_klines is None:
-                continue
+                # 使用5分钟K线（非共享池中的60分钟K线）
+                # 每个标的首次获取带0.3s间隔
+                t0_klines = self._get_t0_klines(item)
+                if t0_klines is None:
+                    continue
 
-            signal = self._evaluate_signal(item, quote, t0_klines)
+                signal = self._evaluate_signal(item, quote, t0_klines)
 
-            if signal and signal.signal_type != T0Signal.SIGNAL_NONE:
-                signals.append(signal)
+                if signal and signal.signal_type != T0Signal.SIGNAL_NONE:
+                    signals.append(signal)
 
-        if signals:
-            self._handle_signals(signals)
+            if signals:
+                self._handle_signals(signals)
+
+        # 加减仓信号（持仓 + 日K周期阶段，节流扫描）
+        if self._position_enabled:
+            pos_signals = self._scan_position_signals()
+            if pos_signals:
+                self._handle_position_signals(pos_signals)
 
     def _evaluate_signal(self, item: WatchItem, quote: Quote,
                          t0_klines: List[KlineData]) -> Optional[T0Signal]:
@@ -439,6 +514,171 @@ class T0MonitorThread(threading.Thread):
             return sig
 
         return None
+
+    # ---------------------------------------------------------------- 加减仓信号
+
+    def _get_daily_klines(self, item: WatchItem) -> Optional[List[KlineData]]:
+        """获取加减仓用的日K线（本地 duckdb + 远端补缺口，带缓存）"""
+        now = time.time()
+        cached = self._daily_cache.get(item.code)
+        if cached and (now - cached[1]) < self.DAILY_CACHE_TTL:
+            return cached[0]
+
+        try:
+            from .kline_local import fetch_daily_hybrid
+            klines = fetch_daily_hybrid(item.code, item.market, days=60)
+            if klines:
+                self._daily_cache[item.code] = (klines, now)
+                return klines
+        except Exception as e:
+            log.warning(f"加减仓日K获取失败 {item.code}: {e}")
+
+        if cached:
+            return cached[0]
+        return None
+
+    def _evaluate_position_signal(self, item: WatchItem, quote: Quote) -> Optional[PositionSignal]:
+        """评估单个持仓的加减仓信号（基于日K周期阶段 detect_stage）"""
+        price = quote.price or quote.pre_close or 0
+        if price <= 0:
+            return None
+
+        klines = self._get_daily_klines(item)
+        if not klines or len(klines) < 20:
+            return None
+
+        try:
+            stage_result = detect_stage(klines)
+        except Exception as e:
+            log.debug(f"加减仓阶段判定失败 {item.code}: {e}")
+            return None
+
+        action = _STAGE_TO_ACTION.get(stage_result.stage)
+        if not action:
+            return None
+
+        reasons = list(stage_result.reasons or [])
+        # 左侧加仓信号补一句操作口径：区分「埋伏」与「接刀」，避免与 detect_stage 原文冲突
+        if action == PositionSignal.ACTION_ADD:
+            if stage_result.stage == "磨底期":
+                reasons.insert(0, "左侧埋伏：缩量超卖抛压衰竭，分批、破位止损")
+            elif stage_result.stage == "下跌期":
+                reasons.insert(0, "左侧接刀：仍在下跌，仅轻仓试探、破位止损")
+
+        return PositionSignal(
+            code=item.code, name=item.name, action=action,
+            stage=stage_result.stage, confidence=stage_result.confidence,
+            reasons=reasons, price=price,
+        )
+
+    def _scan_position_signals(self) -> list[PositionSignal]:
+        """扫描持仓的加减仓信号（只对持仓，节流扫描）"""
+        now = time.time()
+        if now - self._last_position_scan_ts < self._position_interval:
+            return []
+        self._last_position_scan_ts = now
+
+        signals: list[PositionSignal] = []
+        for item in self._watch_items:
+            # 加减仓只针对持仓（无持仓谈不上加/减）
+            if getattr(item, "type", "") != "持仓":
+                continue
+            quote = self._data_pool.get_quote(item.code)
+            if quote is None:
+                continue
+            sig = self._evaluate_position_signal(item, quote)
+            if sig:
+                signals.append(sig)
+        return signals
+
+    def _prune_position_signals(self, max_age: float = 1800):
+        """清理过期的加减仓信号缓存"""
+        now = time.time()
+        stale = [c for c, s in self._last_position_signals.items() if now - s.timestamp > max_age]
+        for c in stale:
+            del self._last_position_signals[c]
+
+    def _handle_position_signals(self, signals: list[PositionSignal]):
+        """统一处理一轮扫描的加减仓信号，去重后发一次通知"""
+        self._prune_position_signals(max_age=1800)
+
+        new_signals: list[PositionSignal] = []
+        for sig in signals:
+            last = self._last_position_signals.get(sig.code)
+            # 同一标的一段时间内不重复推送同一动作（加/减仓方向不变视为同一信号）
+            if last and last.action == sig.action and last.is_valid(max_age=900):
+                log.debug(f"跳过重复加减仓信号: {sig.code} {sig.action}")
+                continue
+            self._last_position_signals[sig.code] = sig
+            new_signals.append(sig)
+
+        if not new_signals:
+            return
+
+        self._print_position_signals(new_signals)
+        if self._position_push:
+            self._push_position_signals(new_signals)
+
+    def _print_position_signals(self, signals: list[PositionSignal]):
+        """打印加减仓信号（醒目排版）"""
+        now_str = datetime.now().strftime("%H:%M:%S")
+        adds = [s for s in signals if s.action == PositionSignal.ACTION_ADD]
+        reduces = [s for s in signals if s.action == PositionSignal.ACTION_REDUCE]
+
+        print(f"\n{'='*75}")
+        print(f"  🚨 加减仓信号汇总（{now_str}）[日K周期阶段]")
+        print(f"{'='*75}")
+        for s in adds + reduces:
+            reasons = "；".join(s.reasons)
+            print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
+                  f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%)")
+            if reasons:
+                print(f"      └─ {reasons}")
+        print(f"{'='*75}\n")
+        log.info(f"加减仓信号汇总: {len(adds)}加仓, {len(reduces)}减仓")
+
+    def _push_position_signals(self, signals: list[PositionSignal]):
+        """推送加减仓信号到微信（醒目标题 + markdown 正文）"""
+        sendkey = os.environ.get("SCT_SENDKEY")
+        if not sendkey:
+            log.debug("未配置 SCT_SENDKEY，跳过加减仓推送")
+            return
+
+        adds = [s for s in signals if s.action == PositionSignal.ACTION_ADD]
+        reduces = [s for s in signals if s.action == PositionSignal.ACTION_REDUCE]
+        now_str = datetime.now().strftime("%m-%d %H:%M")
+
+        parts = []
+        if adds:
+            parts.append(f"🟢加仓{len(adds)}")
+        if reduces:
+            parts.append(f"🔴减仓{len(reduces)}")
+        title = f"🚨加减仓信号 {' '.join(parts)} | {now_str}"
+
+        lines = ["# 🚨 加减仓信号（日K周期阶段）\n", f"扫描时间: {now_str}\n"]
+        for label, group in (("🟢 加仓", adds), ("🔴 减仓", reduces)):
+            if not group:
+                continue
+            lines.append(f"## {label}\n")
+            for s in group:
+                reasons = "；".join(s.reasons)
+                lines.append(f"- {s.action_label} **{s.name}({s.code})**  现价 {s.price:.2f}｜"
+                             f"阶段 **{s.stage}**｜置信 {s.confidence_label}({s.confidence}%)")
+                if reasons:
+                    lines.append(f"  > {reasons}")
+            lines.append("")
+
+        content = "\n".join(lines)
+
+        try:
+            url = f"{API_BASE}/{sendkey}.send"
+            resp = serverchan_client.post(url, data={"title": title, "desp": content})
+            if resp and resp.status_code == 200 and resp.json().get("code") == 0:
+                log.info(f"加减仓信号推送成功: {len(signals)}个信号")
+            else:
+                log.warning("加减仓信号推送失败")
+        except Exception as e:
+            log.error(f"加减仓信号推送异常: {e}")
 
     @staticmethod
     def _calc_buy_sell_ratio(bid_vol: Optional[float], ask_vol: Optional[float]) -> Optional[float]:
