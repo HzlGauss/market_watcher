@@ -3,7 +3,7 @@
 
 核心思路：
     1. 拉 8 大核心指数实时行情（上证/深证/创业板/创业板50/科创50/沪深300/中证500/中证1000）
-    2. 拉指数 60 日 K 线 → 算近 60 日位置百分位 + 均线多空排列
+    2. 拉指数 60 日 K 线 → 算近 60 日位置百分位 + 均线多空排列 + 量能（今日量/5日均量 放缩量 + 5日趋势）
     3. 拉全市场快照（东财 clist）→ 涨跌家数 / 成交额 / 涨停跌停（9.9% 近似）
     4. 拉行业/概念板块资金流 → 领涨 / 领跌板块 + 全市场主力净流入近似
     5. 拉两融余额（融资/融券，替代已停披露的北向资金）
@@ -23,6 +23,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # 强制 UTF-8 输出
 for _stream in (sys.stdout, sys.stderr):
@@ -82,6 +83,31 @@ def _fmt_pct(v) -> str:
     return f"{v:+.2f}%" if v is not None else "  --"
 
 
+def _volume_metrics(kl) -> Optional[tuple]:
+    """从指数日K算量能：今日量/5日均量倍数 + 放量/温和/缩量 + 近5日量能趋势。
+
+    返回 (倍数, 标签, 趋势)，K 线不足 6 根或无有效量时返回 None。
+    """
+    vols = [k.volume for k in kl if getattr(k, "volume", None) is not None and k.volume > 0]
+    if len(vols) < 6:
+        return None
+    today = vols[-1]
+    prev5 = vols[-6:-1]
+    avg5 = sum(prev5) / len(prev5)
+    if avg5 <= 0:
+        return None
+    ratio = today / avg5
+    label = "放量" if ratio >= 1.2 else ("缩量" if ratio < 0.8 else "温和")
+    trend = "—"
+    if len(vols) >= 11:
+        prior5 = vols[-11:-6]
+        avg_prior = sum(prior5) / len(prior5)
+        if avg_prior > 0:
+            tr = avg5 / avg_prior
+            trend = "放量趋势" if tr >= 1.2 else ("缩量趋势" if tr < 0.8 else "温和")
+    return ratio, label, trend
+
+
 # ---------------------------------------------------------------- 数据拉取
 
 def _fetch_index_rows() -> list[dict]:
@@ -106,6 +132,7 @@ def _fetch_index_rows() -> list[dict]:
             if highs and lows and price is not None and max(highs) > min(lows):
                 pos = (price - min(lows)) / (max(highs) - min(lows)) * 100
         ma = calc_ma_alignment(kl) if kl else None
+        vol = _volume_metrics(kl) if kl else None
         rows.append({
             "code": q.code,
             "name": q.name,
@@ -114,6 +141,9 @@ def _fetch_index_rows() -> list[dict]:
             "amount": q.amount,
             "pos": pos,
             "ma": ma.alignment if ma else "数据不足",
+            "vol_ratio": vol[0] if vol else None,
+            "vol_label": vol[1] if vol else "—",
+            "vol_trend": vol[2] if vol else "—",
         })
     return rows
 
@@ -181,10 +211,32 @@ def _print_index_table(rows: list[dict]):
               f"{_fmt_yi(r['amount']):>9}{pos_s:>9}{r['ma']:<10}")
 
 
+def _print_volume_analysis(rows: list[dict]):
+    print()
+    print("=" * 72)
+    print("【2. 量能分析】")
+    print("=" * 72)
+    valid = [r for r in rows if r.get("vol_ratio") is not None]
+    if not valid:
+        print("  ⚠️ 无指数K线量能数据")
+        return
+    print(f"  {'指数':<8}{'今日/5日均量':>12}{'量能':>6}{'近5日趋势':>10}")
+    print("  " + "-" * 72)
+    for r in rows:
+        if r.get("vol_ratio") is None:
+            continue
+        print(f"  {r['name']:<8}{r['vol_ratio']:>11.2f}倍{r['vol_label']:>6}{r['vol_trend']:>10}")
+    up = sum(1 for r in valid if r["vol_label"] == "放量")
+    down = sum(1 for r in valid if r["vol_label"] == "缩量")
+    mild = len(valid) - up - down
+    print(f"  ── 汇总: 放量 {up} 只 / 温和 {mild} 只 / 缩量 {down} 只")
+    print("  （量能倍数 = 今日/最近交易日成交量 ÷ 近5日均量；盘中为未完整实时量，收盘后为准）")
+
+
 def _print_breadth(b: dict):
     print()
     print("=" * 72)
-    print("【2. 市场广度】")
+    print("【3. 市场广度】")
     print("=" * 72)
     if not b.get("total"):
         print("  ⚠️ 无全市场数据（东财 clist 断连）")
@@ -216,7 +268,7 @@ def _print_sector(title: str, inflows, outflows, total_main=None):
 def _print_margin(m):
     print()
     print("=" * 72)
-    print("【4. 两融余额（替代已停披露的北向资金）】")
+    print("【5. 两融余额（替代已停披露的北向资金）】")
     print("=" * 72)
     if m is None or not m.date:
         print("  ⚠️ 无两融数据（akshare 未装或接口不可达）")
@@ -234,25 +286,28 @@ def main():
     print("=" * 72)
     print("  （非交易时段显示最近收盘数据）")
 
-    # 1. 核心指数
-    _print_index_table(_fetch_index_rows())
+    # 1. 核心指数 + 2. 量能分析（共用指数K线）
+    index_rows = _fetch_index_rows()
+    _print_index_table(index_rows)
+    _print_volume_analysis(index_rows)
 
-    # 2. 市场广度
+    # 3. 市场广度
     _print_breadth(_fetch_breadth())
 
-    # 3. 板块领涨领跌
+    # 4. 板块领涨领跌
     ind_in, ind_out, ind_total = _fetch_sector_sides("行业资金流")
-    _print_sector("【3. 板块资金流 · 行业板块（今日）】", ind_in, ind_out, ind_total)
+    _print_sector("【4. 板块资金流 · 行业板块（今日）】", ind_in, ind_out, ind_total)
     con_in, con_out, _ = _fetch_sector_sides("概念资金流")
-    _print_sector("【3. 板块资金流 · 概念板块（今日）】", con_in, con_out)
+    _print_sector("【4. 板块资金流 · 概念板块（今日）】", con_in, con_out)
 
-    # 4. 两融
+    # 5. 两融
     _print_margin(fetch_margin_data())
 
     print()
     print("  说明:")
     print("    - 60日位置 = 现价在近60日高低区间的百分位（0%=近60日最低 / 100%=近60日最高）")
     print("    - 均线 = MA5/10/20/60 排列状态（多头/空头/缠绕/多头回调/空头反弹）")
+    print("    - 量能倍数 = 今日/最近交易日成交量 ÷ 近5日均量；≥1.2放量 / <0.8缩量 / 之间温和")
     print("    - 两融余额为 T+1 日频数据，替代已停止披露的北向资金实时净流入")
     print("    - 本脚本只做取数聚合，『大盘强弱 / 进攻防守』结论由 AI 依据 SKILL.md 框架生成")
     return 0
