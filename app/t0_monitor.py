@@ -77,7 +77,8 @@ class PositionSignal:
     ACTION_REDUCE = 'reduce'  # 减仓
 
     def __init__(self, code: str, name: str, action: str, stage: str,
-                 confidence: int, reasons: list[str], price: float):
+                 confidence: int, reasons: list[str], price: float,
+                 suggested_price: float = 0.0):
         self.code = code
         self.name = name
         self.action = action
@@ -85,6 +86,7 @@ class PositionSignal:
         self.confidence = confidence
         self.reasons = reasons or []
         self.price = price
+        self.suggested_price = suggested_price  # 建议挂单价（加仓=买入、减仓=卖出）
         self.timestamp = time.time()
 
     def is_valid(self, max_age: float = 900) -> bool:
@@ -565,11 +567,38 @@ class T0MonitorThread(threading.Thread):
             elif stage_result.stage == "下跌期":
                 reasons.insert(0, "左侧接刀：仍在下跌，仅轻仓试探、破位止损")
 
+        # 建议挂单价：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
+        suggested = self._suggested_position_price(klines, price, action)
+
         return PositionSignal(
             code=item.code, name=item.name, action=action,
             stage=stage_result.stage, confidence=stage_result.confidence,
-            reasons=reasons, price=price,
+            reasons=reasons, price=price, suggested_price=suggested,
         )
+
+    @staticmethod
+    def _suggested_position_price(klines: List[KlineData], price: float, action: str) -> float:
+        """根据日K支撑压力位计算加减仓建议挂单价。
+
+        加仓 → 买入挂单价：下方最近支撑 + ATR/4 缓冲（不高于现价）
+        减仓 → 卖出挂单价：上方最近压力 − ATR/4 缓冲（不低于现价）
+        """
+        try:
+            sr = calc_support_resistance(klines, lookback=20, price=price)
+        except Exception:
+            sr = None
+
+        atr = (sr.atr if sr and sr.atr else price * 0.01)
+        if action == PositionSignal.ACTION_ADD:
+            if sr and sr.support:
+                suggested = sr.support + atr / 4
+                return round(min(suggested, price), 3)
+            return round(price * 0.99, 3)  # 无支撑，现价下方 1% 低吸
+        # 减仓
+        if sr and sr.resistance:
+            suggested = sr.resistance - atr / 4
+            return round(max(suggested, price), 3)
+        return round(price * 1.01, 3)  # 无压力，现价上方 1% 高抛
 
     def _scan_position_signals(self) -> list[PositionSignal]:
         """扫描持仓的加减仓信号（只对持仓，节流扫描）"""
@@ -630,8 +659,10 @@ class T0MonitorThread(threading.Thread):
         print(f"{'='*75}")
         for s in adds + reduces:
             reasons = "；".join(s.reasons)
+            side = "买入" if s.action == PositionSignal.ACTION_ADD else "卖出"
+            sugg = f"  建议{side}挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
-                  f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%)")
+                  f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if reasons:
                 print(f"      └─ {reasons}")
         print(f"{'='*75}\n")
@@ -662,8 +693,10 @@ class T0MonitorThread(threading.Thread):
             lines.append(f"## {label}\n")
             for s in group:
                 reasons = "；".join(s.reasons)
+                side = "买入" if s.action == PositionSignal.ACTION_ADD else "卖出"
+                sugg = f"｜建议{side}挂单价 **{s.suggested_price:.2f}**" if s.suggested_price > 0 else ""
                 lines.append(f"- {s.action_label} **{s.name}({s.code})**  现价 {s.price:.2f}｜"
-                             f"阶段 **{s.stage}**｜置信 {s.confidence_label}({s.confidence}%)")
+                             f"阶段 **{s.stage}**｜置信 {s.confidence_label}({s.confidence}%){sugg}")
                 if reasons:
                     lines.append(f"  > {reasons}")
             lines.append("")
