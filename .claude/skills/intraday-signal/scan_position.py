@@ -2,7 +2,7 @@
 """加减仓批量扫描：扫描 holdings.csv 各持仓，按日K周期阶段给出加/减仓信号 + 建议挂单价。
 
 核心思路：
-    1. 读 holdings.csv 持仓池（含观察标的）
+    1. 读 holdings.csv 持仓池
     2. 批量拉实时快照（新浪 + 腾讯量比/换手率）
     3. 逐标的拉日 K 线（本地 duckdb 前复权 + 远端补缺口）→ detect_stage 周期阶段
     4. 阶段 → 加/减仓动作（启动期/磨底期/下跌期=加，赶顶期/派发期=减），按置信度降序
@@ -66,13 +66,8 @@ def _read_holdings() -> list[dict]:
                 if len(code) != 6:
                     continue
                 market = _detect_market(code, market)
-                amount_raw = str(row.get("amount", "")).strip()
-                try:
-                    amount = int(float(amount_raw)) if amount_raw not in ("", "-") else 0
-                except (ValueError, TypeError):
-                    amount = 0
                 out.append({"code": code, "name": name, "market": market,
-                            "is_etf": _is_etf(code), "amount": amount})
+                            "is_etf": _is_etf(code)})
     except Exception:
         pass
     return out
@@ -129,16 +124,14 @@ def main():
     reduces = [s for s in signals if s.action == PositionSignal.ACTION_REDUCE]
     adds.sort(key=lambda s: s.confidence, reverse=True)
     reduces.sort(key=lambda s: s.confidence, reverse=True)
-    amount_map = {h["code"]: h["amount"] for h in holdings}
 
     if adds:
         shown = adds if limit is None else adds[:limit]
         print()
         print(f"  ── 🟢 加仓信号（{len(adds)} 只，按置信度降序）──")
         for s in shown:
-            tag = "" if amount_map.get(s.code, 0) > 0 else "（观察·无持仓）"
             sugg = f"｜建议挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
-            print(f"  {s.action_label}  {s.name}({s.code}){tag}  现价 {s.price:.2f}  "
+            print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
                 print(f"      └─ {'；'.join(s.reasons)}")
@@ -148,9 +141,8 @@ def main():
         print()
         print(f"  ── 🔴 减仓信号（{len(reduces)} 只，按置信度降序）──")
         for s in shown:
-            tag = "" if amount_map.get(s.code, 0) > 0 else "（观察·无持仓）"
             sugg = f"｜建议挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
-            print(f"  {s.action_label}  {s.name}({s.code}){tag}  现价 {s.price:.2f}  "
+            print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
                 print(f"      └─ {'；'.join(s.reasons)}")
@@ -159,7 +151,6 @@ def main():
     print("  说明:")
     print("    - 阶段映射：启动期/磨底期/下跌期=加仓（右侧/左侧埋伏/左侧接刀），赶顶期/派发期=减仓")
     print("    - 置信度 = detect_stage 阶段判定置信；加仓挂单价=支撑上方低吸，减仓=压力下方高抛")
-    print("    - 「观察·无持仓」= holdings.csv 中 amount 为 0/空的观察标的，减仓仅作阶段风险提示，加仓≈建仓")
     print("    - 日K级慢变量，盘中/盘后均可运行；是否操作由 AI 依据 SKILL.md 框架生成")
     return 0
 
