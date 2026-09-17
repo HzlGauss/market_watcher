@@ -165,6 +165,132 @@ def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     }
 
 
+def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
+    """做 T 可行性评估（简单三门槛：非单边 / 振幅够 / 区间够）。
+
+    与 analyze_intraday 的单股做 T 测算同一套逻辑，供 scan_t0 批量扫描复用。
+    注意：判「单边 vs 震荡」直接用 5 分钟均线排列，不能用 detect_market_regime——
+    它的 bb_width<5% 阈值按日K校准，喂 5 分钟K线时几乎恒判「窄幅震荡」，导致 ✅ 误杀。
+
+    Returns:
+        {"suitable": bool, "reasons": [str], "support": float|None,
+         "resistance": float|None, "atr": float|None, "amp": float|None,
+         "pos": float|None, "ma_align": str, "min_amp": float,
+         "buy_price": float, "sell_price": float}
+    """
+    sr = calc_support_resistance(min_klines, lookback=40)
+    tech = get_technical_summary(quote, min_klines)
+    price = quote.price or quote.pre_close or 0
+
+    is_etf = quote.type and "ETF" in quote.type
+    min_amp = 0.8 if is_etf else 1.5
+    amp = pos = None
+    if quote.high and quote.low and quote.pre_close and quote.high > quote.low:
+        amp = (quote.high - quote.low) / quote.pre_close * 100
+        pos = (price - quote.low) / (quote.high - quote.low) * 100
+
+    ma_align = tech.ma_alignment
+    is_trend = ma_align in ("多头排列", "空头排列")
+
+    reasons: list[str] = []
+    if price <= 0:
+        reasons.append("无有效现价")
+    if is_trend:
+        reasons.append(f"单边行情({ma_align})，做 T 易踏空/套牢")
+    if amp is None or amp < min_amp:
+        if amp is None:
+            reasons.append(f"日内振幅不足(无高低价，门槛 {min_amp}%)")
+        else:
+            reasons.append(f"日内振幅不足({amp:.2f}% < {min_amp}%)，无利润空间")
+    if sr.support is None or sr.resistance is None:
+        reasons.append("无有效支撑/压力位")
+    elif price > 0:
+        width_pct = (sr.resistance - sr.support) / price * 100
+        if width_pct < 0.8:
+            reasons.append(f"支撑压力区间过窄({width_pct:.2f}% < 0.8%)，无利润空间")
+
+    suggested = (_compute_suggested_prices(sr, price, quote) if price > 0
+                 else {"buy_price": 0.0, "sell_price": 0.0})
+
+    return {
+        "suitable": not reasons,
+        "reasons": reasons,
+        "support": sr.support,
+        "resistance": sr.resistance,
+        "atr": sr.atr,
+        "amp": round(amp, 2) if amp is not None else None,
+        "pos": round(pos, 0) if pos is not None else None,
+        "ma_align": ma_align,
+        "min_amp": min_amp,
+        "buy_price": suggested["buy_price"],
+        "sell_price": suggested["sell_price"],
+    }
+
+
+def suggested_position_price(klines: List[KlineData], price: float, action: str) -> float:
+    """根据日K支撑压力位计算加减仓建议挂单价。
+
+    加仓 → 加仓挂单价：下方最近支撑 + ATR/4 缓冲（不高于现价）
+    减仓 → 减仓挂单价：上方最近压力 − ATR/4 缓冲（不低于现价）
+    """
+    try:
+        sr = calc_support_resistance(klines, lookback=20, price=price)
+    except Exception:
+        sr = None
+
+    atr = (sr.atr if sr and sr.atr else price * 0.01)
+    if action == PositionSignal.ACTION_ADD:
+        if sr and sr.support:
+            suggested = sr.support + atr / 4
+            return round(min(suggested, price), 3)
+        return round(price * 0.99, 3)  # 无支撑，现价下方 1% 低吸
+    # 减仓
+    if sr and sr.resistance:
+        suggested = sr.resistance - atr / 4
+        return round(max(suggested, price), 3)
+    return round(price * 1.01, 3)  # 无压力，现价上方 1% 高抛
+
+
+def evaluate_position_signal(item: WatchItem, quote: Quote,
+                             daily_klines: Optional[List[KlineData]]) -> Optional[PositionSignal]:
+    """评估单个持仓的加减仓信号（基于日K周期阶段 detect_stage）。
+
+    纯函数，供实时线程与 scan_position 批量扫描共用。
+    """
+    price = quote.price or quote.pre_close or 0
+    if price <= 0:
+        return None
+    if not daily_klines or len(daily_klines) < 20:
+        return None
+
+    try:
+        stage_result = detect_stage(daily_klines)
+    except Exception as e:
+        log.debug(f"加减仓阶段判定失败 {item.code}: {e}")
+        return None
+
+    action = _STAGE_TO_ACTION.get(stage_result.stage)
+    if not action:
+        return None
+
+    reasons = list(stage_result.reasons or [])
+    # 左侧加仓信号补一句操作口径：区分「埋伏」与「接刀」，避免与 detect_stage 原文冲突
+    if action == PositionSignal.ACTION_ADD:
+        if stage_result.stage == "磨底期":
+            reasons.insert(0, "左侧埋伏：缩量超卖抛压衰竭，分批、破位止损")
+        elif stage_result.stage == "下跌期":
+            reasons.insert(0, "左侧接刀：仍在下跌，仅轻仓试探、破位止损")
+
+    # 建议挂单价：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
+    suggested = suggested_position_price(daily_klines, price, action)
+
+    return PositionSignal(
+        code=item.code, name=item.name, action=action,
+        stage=stage_result.stage, confidence=stage_result.confidence,
+        reasons=reasons, price=price, suggested_price=suggested,
+    )
+
+
 class T0MonitorThread(threading.Thread):
     """
     做T监控线程
@@ -370,11 +496,10 @@ class T0MonitorThread(threading.Thread):
         if intrabar["amplitude_low"]:
             return None
 
-        # 窄幅震荡过滤（回测：此状态下胜率45.6%，均收益-0.32%）
-        from app.technical import detect_market_regime
-        regime = detect_market_regime(tech, price, sr.atr)
-        if regime.regime == "窄幅震荡":
-            return None
+        # 5分钟均线排列 → 单边/震荡。这里不能用 detect_market_regime 判「窄幅震荡」——
+        # 它的 bb_width<5% 阈值按日K校准，喂 5 分钟K线时几乎恒判「窄幅震荡」，误杀全部信号。
+        # 窄幅/无空间的过滤已由上面的 range_width 与 intrabar 振幅门槛覆盖。
+        ma_align = tech.ma_alignment
 
         # 计算建议挂单价格
         suggested = _compute_suggested_prices(sr, price, quote)
@@ -400,11 +525,11 @@ class T0MonitorThread(threading.Thread):
         MIN_RR_BUY = 0.15 if sup_confluence >= 2 else (0.2 if sup_confluence >= 1 else 0.3)
         MIN_RR_SELL = 0.15 if res_confluence >= 2 else (0.2 if res_confluence >= 1 else 0.3)
 
-        # 市场状态自适应：趋势市调整 RR 阈值
-        if regime.regime == "趋势上涨":
+        # 市场状态自适应：5分钟均线排列判断单边趋势，趋势市调整 RR 阈值
+        if ma_align == "多头排列":
             MIN_RR_BUY = max(0.10, MIN_RR_BUY - 0.05)  # 顺势买入门槛更低
             MIN_RR_SELL = min(0.40, MIN_RR_SELL + 0.10)  # 逆势卖出门槛更高
-        elif regime.regime == "趋势下跌":
+        elif ma_align == "空头排列":
             MIN_RR_BUY = min(0.40, MIN_RR_BUY + 0.10)
             MIN_RR_SELL = max(0.10, MIN_RR_SELL - 0.05)
 
@@ -541,64 +666,8 @@ class T0MonitorThread(threading.Thread):
 
     def _evaluate_position_signal(self, item: WatchItem, quote: Quote) -> Optional[PositionSignal]:
         """评估单个持仓的加减仓信号（基于日K周期阶段 detect_stage）"""
-        price = quote.price or quote.pre_close or 0
-        if price <= 0:
-            return None
-
         klines = self._get_daily_klines(item)
-        if not klines or len(klines) < 20:
-            return None
-
-        try:
-            stage_result = detect_stage(klines)
-        except Exception as e:
-            log.debug(f"加减仓阶段判定失败 {item.code}: {e}")
-            return None
-
-        action = _STAGE_TO_ACTION.get(stage_result.stage)
-        if not action:
-            return None
-
-        reasons = list(stage_result.reasons or [])
-        # 左侧加仓信号补一句操作口径：区分「埋伏」与「接刀」，避免与 detect_stage 原文冲突
-        if action == PositionSignal.ACTION_ADD:
-            if stage_result.stage == "磨底期":
-                reasons.insert(0, "左侧埋伏：缩量超卖抛压衰竭，分批、破位止损")
-            elif stage_result.stage == "下跌期":
-                reasons.insert(0, "左侧接刀：仍在下跌，仅轻仓试探、破位止损")
-
-        # 建议挂单价：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
-        suggested = self._suggested_position_price(klines, price, action)
-
-        return PositionSignal(
-            code=item.code, name=item.name, action=action,
-            stage=stage_result.stage, confidence=stage_result.confidence,
-            reasons=reasons, price=price, suggested_price=suggested,
-        )
-
-    @staticmethod
-    def _suggested_position_price(klines: List[KlineData], price: float, action: str) -> float:
-        """根据日K支撑压力位计算加减仓建议挂单价。
-
-        加仓 → 加仓挂单价：下方最近支撑 + ATR/4 缓冲（不高于现价）
-        减仓 → 减仓挂单价：上方最近压力 − ATR/4 缓冲（不低于现价）
-        """
-        try:
-            sr = calc_support_resistance(klines, lookback=20, price=price)
-        except Exception:
-            sr = None
-
-        atr = (sr.atr if sr and sr.atr else price * 0.01)
-        if action == PositionSignal.ACTION_ADD:
-            if sr and sr.support:
-                suggested = sr.support + atr / 4
-                return round(min(suggested, price), 3)
-            return round(price * 0.99, 3)  # 无支撑，现价下方 1% 低吸
-        # 减仓
-        if sr and sr.resistance:
-            suggested = sr.resistance - atr / 4
-            return round(max(suggested, price), 3)
-        return round(price * 1.01, 3)  # 无压力，现价上方 1% 高抛
+        return evaluate_position_signal(item, quote, klines)
 
     def _scan_position_signals(self) -> list[PositionSignal]:
         """扫描持仓的加减仓信号（只对持仓，节流扫描）"""

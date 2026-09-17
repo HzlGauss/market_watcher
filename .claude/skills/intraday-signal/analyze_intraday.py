@@ -61,7 +61,7 @@ from app.technical import (
     is_low_volume,
     is_stagflation,
 )
-from app.t0_monitor import _compute_suggested_prices
+from app.t0_monitor import evaluate_t0_measure
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -343,51 +343,28 @@ def _print_t0_measure(code: str, market: str, q: Quote):
     if not klines:
         print("  ⚠️ 未查到 5 分钟 K 线数据，无法做 T 测算")
         return
-    sr = calc_support_resistance(klines, lookback=40)
-    tech = get_technical_summary(q, klines)
-    price = q.price or q.pre_close or 0
-    if price <= 0:
+    if (q.price or q.pre_close or 0) <= 0:
         print("  ⚠️ 无有效现价")
         return
-    print(f"  支撑 {_f(sr.support)}  压力 {_f(sr.resistance)}  ATR {_f(sr.atr, 3)}")
-    # 日内振幅与位置
-    is_etf = q.type and "ETF" in q.type
-    min_amp = 0.8 if is_etf else 1.5
-    amp = pos = None
-    if q.high and q.low and q.pre_close and q.high > q.low:
-        amp = (q.high - q.low) / q.pre_close * 100
-        pos = (price - q.low) / (q.high - q.low) * 100
-    print(f"  日内振幅 {_f(amp, 2)}%  |  日内位置 {_f(pos, 0)}%  |  振幅门槛 {min_amp}%（{'ETF' if is_etf else '个股'}）")
 
-    regime = detect_market_regime(tech, price, sr.atr)
-    print(f"  市场状态(5min): {regime.regime}（置信度 {regime.confidence}）")
+    m = evaluate_t0_measure(q, klines)
+    is_etf = q.type and "ETF" in q.type
+    print(f"  支撑 {_f(m['support'])}  压力 {_f(m['resistance'])}  ATR {_f(m['atr'], 3)}")
+    print(f"  日内振幅 {_f(m['amp'], 2)}%  |  日内位置 {_f(m['pos'], 0)}%  |  振幅门槛 {m['min_amp']}%（{'ETF' if is_etf else '个股'}）")
+
+    # 5 分钟均线排列 → 单边 vs 震荡；做 T 只适合震荡（不接单边趋势）。
+    # 注意：单边/震荡判定在 evaluate_t0_measure 内直接用 tech.ma_alignment，不能用
+    # detect_market_regime（其 bb_width<5% 阈值按日K校准，喂 5 分钟K线几乎恒判「窄幅震荡」）。
+    is_trend = m["ma_align"] in ("多头排列", "空头排列")
+    print(f"  市场状态(5min): {m['ma_align']}（{'单边' if is_trend else '震荡'}）")
 
     # ---- 做 T 可行性硬门槛（稳健优先：默认不建议，全部满足才建议操作）----
-    reasons = []
-    # 1. 单边行情不做 T（趋势上涨/趋势下跌）
-    if regime.regime in ("趋势上涨", "趋势下跌"):
-        reasons.append(f"单边行情({regime.regime})，做 T 易踏空/套牢")
-    elif regime.regime == "窄幅震荡":
-        reasons.append("窄幅震荡（即将变盘），做 T 空间小、风险大")
-    # 2. 日内振幅不够，价差覆盖不了成本
-    if amp is None or amp < min_amp:
-        reasons.append(f"日内振幅不足({_f(amp, 2)}% < {min_amp}%)，无利润空间")
-    # 3. 支撑/压力区间过窄（至少 0.8% 覆盖成本 + 留利润）
-    if sr.support is None or sr.resistance is None:
-        reasons.append("无有效支撑/压力位")
-    else:
-        width_pct = (sr.resistance - sr.support) / price * 100
-        if width_pct < 0.8:
-            reasons.append(f"支撑压力区间过窄({_f(width_pct, 2)}% < 0.8%)，无利润空间")
-
-    # 无条件给出参考挂单价（技术位参考；是否建议操作由下方判定决定）
-    suggested = _compute_suggested_prices(sr, price, q)
-    if reasons:
-        print(f"  ❌ 今日不适合 T+0 操作：{'；'.join(reasons)}")
-        print(f"  参考挂单价（仅技术位参考，不建议下单）: 买入 {_f(suggested['buy_price'], 3)}   卖出 {_f(suggested['sell_price'], 3)}")
+    if not m["suitable"]:
+        print(f"  ❌ 今日不适合 T+0 操作：{'；'.join(m['reasons'])}")
+        print(f"  参考挂单价（仅技术位参考，不建议下单）: 买入 {_f(m['buy_price'], 3)}   卖出 {_f(m['sell_price'], 3)}")
     else:
         print(f"  ✅ 适合做 T（震荡 + 振幅/区间充足）")
-        print(f"  做 T 建议买单: {_f(suggested['buy_price'], 3)}   卖单: {_f(suggested['sell_price'], 3)}")
+        print(f"  做 T 建议买单: {_f(m['buy_price'], 3)}   卖单: {_f(m['sell_price'], 3)}")
 
 
 # ---------------------------------------------------------------- 抄底信号
