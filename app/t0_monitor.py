@@ -8,6 +8,7 @@ import threading
 import time
 import logging
 import os
+import re
 from datetime import datetime
 from typing import List, Optional, Dict
 
@@ -165,6 +166,129 @@ def _compute_suggested_prices(sr, price: float, quote: Quote) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 分时量能走势
+
+_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_TIME_RE = re.compile(r"(\d{2}):(\d{2})")
+
+
+def _bar_time(date_str: str) -> tuple[str, Optional[int]]:
+    """从 bar.date 提取 (日期 'YYYY-MM-DD', 分钟数 int)。分钟数 = 小时*60+分钟，解析失败 None。"""
+    d = _DATE_RE.search(date_str or "")
+    day = d.group(1) if d else ""
+    t = _TIME_RE.search(date_str or "")
+    minutes = int(t.group(1)) * 60 + int(t.group(2)) if t else None
+    return day, minutes
+
+
+def _mean_vol(bars: list[KlineData]) -> Optional[float]:
+    """bar 平均成交量（跳过 None/<=0）。"""
+    vols = [b.volume for b in bars if b.volume is not None and b.volume > 0]
+    return sum(vols) / len(vols) if vols else None
+
+
+def analyze_intraday_volume(min_klines: Optional[List[KlineData]]) -> dict:
+    """盘中分时量能走势分析（5 分钟 K 线）。
+
+    输入 5 分钟 K 线（可能含今日+前日，按时间升序），自动筛出「最后一根 bar 所在交易日」
+    的今日 bar，切分早盘/午盘/尾盘，输出三个维度：
+
+    - 量能趋势 trend：早盘 vs 午盘均量对比（持续放量 / 持续缩量 / 量能平稳）
+    - 量价配合 vol_price：上涨 bar 均量 vs 下跌 bar 均量（上涨放量下跌缩量=健康 /
+      上涨缩量下跌放量=出货/抛压，即「价涨量能跟不上」）
+    - 尾盘异动 tail：最后 30 分钟量能 vs 全天均量（放量拉升 / 放量跳水 / 缩量 / 未到尾盘）
+
+    返回 dict；bar 不足时 ok=False 并给 note。量能用比值，不受 volume 单位影响。
+    """
+    if not min_klines:
+        return {"ok": False, "note": "无 5 分钟 K 线数据"}
+
+    parsed = []
+    for b in min_klines:
+        day, minutes = _bar_time(b.date)
+        if day and minutes is not None:
+            parsed.append((day, minutes, b))
+    if not parsed:
+        return {"ok": False, "note": "5 分钟 K 线时间戳无法解析"}
+
+    today = parsed[-1][0]  # 升序最后一根 = 最新交易日
+    today_bars = [(m, b) for d, m, b in parsed if d == today]
+    if len(today_bars) < 3:
+        return {"ok": False, "note": f"今日 bar 不足（仅 {len(today_bars)} 根）"}
+
+    # 切分时段（A股交易时段分钟数）：早盘 9:30-11:30，午盘 13:00-15:00，尾盘 14:30-15:00
+    am = [b for m, b in today_bars if 570 <= m <= 690]
+    pm = [b for m, b in today_bars if 780 <= m <= 900]
+    tail = [b for m, b in today_bars if m >= 870]
+
+    out: dict = {"ok": True, "n_bars": len(today_bars),
+                 "trend": "数据不足", "trend_ratio": None,
+                 "vol_price": "数据不足", "up_vol_ratio": None,
+                 "tail": "数据不足", "tail_ratio": None}
+
+    # ---- 量能趋势：早盘 vs 午盘 ----
+    am_vol, pm_vol = _mean_vol(am), _mean_vol(pm)
+    if am_vol and pm_vol:
+        ratio = pm_vol / am_vol
+        out["trend_ratio"] = round(ratio, 2)
+        if ratio >= 1.2:
+            out["trend"] = "持续放量（午后放量）"
+        elif ratio <= 0.8:
+            out["trend"] = "持续缩量（午后缩量）"
+        else:
+            out["trend"] = "量能平稳"
+    elif am_vol and not pm_vol:
+        out["trend"] = "盘中（仅早盘，午盘未走完）"
+    elif pm_vol and not am_vol:
+        out["trend"] = "盘中（仅午盘）"
+
+    # ---- 量价配合：上涨 bar 均量 vs 下跌 bar 均量（bar 内 close vs open）----
+    up_bars, down_bars = [], []
+    for _, b in today_bars:
+        if b.close is None or b.open is None:
+            continue
+        if b.close > b.open:
+            up_bars.append(b)
+        elif b.close < b.open:
+            down_bars.append(b)
+    up_vol, down_vol = _mean_vol(up_bars), _mean_vol(down_bars)
+    if up_vol and down_vol:
+        ratio = up_vol / down_vol
+        out["up_vol_ratio"] = round(ratio, 2)
+        if ratio >= 1.2:
+            out["vol_price"] = "上涨放量、下跌缩量（健康，价量配合）"
+        elif ratio <= 0.8:
+            out["vol_price"] = "上涨缩量、下跌放量（出货/抛压，追高无力）"
+        else:
+            out["vol_price"] = "量价中性"
+    elif up_vol and not down_vol:
+        out["vol_price"] = "单边上涨（无量下跌参考）"
+    elif down_vol and not up_vol:
+        out["vol_price"] = "单边下跌（无量上涨参考）"
+
+    # ---- 尾盘异动：最后 30 分钟 vs 全天 ----
+    tail_vol, all_vol = _mean_vol(tail), _mean_vol([b for _, b in today_bars])
+    if len(tail) >= 2 and tail_vol and all_vol:
+        ratio = tail_vol / all_vol
+        out["tail_ratio"] = round(ratio, 2)
+        if ratio >= 1.5:
+            # 尾盘方向：最后一根 close vs 尾盘第一根 open
+            first_open = tail[0].open
+            last_close = tail[-1].close
+            if None not in (first_open, last_close):
+                out["tail"] = "尾盘放量拉升" if last_close > first_open else "尾盘放量跳水"
+            else:
+                out["tail"] = "尾盘放量"
+        elif ratio <= 0.7:
+            out["tail"] = "尾盘缩量"
+        else:
+            out["tail"] = "尾盘平稳"
+    elif len(tail) < 2:
+        out["tail"] = "未到尾盘"
+
+    return out
+
+
 def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
     """做 T 可行性评估（简单三门槛：非单边 / 振幅够 / 区间够）。
 
@@ -209,6 +333,11 @@ def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
         if width_pct < 0.8:
             reasons.append(f"支撑压力区间过窄({width_pct:.2f}% < 0.8%)，无利润空间")
 
+    # ---- 分时量能维度（硬门槛：量价背离 → 不适合做T）----
+    vol_info = analyze_intraday_volume(min_klines)
+    if vol_info["ok"] and vol_info["vol_price"] == "上涨缩量、下跌放量（出货/抛压，追高无力）":
+        reasons.append("量价背离：上涨缩量/下跌放量，追高易被套")
+
     suggested = (_compute_suggested_prices(sr, price, quote) if price > 0
                  else {"buy_price": 0.0, "sell_price": 0.0})
 
@@ -224,6 +353,9 @@ def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
         "min_amp": min_amp,
         "buy_price": suggested["buy_price"],
         "sell_price": suggested["sell_price"],
+        "vol_trend": vol_info["trend"],
+        "vol_price": vol_info["vol_price"],
+        "vol_tail": vol_info["tail"],
     }
 
 
@@ -252,10 +384,13 @@ def suggested_position_price(klines: List[KlineData], price: float, action: str)
 
 
 def evaluate_position_signal(item: WatchItem, quote: Quote,
-                             daily_klines: Optional[List[KlineData]]) -> Optional[PositionSignal]:
+                             daily_klines: Optional[List[KlineData]],
+                             min_klines: Optional[List[KlineData]] = None) -> Optional[PositionSignal]:
     """评估单个持仓的加减仓信号（基于日K周期阶段 detect_stage）。
 
     纯函数，供实时线程与 scan_position 批量扫描共用。
+    可选传入 min_klines（5 分钟 K 线）做分时量价软提示——仅追加到 reasons，
+    不改变 stage/action/confidence（日K慢变量 + 分时快变量，时间尺度不同）。
     """
     price = quote.price or quote.pre_close or 0
     if price <= 0:
@@ -280,6 +415,18 @@ def evaluate_position_signal(item: WatchItem, quote: Quote,
             reasons.insert(0, "左侧埋伏：缩量超卖抛压衰竭，分批、破位止损")
         elif stage_result.stage == "下跌期":
             reasons.insert(0, "左侧接刀：仍在下跌，仅轻仓试探、破位止损")
+
+    # 分时量价软提示（仅作时机参考，不改阶段判定）
+    if min_klines:
+        try:
+            vol_info = analyze_intraday_volume(min_klines)
+        except Exception:
+            vol_info = {"ok": False, "vol_price": ""}
+        if vol_info.get("ok") and vol_info.get("vol_price", "").startswith("上涨缩量、下跌放量"):
+            if action == PositionSignal.ACTION_ADD:
+                reasons.append("分时量价背离：价涨缩量/下跌放量，诱多嫌疑，暂缓加仓等放量确认")
+            else:
+                reasons.append("分时量价背离：价涨缩量/下跌放量，派发确认，减仓更坚决")
 
     # 建议挂单价：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
     suggested = suggested_position_price(daily_klines, price, action)

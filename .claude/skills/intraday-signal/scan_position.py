@@ -17,6 +17,7 @@
 """
 import csv
 import sys
+import time
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
@@ -112,7 +113,14 @@ def main():
         if q is None:
             continue
         klines = _fetch_daily(item.code, item.market)
-        sig = evaluate_position_signal(item, q, klines)
+        # 5分钟K线 → 分时量价软提示（失败/非交易时段静默跳过，不影响日K阶段判定）
+        min_klines = None
+        try:
+            time.sleep(0.3)  # 降低请求频率，避免新浪 456 限频
+            min_klines = fetch_historical_kline(item.code, item.market, days=2, scale=5)
+        except Exception:
+            min_klines = None
+        sig = evaluate_position_signal(item, q, klines, min_klines)
         if sig:
             signals.append(sig)
 

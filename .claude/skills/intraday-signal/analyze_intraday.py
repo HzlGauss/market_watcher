@@ -61,7 +61,7 @@ from app.technical import (
     is_low_volume,
     is_stagflation,
 )
-from app.t0_monitor import evaluate_t0_measure
+from app.t0_monitor import evaluate_t0_measure, analyze_intraday_volume
 
 _DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -365,6 +365,32 @@ def _print_t0_measure(code: str, market: str, q: Quote):
     else:
         print(f"  ✅ 适合做 T（震荡 + 振幅/区间充足）")
         print(f"  做 T 建议买单: {_f(m['buy_price'], 3)}   卖单: {_f(m['sell_price'], 3)}")
+    return klines
+
+
+def _print_intraday_volume(code: str, market: str, min_klines=None):
+    """【6 盘中量能走势】分时量能三维度：量能趋势 / 量价配合 / 尾盘异动。
+
+    数据源 = 5 分钟 K 线（复用做T测算同一份），核心回答「价涨量能有没有持续跟上」——
+    上涨缩量、下跌放量 = 追高无力，大概率回落；上涨放量、下跌缩量 = 健康。
+    """
+    print()
+    print("=" * 72)
+    print("【6. 盘中量能走势（5 分钟 K 线）】")
+    print("=" * 72)
+    if min_klines is None:
+        min_klines = _fetch_min_klines(code, market)
+    info = analyze_intraday_volume(min_klines)
+    if not info["ok"]:
+        print(f"  ⚠️ {info['note']}")
+        return
+    print(f"  今日 bar 数 {info['n_bars']}")
+    print(f"  量能趋势: {info['trend']}"
+          + (f"（午后/早盘量比 {info['trend_ratio']}）" if info["trend_ratio"] is not None else ""))
+    print(f"  量价配合: {info['vol_price']}"
+          + (f"（上涨/下跌量比 {info['up_vol_ratio']}）" if info["up_vol_ratio"] is not None else ""))
+    print(f"  尾盘异动: {info['tail']}"
+          + (f"（尾盘/全天量比 {info['tail_ratio']}）" if info["tail_ratio"] is not None else ""))
 
 
 # ---------------------------------------------------------------- 抄底信号
@@ -434,7 +460,7 @@ def _print_bottom_signal(code: str, market: str, days: int, q: Quote,
                          klines: list[KlineData] | None):
     print()
     print("=" * 72)
-    print("【6. 抄底信号测算（深度回撤 + 止跌确认）】")
+    print("【7. 抄底信号测算（深度回撤 + 止跌确认）】")
     print("=" * 72)
     if not klines:
         print("  ⚠️ 无日 K 线数据，无法测算抄底信号")
@@ -786,7 +812,10 @@ def main():
     flow_sum = _print_flow_trend(code, name, mx)
 
     # ---- 做 T 测算（5 分钟 K 线）----
-    _print_t0_measure(code, market, q)
+    min_klines = _print_t0_measure(code, market, q)
+
+    # ---- 盘中量能走势（复用做T的5分钟K线）----
+    _print_intraday_volume(code, market, min_klines)
 
     # ---- 抄底信号测算（深度回撤 + 参考确认）----
     _print_bottom_signal(code, market, days, q, ff, flow_sum, klines)
