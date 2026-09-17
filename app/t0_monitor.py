@@ -580,8 +580,8 @@ class T0MonitorThread(threading.Thread):
     def _suggested_position_price(klines: List[KlineData], price: float, action: str) -> float:
         """根据日K支撑压力位计算加减仓建议挂单价。
 
-        加仓 → 买入挂单价：下方最近支撑 + ATR/4 缓冲（不高于现价）
-        减仓 → 卖出挂单价：上方最近压力 − ATR/4 缓冲（不低于现价）
+        加仓 → 加仓挂单价：下方最近支撑 + ATR/4 缓冲（不高于现价）
+        减仓 → 减仓挂单价：上方最近压力 − ATR/4 缓冲（不低于现价）
         """
         try:
             sr = calc_support_resistance(klines, lookback=20, price=price)
@@ -659,7 +659,7 @@ class T0MonitorThread(threading.Thread):
         print(f"{'='*75}")
         for s in adds + reduces:
             reasons = "；".join(s.reasons)
-            side = "买入" if s.action == PositionSignal.ACTION_ADD else "卖出"
+            side = "加仓" if s.action == PositionSignal.ACTION_ADD else "减仓"
             sugg = f"  建议{side}挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
@@ -693,7 +693,7 @@ class T0MonitorThread(threading.Thread):
             lines.append(f"## {label}\n")
             for s in group:
                 reasons = "；".join(s.reasons)
-                side = "买入" if s.action == PositionSignal.ACTION_ADD else "卖出"
+                side = "加仓" if s.action == PositionSignal.ACTION_ADD else "减仓"
                 sugg = f"｜建议{side}挂单价 **{s.suggested_price:.2f}**" if s.suggested_price > 0 else ""
                 lines.append(f"- {s.action_label} **{s.name}({s.code})**  现价 {s.price:.2f}｜"
                              f"阶段 **{s.stage}**｜置信 {s.confidence_label}({s.confidence}%){sugg}")
