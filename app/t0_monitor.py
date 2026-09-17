@@ -653,6 +653,9 @@ class T0MonitorThread(threading.Thread):
         now_str = datetime.now().strftime("%H:%M:%S")
         adds = [s for s in signals if s.action == PositionSignal.ACTION_ADD]
         reduces = [s for s in signals if s.action == PositionSignal.ACTION_REDUCE]
+        # 按置信度降序，高的在前
+        adds.sort(key=lambda s: s.confidence, reverse=True)
+        reduces.sort(key=lambda s: s.confidence, reverse=True)
 
         print(f"\n{'='*75}")
         print(f"  🚨 加减仓信号汇总（{now_str}）[日K周期阶段]")
@@ -677,6 +680,9 @@ class T0MonitorThread(threading.Thread):
 
         adds = [s for s in signals if s.action == PositionSignal.ACTION_ADD]
         reduces = [s for s in signals if s.action == PositionSignal.ACTION_REDUCE]
+        # 按置信度降序，高的在前
+        adds.sort(key=lambda s: s.confidence, reverse=True)
+        reduces.sort(key=lambda s: s.confidence, reverse=True)
         now_str = datetime.now().strftime("%m-%d %H:%M")
 
         parts = []
