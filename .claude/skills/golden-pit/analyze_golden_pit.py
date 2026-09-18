@@ -248,9 +248,32 @@ def _print_volume(klines):
         print("  ⚠️ 量能数据不足")
 
 
-def _hithink_fundamental(code: str) -> dict:
-    """同花顺当前估值 + 最新财报指标（PE/PB/ROE/净利同比/营收同比），不依赖 MX_APIKEY。"""
-    f = {"pe": None, "pb": None, "roe": None, "profit_growth": None, "revenue_growth": None}
+def _local_fundamental(code: str) -> dict:
+    """本地 market.duckdb：估值历史分位 + 三张报表基本面，字段不足为 None。"""
+    out = {"pb_pct": None, "pe_pct": None, "roe": None, "profit_growth": None,
+           "revenue_growth": None, "pb": None, "pe": None}
+    try:
+        from app import fundamental_local
+        v = fundamental_local.valuation_percentile(code)
+        if v:
+            out["pb_pct"] = v.get("pb_pct")
+            out["pe_pct"] = v.get("pe_pct")
+        fs = fundamental_local.financial_snapshot(code)
+        if fs:
+            out["roe"] = fs.get("roe")
+            out["profit_growth"] = fs.get("profit_growth")
+            out["revenue_growth"] = fs.get("revenue_growth")
+    except Exception:
+        pass
+    return out
+
+
+def _hithink_fundamental(code: str, local: dict | None = None) -> dict:
+    """同花顺当前估值（PE/PB）+ 财务指标（本地三张报表优先、同花顺兜底），不依赖 MX_APIKEY。"""
+    local = local or {}
+    f = {"pe": None, "pb": None, "roe": local.get("roe"),
+         "profit_growth": local.get("profit_growth"),
+         "revenue_growth": local.get("revenue_growth")}
     try:
         from app import hithink
         vals = hithink.fetch_valuations_snapshot([code])
@@ -259,43 +282,56 @@ def _hithink_fundamental(code: str) -> dict:
             f["pb"] = vals[0].get("pb_mrq")
     except Exception:
         pass
-    try:
-        from app import hithink
-        ind = hithink.fetch_financial_indicators(code)
-        f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
-        f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
-        f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
-    except Exception:
-        pass
+    # 本地缺失的财务指标回退同花顺
+    if f["roe"] is None or f["profit_growth"] is None or f["revenue_growth"] is None:
+        try:
+            from app import hithink
+            ind = hithink.fetch_financial_indicators(code)
+            if f["roe"] is None:
+                f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
+            if f["profit_growth"] is None:
+                f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
+            if f["revenue_growth"] is None:
+                f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
+        except Exception:
+            pass
     return f
 
 
 def _print_fundamental(mx, code: str, name: str) -> dict:
-    """【4】估值低位 + 基本面：同花顺（当前估值+财报）+ 妙想（历史分位/股息率），返回 dict。"""
+    """【4】估值低位 + 基本面：同花顺（当前估值）+ 本地/同花顺（财报）+ 本地/妙想（历史分位），返回 dict。"""
     print()
     print("=" * 72)
-    print("【4. 估值低位 + 基本面（同花顺 + 妙想分位）】")
+    print("【4. 估值低位 + 基本面（本地库 + 同花顺 + 妙想分位）】")
     print("=" * 72)
     f = {"pb_pct": None, "pe_pct": None, "pe": None, "pb": None,
          "roe": None, "profit_growth": None, "revenue_growth": None}
 
-    # ---- 同花顺：当前估值 + 财务指标（主源，不依赖 MX_APIKEY）----
-    hf = _hithink_fundamental(code)
+    local = _local_fundamental(code)
+    f["pb_pct"] = local["pb_pct"]
+    f["pe_pct"] = local["pe_pct"]
+
+    # ---- 同花顺：当前估值 + 财务指标（本地三张报表优先、同花顺兜底）----
+    hf = _hithink_fundamental(code, local)
     f.update(hf)
-    print("  同花顺（当前估值 + 最新财报）:")
+    print("  同花顺（当前估值 + 最新财报，本地库兜底）:")
     print(f"    PE(TTM) {_f(f['pe'])}  |  PB {_f(f['pb'])}")
     print(f"    净利同比 {_fpct(f['profit_growth'])}  |  营收同比 {_fpct(f['revenue_growth'])}  |  ROE(加权) {_fpct(f['roe'])}")
 
-    # ---- 妙想：历史分位（PB/PE 分位 + 股息率）——同花顺估值端点不含历史分位 ----
-    if mx is None:
-        print("  （未配置 MX_APIKEY，PB/PE 历史分位跳过；ROE/净利同比已由同花顺补齐）")
+    # ---- 历史分位：本地 valuation_daily 优先，不足回退妙想（PB/PE 分位 + 股息率）----
+    if f["pb_pct"] is not None and f["pe_pct"] is not None:
+        print(f"  PB/PE 历史分位（本地逐日累积）: PB {_fpct(f['pb_pct'])}  |  PE {_fpct(f['pe_pct'])}")
+    elif mx is None:
+        print("  （本地估值累积不足且未配置 MX_APIKEY，PB/PE 历史分位跳过）")
     else:
         try:
             tables = mx.query_structured(f"{name} {code} 市盈率 历史分位 市净率 历史分位 股息率")
             if tables:
                 print(_render_tables(tables))
-                f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
-                f["pe_pct"] = _find_col_value(tables, "市盈率", "百分位")
+                if f["pb_pct"] is None:
+                    f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
+                if f["pe_pct"] is None:
+                    f["pe_pct"] = _find_col_value(tables, "市盈率", "百分位")
         except Exception:
             pass
 

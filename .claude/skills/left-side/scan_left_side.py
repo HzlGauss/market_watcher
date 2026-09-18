@@ -269,9 +269,32 @@ def _find_col_value(tables, *keywords) -> float | None:
     return None
 
 
-def _hithink_fundamental(code: str) -> dict:
-    """同花顺当前估值 + 最新财报指标（PE/PB/ROE/净利同比/营收同比），不依赖 MX_APIKEY。"""
-    f = {"pe": None, "pb": None, "roe": None, "profit_growth": None, "revenue_growth": None}
+def _local_fundamental(code: str) -> dict:
+    """本地 market.duckdb：估值历史分位 + 三张报表基本面，字段不足为 None。"""
+    out = {"pb_pct": None, "pe_pct": None, "roe": None, "profit_growth": None,
+           "revenue_growth": None, "pb": None, "pe": None}
+    try:
+        from app import fundamental_local
+        v = fundamental_local.valuation_percentile(code)
+        if v:
+            out["pb_pct"] = v.get("pb_pct")
+            out["pe_pct"] = v.get("pe_pct")
+        fs = fundamental_local.financial_snapshot(code)
+        if fs:
+            out["roe"] = fs.get("roe")
+            out["profit_growth"] = fs.get("profit_growth")
+            out["revenue_growth"] = fs.get("revenue_growth")
+    except Exception:
+        pass
+    return out
+
+
+def _hithink_fundamental(code: str, local: dict | None = None) -> dict:
+    """同花顺当前估值（PE/PB）+ 财务指标（本地三张报表优先、同花顺兜底），不依赖 MX_APIKEY。"""
+    local = local or {}
+    f = {"pe": None, "pb": None, "roe": local.get("roe"),
+         "profit_growth": local.get("profit_growth"),
+         "revenue_growth": local.get("revenue_growth")}
     try:
         from app import hithink
         vals = hithink.fetch_valuations_snapshot([code])
@@ -280,25 +303,32 @@ def _hithink_fundamental(code: str) -> dict:
             f["pb"] = vals[0].get("pb_mrq")
     except Exception:
         pass
-    try:
-        from app import hithink
-        ind = hithink.fetch_financial_indicators(code)
-        f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
-        f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
-        f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
-    except Exception:
-        pass
+    # 本地缺失的财务指标回退同花顺
+    if f["roe"] is None or f["profit_growth"] is None or f["revenue_growth"] is None:
+        try:
+            from app import hithink
+            ind = hithink.fetch_financial_indicators(code)
+            if f["roe"] is None:
+                f["roe"] = _num(ind.get("profitability", {}).get("index_weighted_avg_roe"))
+            if f["profit_growth"] is None:
+                f["profit_growth"] = _num(ind.get("growth", {}).get("calculate_parent_holder_net_profit_yoy_growth_ratio"))
+            if f["revenue_growth"] is None:
+                f["revenue_growth"] = _num(ind.get("growth", {}).get("calculate_operating_income_yoy_growth_ratio"))
+        except Exception:
+            pass
     return f
 
 
 def _fetch_fundamental(mx, name: str, code: str) -> dict:
-    """同花顺（ROE/净利同比/当前估值，主源）+ 妙想（PB 历史分位，兜底）→ dict。
+    """本地（market.duckdb 估值分位 + 三张报表，主源）→ 同花顺（当前估值/财报，兜底）→ 妙想（分位，兜底）。
 
-    mx 为 None（无 MX_APIKEY）时仅同花顺字段可用；同花顺估值端点不含历史分位，故 pb_pct 仍走妙想。
+    mx 为 None（无 MX_APIKEY）时 pb_pct 走本地分位、缺历史则显示 --。
     """
     f = {"pb_pct": None, "roe": None, "profit_growth": None, "pb": None, "pe": None}
-    f.update(_hithink_fundamental(code))
-    if mx is not None:
+    local = _local_fundamental(code)
+    f.update(_hithink_fundamental(code, local))
+    f["pb_pct"] = local["pb_pct"]
+    if f["pb_pct"] is None and mx is not None:
         try:
             tables = mx.query_structured(f"{name} {code} 市净率 历史分位")
             f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
@@ -353,7 +383,7 @@ def _fundamental_check(results, top: int) -> None:
     n_fund = min(top, len(results), 10)
     print()
     print("=" * 72)
-    print(f"基本面/估值确定性门槛（前 {n_fund} 名，同花顺 + 妙想分位）")
+    print(f"基本面/估值确定性门槛（前 {n_fund} 名，本地库 + 同花顺 + 妙想分位）")
     print("=" * 72)
     print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
     print("  " + "-" * 68)
@@ -368,7 +398,7 @@ def _fundamental_check(results, top: int) -> None:
         print(f"  {r['code']:<8}{r['name']:<10}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label} {note}")
     print()
     print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
-    print("  （ROE/净利同比/当前估值由同花顺直供；PB 历史分位需 MX_APIKEY，缺失时显示 --）")
+    print("  （ROE/净利同比/当前估值由本地库+同花顺直供；PB 历史分位优先本地逐日累积、不足回退妙想，缺失时显示 --）")
     print("  仅 ✅通过 才值得进一步看买点；❌/⚠️/待查 建议排除或人工补查后观望。")
 
 

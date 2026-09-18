@@ -332,20 +332,40 @@ def _find_col_value(tables, *keywords) -> float | None:
 
 
 def _fetch_fundamental(mx, name: str, code: str) -> dict:
-    """妙想结构化查询 → {pb_pct, roe, profit_growth}，失败字段为 None。"""
+    """本地（market.duckdb 估值分位 + 三张报表）优先 → 妙想兜底 → {pb_pct, roe, profit_growth}。
+
+    mx 为 None（无 MX_APIKEY）时仅本地字段可用，缺则 None。
+    """
     f = {"pb_pct": None, "roe": None, "profit_growth": None}
     try:
-        tables = mx.query_structured(f"{name} {code} 市净率 历史分位")
-        f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
+        from app import fundamental_local
+        v = fundamental_local.valuation_percentile(code)
+        if v:
+            f["pb_pct"] = v.get("pb_pct")
+        fs = fundamental_local.financial_snapshot(code)
+        if fs:
+            f["roe"] = fs.get("roe")
+            f["profit_growth"] = fs.get("profit_growth")
     except Exception:
         pass
+    if mx is None:
+        return f
+    if f["pb_pct"] is None:
+        try:
+            tables = mx.query_structured(f"{name} {code} 市净率 历史分位")
+            f["pb_pct"] = _find_col_value(tables, "市净率", "百分位")
+        except Exception:
+            pass
     time.sleep(0.4)
-    try:
-        tables = mx.query_structured(f"{name} {code} 最新财报 净利润 同比增长 ROE")
-        f["profit_growth"] = _find_col_value(tables, "净利润", "同比")
-        f["roe"] = _find_col_value(tables, "ROE")
-    except Exception:
-        pass
+    if f["roe"] is None or f["profit_growth"] is None:
+        try:
+            tables = mx.query_structured(f"{name} {code} 最新财报 净利润 同比增长 ROE")
+            if f["profit_growth"] is None:
+                f["profit_growth"] = _find_col_value(tables, "净利润", "同比")
+            if f["roe"] is None:
+                f["roe"] = _find_col_value(tables, "ROE")
+        except Exception:
+            pass
     return f
 
 
@@ -375,28 +395,31 @@ def _fund_gate(f: dict) -> tuple[str, str]:
 
 
 def _fundamental_check(results, top: int) -> None:
-    """对 top 候选跑估值分位 + 净利同比 + ROE 确定性门槛，否决/降级不达标者。"""
+    """对 top 候选跑估值分位 + 净利同比 + ROE 确定性门槛，否决/降级不达标者。
+
+    本地 market.duckdb（估值分位 + 三张报表）优先，妙想兜底；两者都无时字段为 None，
+    由 _fund_gate 判「-- 待查」。不再因缺 MX_APIKEY 跳过（本地数据可独立填字段）。
+    """
     try:
         from app.config import Config
         from app.utils import load_env
         from app.miaoxiang import MXClient
     except Exception:
         return
+    mx = None
     try:
         load_env(_ROOT)
         config = Config(_ROOT / "watchlist_config.json")
         keys = config.mx_apikeys
-        if not keys:
-            print("\n  （未配置 MX_APIKEY，跳过基本面/估值门槛；可对单只运行 analyze_golden_pit.py 细看）")
-            return
-        mx = MXClient(keys)
+        if keys:
+            mx = MXClient(keys)
     except Exception:
-        return
+        mx = None
 
     n_fund = min(top, len(results), 8)
     print()
     print("=" * 72)
-    print(f"基本面/估值确定性门槛（前 {n_fund} 名，妙想）")
+    print(f"基本面/估值确定性门槛（前 {n_fund} 名，本地库 + 妙想）")
     print("=" * 72)
     print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
     print("  " + "-" * 68)
