@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -85,15 +86,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
     print(f"  {Color.CYAN}W{Color.RESET}. Weekly Review (周报·持仓+自选)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
+    print(f"  {Color.CYAN}U{Color.RESET}. Data Sync (日K + 估值 本地库更新)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M/S/W/G]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G"):
+            choice = input(f" Enter option [0-9/D/M/S/W/G/U]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G", "U"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W or G{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W, G or U{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -1218,6 +1220,37 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         log.info("All threads stopped")
 
 
+def _run_data_sync() -> None:
+    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积。
+
+    两项都走 tools/marketdb_local.py 子命令（各自加载 .env 的 HITHINK_FINANCE_API_KEY）：
+    - sync: auto-sync 自动判断 skip/incremental/full，把本地日K补齐到最近交易日（T+1，最多到昨天）
+    - sync-valuation --all: 全市场估值快照落库（PE/PB/PS/PCF），历史分位需每日收盘后累积
+    """
+    tool = BASE_DIR / "tools" / "marketdb_local.py"
+    steps = [
+        ("日K 增量同步", ["sync"]),
+        ("估值快照累积", ["sync-valuation", "--all"]),
+    ]
+    print(f"\n{Color.BOLD}{Color.CYAN}🔄 数据更新（本地行情库）{Color.RESET}")
+    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）{Color.RESET}")
+    print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
+
+    for label, args in steps:
+        print(f"{Color.BOLD}{label}:{Color.RESET}")
+        try:
+            rc = subprocess.run(
+                [sys.executable, str(tool), *args],
+                cwd=str(BASE_DIR),
+            ).returncode
+            if rc == 0:
+                print(f"{Color.GREEN}  ✅ {label}完成{Color.RESET}\n")
+            else:
+                print(f"{Color.YELLOW}  ⚠️ {label}退出码 {rc}（可能已是最新，或触发同花顺限流，稍后重试）{Color.RESET}\n")
+        except Exception as e:
+            print(f"{Color.RED}  ❌ {label}失败: {e}{Color.RESET}\n")
+
+
 def main() -> None:
     """Main entry - menu selection mode"""
     if sys.platform == "win32":
@@ -1555,6 +1588,8 @@ def main() -> None:
                 print(f"{Color.RED}❌ 周报生成失败: {e}{Color.RESET}")
         elif choice == "M":
             _run_miaoxiang_menu(config)
+        elif choice == "U":
+            _run_data_sync()
 
 
 def _run_miaoxiang_menu(config: Config) -> None:
