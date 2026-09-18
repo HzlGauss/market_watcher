@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""加减仓批量扫描：扫描 holdings.csv 各持仓，按日K周期阶段给出加/减仓信号 + 建议挂单价。
+"""加减仓批量扫描：扫描 holdings.csv 各持仓，按日K周期阶段给出加/减仓信号 + 建议挂单区间。
 
 核心思路：
     1. 读 holdings.csv 持仓池
@@ -138,7 +138,12 @@ def main():
         print()
         print(f"  ── 🟢 加仓信号（{len(adds)} 只，按置信度降序）──")
         for s in shown:
-            sugg = f"｜建议挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
+            if s.suggested_high > s.suggested_low > 0 and (s.suggested_high - s.suggested_low) >= 0.005:
+                sugg = f"｜加仓挂单区间 {s.suggested_low:.2f}~{s.suggested_high:.2f}"
+            elif s.suggested_price > 0:
+                sugg = f"｜加仓挂单价 {s.suggested_price:.2f}"
+            else:
+                sugg = ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
@@ -149,7 +154,12 @@ def main():
         print()
         print(f"  ── 🔴 减仓信号（{len(reduces)} 只，按置信度降序）──")
         for s in shown:
-            sugg = f"｜建议挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
+            if s.suggested_high > s.suggested_low > 0 and (s.suggested_high - s.suggested_low) >= 0.005:
+                sugg = f"｜减仓挂单区间 {s.suggested_low:.2f}~{s.suggested_high:.2f}"
+            elif s.suggested_price > 0:
+                sugg = f"｜减仓挂单价 {s.suggested_price:.2f}"
+            else:
+                sugg = ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
@@ -158,7 +168,7 @@ def main():
     print()
     print("  说明:")
     print("    - 阶段映射：启动期/磨底期/下跌期=加仓（右侧/左侧埋伏/左侧接刀），赶顶期/派发期=减仓")
-    print("    - 置信度 = detect_stage 阶段判定置信；加仓挂单价=支撑上方低吸，减仓=压力下方高抛")
+    print("    - 置信度 = detect_stage 阶段判定置信；挂单区间=加仓支撑上方低吸、减仓压力下方高抛")
     print("    - 日K级慢变量，盘中/盘后均可运行；是否操作由 AI 依据 SKILL.md 框架生成")
     return 0
 

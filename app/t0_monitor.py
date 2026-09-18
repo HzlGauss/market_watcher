@@ -79,7 +79,8 @@ class PositionSignal:
 
     def __init__(self, code: str, name: str, action: str, stage: str,
                  confidence: int, reasons: list[str], price: float,
-                 suggested_price: float = 0.0):
+                 suggested_price: float = 0.0,
+                 suggested_low: float = 0.0, suggested_high: float = 0.0):
         self.code = code
         self.name = name
         self.action = action
@@ -88,6 +89,8 @@ class PositionSignal:
         self.reasons = reasons or []
         self.price = price
         self.suggested_price = suggested_price  # 建议挂单价（加仓=买入、减仓=卖出）
+        self.suggested_low = suggested_low      # 挂单区间下沿（加仓=买入、减仓=卖出）
+        self.suggested_high = suggested_high    # 挂单区间上沿
         self.timestamp = time.time()
 
     def is_valid(self, max_age: float = 900) -> bool:
@@ -383,6 +386,35 @@ def suggested_position_price(klines: List[KlineData], price: float, action: str)
     return round(price * 1.01, 3)  # 无压力，现价上方 1% 高抛
 
 
+def suggested_position_range(klines: List[KlineData], price: float, action: str) -> tuple[float, float]:
+    """根据日K支撑压力位计算加减仓建议挂单区间 (low, high)。
+
+    加仓 → 买入区间：下方支撑 ~ 支撑+ATR/2（不高于现价），支撑上方分批低吸
+    减仓 → 卖出区间：压力-ATR/2 ~ 上方压力（不低于现价），压力下方分批高抛
+    无支撑/压力时用现价 ±1~2% 兜底。返回的 (low, high) 已 round 到 3 位。
+    """
+    try:
+        sr = calc_support_resistance(klines, lookback=20, price=price)
+    except Exception:
+        sr = None
+    atr = (sr.atr if sr and sr.atr else price * 0.01)
+
+    if action == PositionSignal.ACTION_ADD:
+        support = (sr.support if sr and sr.support else price * 0.98)
+        low = round(support, 3)
+        high = round(min(support + atr / 2, price), 3)
+        if high <= low:  # 区间异常（支撑贴近现价）时退回 [low, price]
+            high = round(price, 3)
+        return low, high
+    # 减仓
+    resistance = (sr.resistance if sr and sr.resistance else price * 1.02)
+    low = round(max(price, resistance - atr / 2), 3)
+    high = round(resistance, 3)
+    if low >= high:  # 区间异常（压力贴近现价）时退回 [price, high]
+        low = round(price, 3)
+    return low, high
+
+
 def evaluate_position_signal(item: WatchItem, quote: Quote,
                              daily_klines: Optional[List[KlineData]],
                              min_klines: Optional[List[KlineData]] = None) -> Optional[PositionSignal]:
@@ -428,13 +460,15 @@ def evaluate_position_signal(item: WatchItem, quote: Quote,
             else:
                 reasons.append("分时量价背离：价涨缩量/下跌放量，派发确认，减仓更坚决")
 
-    # 建议挂单价：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
+    # 建议挂单区间：加仓=支撑上方低吸、减仓=压力下方高抛（复用日K支撑压力位）
     suggested = suggested_position_price(daily_klines, price, action)
+    suggested_low, suggested_high = suggested_position_range(daily_klines, price, action)
 
     return PositionSignal(
         code=item.code, name=item.name, action=action,
         stage=stage_result.stage, confidence=stage_result.confidence,
         reasons=reasons, price=price, suggested_price=suggested,
+        suggested_low=suggested_low, suggested_high=suggested_high,
     )
 
 
@@ -879,7 +913,12 @@ class T0MonitorThread(threading.Thread):
         for s in adds + reduces:
             reasons = "；".join(s.reasons)
             side = "加仓" if s.action == PositionSignal.ACTION_ADD else "减仓"
-            sugg = f"  建议{side}挂单价 {s.suggested_price:.2f}" if s.suggested_price > 0 else ""
+            if s.suggested_high > s.suggested_low > 0 and (s.suggested_high - s.suggested_low) >= 0.005:
+                sugg = f"  建议{side}挂单区间 {s.suggested_low:.2f}~{s.suggested_high:.2f}"
+            elif s.suggested_price > 0:
+                sugg = f"  建议{side}挂单价 {s.suggested_price:.2f}"
+            else:
+                sugg = ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
                   f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
             if reasons:
@@ -916,7 +955,12 @@ class T0MonitorThread(threading.Thread):
             for s in group:
                 reasons = "；".join(s.reasons)
                 side = "加仓" if s.action == PositionSignal.ACTION_ADD else "减仓"
-                sugg = f"｜建议{side}挂单价 **{s.suggested_price:.2f}**" if s.suggested_price > 0 else ""
+                if s.suggested_high > s.suggested_low > 0 and (s.suggested_high - s.suggested_low) >= 0.005:
+                    sugg = f"｜建议{side}挂单区间 **{s.suggested_low:.2f}~{s.suggested_high:.2f}**"
+                elif s.suggested_price > 0:
+                    sugg = f"｜建议{side}挂单价 **{s.suggested_price:.2f}**"
+                else:
+                    sugg = ""
                 lines.append(f"- {s.action_label} **{s.name}({s.code})**  现价 {s.price:.2f}｜"
                              f"阶段 **{s.stage}**｜置信 {s.confidence_label}({s.confidence}%){sugg}")
                 if reasons:
