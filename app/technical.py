@@ -116,6 +116,76 @@ def _fetch_tencent_minute_kline(code: str, market: str, scale: int, days: int) -
     return []
 
 
+def _fetch_min5_remote(code: str, market: str) -> list[KlineData]:
+    """远端拉 5 分钟 K 线（新浪 → 腾讯 → AKShare），供 min5_local 缓存层兜底。
+
+    固定 scale=5 / days=2 / datalen=120，即原 fetch_historical_kline 对 scale<240
+    生效的分钟线链路。返回空列表表示多源均失败。
+    """
+    prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
+    sina_code = f"{prefix}{code}"
+    url = (
+        f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={sina_code}&scale=5"
+        f"&ma=no&datalen=120"
+    )
+
+    resp = _sina_kline_get(url, retries=2)
+    if resp is not None:
+        try:
+            data = resp.json()
+            if data:
+                results: list[KlineData] = []
+                for item in data:
+                    results.append(KlineData(
+                        date=item.get("day", ""),
+                        open=_sf(item.get("open")),
+                        high=_sf(item.get("high")),
+                        low=_sf(item.get("low")),
+                        close=_sf(item.get("close")),
+                        volume=_sf(item.get("volume")),
+                    ))
+                if results:
+                    return results
+        except Exception as e:
+            log.warning(f"5分钟K线解析失败 {code}: {e}")
+
+    # 新浪失败 → 腾讯分钟线
+    tencent_k = _fetch_tencent_minute_kline(code, market, scale=5, days=2)
+    if tencent_k:
+        return tencent_k
+
+    # 腾讯失败 → AKShare 分钟兜底
+    try:
+        import akshare as ak
+        is_etf = code.startswith(("51", "56", "58", "15", "16", "18"))
+        if is_etf:
+            df = ak.fund_etf_hist_min_em(symbol=code, period="5")
+        else:
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="5")
+        if df is not None and not df.empty:
+            df = df.tail(120).reset_index(drop=True)
+            results = []
+            for _, row in df.iterrows():
+                results.append(KlineData(
+                    date=str(row.get("时间", "")),
+                    open=_sf(row.get("开盘")),
+                    high=_sf(row.get("最高")),
+                    low=_sf(row.get("最低")),
+                    close=_sf(row.get("收盘")),
+                    volume=_sf(row.get("成交量")),
+                ))
+            if results:
+                return results
+    except ImportError:
+        pass
+    except Exception as e:
+        log.warning(f"AKShare 5分钟K线获取失败 {code}: {e}")
+
+    log.warning(f"5分钟K线数据获取失败: {code}")
+    return []
+
+
 def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 240) -> list[KlineData]:
     """获取K线数据（多源兜底）
 
@@ -130,6 +200,18 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
     Returns:
         K线数据列表（按时间升序）
     """
+    # 5 分钟 K 线走本地 duckdb 缓存：先查库、只补增量、当天首次访问清理历史，
+    # 避免盯盘线程 + 多个 skill 高频打新浪 scale=5 接口触发 456 限流。
+    if scale == 5:
+        from app import min5_local
+        cached = min5_local.try_read_fresh(code, market)
+        if cached is not None:
+            return cached
+        remote = _fetch_min5_remote(code, market)
+        if remote:
+            min5_local.write(code, market, remote)
+        return remote
+
     prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
     sina_code = f"{prefix}{code}"
 
