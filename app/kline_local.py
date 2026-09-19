@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import datetime
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +33,87 @@ def _db_path() -> Path:
 def available() -> bool:
     """本地库是否存在（轻量，仅查文件，不 import marketdb）。"""
     return _db_path().exists()
+
+
+_REEXEC_ENV = "_MW_MARKETDB_REEXEC"
+
+
+def _imports_marketdb(py: str) -> bool:
+    """该解释器能否 import marketdb（用于探测正确的运行解释器）。"""
+    try:
+        r = subprocess.run([py, "-c", "import marketdb"], capture_output=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _candidate_pythons() -> list[str]:
+    """候选解释器路径：MARKETDB_PYTHON → 常见 conda 安装（跨平台）。"""
+    out = []
+    explicit = os.environ.get("MARKETDB_PYTHON")
+    if explicit:
+        out.append(explicit)
+    home = Path.home()
+    if os.name == "nt":  # Windows
+        for name in ("miniconda3", "anaconda3", "miniforge3", "mambaforge"):
+            out.append(str(home / name / "python.exe"))
+            out.append(str(home / "AppData" / "Local" / name / "python.exe"))
+    else:  # macOS / Linux
+        for name in ("miniconda3", "anaconda3", "miniforge3", "mambaforge"):
+            out.append(str(home / name / "bin" / "python3"))
+            out.append(str(home / name / "bin" / "python"))
+    return out
+
+
+def _find_marketdb_python() -> Optional[str]:
+    """找一个已安装 marketdb 的解释器：先 load_env 注入 .env 的 MARKETDB_PYTHON，再探测 conda 路径。"""
+    try:
+        from .utils import load_env
+        load_env(_ROOT)  # 注入 .env 的 MARKETDB_PYTHON（每台机器各自配置本机路径）
+    except Exception:
+        pass
+    seen = set()
+    for py in _candidate_pythons():
+        if not py or py in seen or py == sys.executable:
+            continue
+        seen.add(py)
+        if os.path.exists(py) and _imports_marketdb(py):
+            return py
+    return None
+
+
+_warned_local_db = False
+
+
+def ensure_marketdb_interpreter() -> None:
+    """当前解释器缺 marketdb 时，自动切换到已装 marketdb 的解释器重跑（os.execv 替换进程）。
+
+    用于 skill 批量扫描：本地库日 K 是主源，用错解释器会静默回退新浪并触发 456 限流。
+    主程序（__main__.py）不依赖本地库也能跑，故不在此自动切换（仅由 skill 脚本路径调用）。
+    找不到可用解释器时打印一次警告，避免静默降级。
+    """
+    global _warned_local_db
+    try:
+        import marketdb  # noqa: F401
+        return  # 当前解释器已具备，无需切换
+    except Exception:
+        pass
+    if os.environ.get(_REEXEC_ENV):
+        return  # 已切换过一次仍失败，放弃，避免死循环
+    if not available():
+        return  # 本地库不存在，走新浪是预期（新环境未 bootstrap），不提示
+    py = _find_marketdb_python()
+    if py and py != sys.executable:
+        os.environ[_REEXEC_ENV] = "1"
+        os.execv(py, [py, *sys.argv])
+        return
+    if not _warned_local_db:
+        _warned_local_db = True
+        print("⚠️ 本地库 data/market.duckdb 存在，但当前解释器缺 marketdb，且未找到可用解释器",
+              file=sys.stderr)
+        print("   → 已回退新浪日K（批量扫描可能触发 456 限流、候选不全）。", file=sys.stderr)
+        print("   → 解决：在 .env 配置 MARKETDB_PYTHON 指向已装 marketdb 的解释器（每台机器各自配置本机路径）。",
+              file=sys.stderr)
 
 
 def _f(v) -> Optional[float]:
@@ -123,5 +206,6 @@ def fetch_daily_local_first(code: str, market: str, days: int = 60) -> list[Klin
     local = fetch_daily(code, market, days)
     if local:
         return local
+    ensure_marketdb_interpreter()  # 本地库存在却读不到 → 多为解释器缺 marketdb，尝试切解释器重跑
     from .technical import fetch_historical_kline
     return fetch_historical_kline(code, market, days=days, scale=240)

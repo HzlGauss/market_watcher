@@ -107,6 +107,12 @@ def main():
     quotes = fetch_quotes(items) or []
     quote_map = {q.code: q for q in quotes}
 
+    try:
+        from app import kline_local
+        kline_local.ensure_marketdb_interpreter()
+    except Exception:
+        pass
+
     signals = []
     for h, item in zip(holdings, items):
         q = quote_map.get(item.code)
