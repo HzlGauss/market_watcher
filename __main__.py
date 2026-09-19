@@ -1236,11 +1236,16 @@ def _run_data_sync() -> None:
     print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）{Color.RESET}")
     print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
 
+    # marketdb/duckdb 装在独立环境（如 miniconda）时，用 MARKETDB_PYTHON 指定其解释器，否则回退当前解释器
+    py = os.environ.get("MARKETDB_PYTHON") or sys.executable
+    if py != sys.executable:
+        print(f"{Color.DIM}  使用 marketdb 解释器: {py}{Color.RESET}\n")
+
     for label, args in steps:
         print(f"{Color.BOLD}{label}:{Color.RESET}")
         try:
             rc = subprocess.run(
-                [sys.executable, str(tool), *args],
+                [py, str(tool), *args],
                 cwd=str(BASE_DIR),
             ).returncode
             if rc == 0:
