@@ -211,6 +211,127 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
     }
 
 
+def _score_pullback(code: str, stock: dict, klines, turnover: float | None = None) -> dict | None:
+    """右侧「回踩买点」检测：趋势多头 + 近期创过新高 + 现价回踩缩量 + 未破 MA20。
+
+    与 _score_candidate（突破日追入）互补：突破日是最延伸处、追高易接盘；回踩
+    MA5/MA10/突破位附近是趋势内的优质赔率位。返回 dict 或 None（不满足条件）。
+
+    核心条件（全部满足才返回）：
+      1. 站上 MA20 且 MA20 走平向上（趋势未破）
+      2. 近 5 日内创过 20 日新高（突破发生在近期，而非早已走远/已走坏）
+      3. 现价从近期高点回撤 2%~10%（正在回踩，而非创新高追高）
+      4. 回踩缩量（今日量比 < 1.2，放量回调 = 出货嫌疑，排除）
+    """
+    n = len(klines)
+    if n < 60:
+        return None
+    closes = [k.close for k in klines]
+    if any(c is None for c in closes[-30:]):
+        return None
+    price = closes[-1]
+    if price is None or price <= 0:
+        return None
+
+    name = stock.get("name", "")
+    if "ST" in name.upper() or "退" in name:
+        return None
+
+    ma10 = calc_sma(closes, 10)[-1] if len(closes) >= 10 else None
+    ma20 = calc_sma(closes, 20)[-1] if len(closes) >= 20 else None
+    ma20_prev = calc_sma(closes, 20)[-6] if len(closes) >= 26 else None
+
+    # 1. 站上 MA20 且 MA20 走平向上（趋势未破）
+    if ma20 is None or price < ma20:
+        return None
+    ma20_rising = ma20_prev is not None and ma20 >= ma20_prev
+    if not ma20_rising:
+        return None
+
+    # 2. 近 5 日内创过 20 日新高
+    highs20 = [k.high for k in klines[-21:-1] if k.high is not None]
+    recent5 = [k.high for k in klines[-6:-1] if k.high is not None]
+    if len(highs20) < 5 or not recent5:
+        return None
+    high20 = max(highs20)
+    recent_high = max(recent5)
+    if recent_high < high20 * 0.99:
+        return None
+
+    # 3. 回撤幅度 2%~10%
+    if recent_high <= 0:
+        return None
+    drawdown = (recent_high - price) / recent_high * 100
+    if drawdown < 2.0 or drawdown > 10.0:
+        return None
+
+    # 4. 回踩缩量：今日量比 < 1.2
+    vols = [k.volume for k in klines if k.volume is not None]
+    vol_ratio = None
+    if len(vols) >= 6 and vols[-1] is not None:
+        prev5 = vols[-6:-1]
+        avg5 = sum(prev5) / len(prev5) if prev5 else None
+        vol_ratio = (vols[-1] / avg5) if (avg5 and avg5 > 0) else None
+    if vol_ratio is None or vol_ratio >= 1.2:
+        return None
+
+    # ---- 打分 0~100 ----
+    score = 40  # 核心条件满足的基础分
+
+    # 回撤深度（3~6% 健康回踩最优；太浅=没调够，太深=可能转弱）
+    if 3.0 <= drawdown <= 6.0:
+        score += 15
+    elif drawdown < 3.0:
+        score += 8
+    else:
+        score += 6
+
+    # 缩量程度（回踩量越小越健康）
+    if vol_ratio < 0.8:
+        score += 15
+    elif vol_ratio < 1.0:
+        score += 10
+    else:
+        score += 5
+
+    # 支撑贴近度：回踩到 MA10/MA20 附近加分
+    dist_ma10 = abs(price - ma10) / ma10 * 100 if ma10 else 999.0
+    dist_ma20 = abs(price - ma20) / ma20 * 100 if ma20 else 999.0
+    if dist_ma10 <= 2.0:
+        score += 15
+        align_txt = "回踩MA10"
+    elif dist_ma20 <= 2.0:
+        score += 10
+        align_txt = "回踩MA20"
+    elif ma10 is not None and price >= ma10:
+        score += 8
+        align_txt = "MA10上方"
+    else:
+        score += 4
+        align_txt = "MA10下方"
+
+    # 换手率（低换手回踩更健康）
+    if turnover is not None:
+        if 1.0 <= turnover < 4.0:
+            score += 5
+        elif turnover < 1.0:
+            score += 3
+
+    return {
+        "code": code,
+        "name": name,
+        "source": stock.get("source", ""),
+        "price": price,
+        "drawdown": round(drawdown, 1),
+        "vol_ratio": round(vol_ratio, 2),
+        "turnover": turnover,
+        "dist_ma10": round(dist_ma10, 1),
+        "align": align_txt,
+        "recent_high": round(recent_high, 2),
+        "score": score,
+    }
+
+
 def _verdict(score: int) -> str:
     if score >= 75:
         return "✅ 强"
@@ -393,31 +514,53 @@ def main():
         return 0
 
     results.sort(key=lambda x: -x["score"])
+    strong = [r for r in results if r["score"] >= 75]
+    mid = [r for r in results if 55 <= r["score"] < 75]
+    weak_n = len(results) - len(strong) - len(mid)
+
+    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'5日涨%':>7}{'量比':>6}{'换手%':>6}"
+              f"{'均线':<10}{'MACD':>6}{'突破':<10}{'分':>4}  分级")
+
+    def _dump(rows, limit):
+        for r in rows[:limit]:
+            gain_txt = f"{r['gain5']:.1f}" if r["gain5"] is not None else "  --"
+            vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+            tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
+            print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{gain_txt:>7}"
+                  f"{vol_txt:>6}{tr_txt:>6}{r['align']:<10}{r['macd_sig']:>6}{r['breakout']:<10}"
+                  f"{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("=" * 72)
-    print(f"右侧机会候选（按信号分降序，共 {len(results)} 只，显示前 {min(top, len(results))}）")
+    print(f"右侧机会候选（共 {len(results)} 只；强档 ≥75 为主，中档 55~74 观察，弱档 <55 不显示）")
     print("=" * 72)
-    header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'5日涨%':>7}{'量比':>6}{'换手%':>6}"
-              f"{'均线':<10}{'MACD':>6}{'突破':<10}{'分':>4}  分级")
-    print(header)
-    print("  " + "-" * 98)
-    for r in results[:top]:
-        gain_txt = f"{r['gain5']:.1f}" if r["gain5"] is not None else "  --"
-        vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
-        tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
-        print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{gain_txt:>7}"
-              f"{vol_txt:>6}{tr_txt:>6}{r['align']:<10}{r['macd_sig']:>6}{r['breakout']:<10}"
-              f"{r['score']:>4}  {_verdict(r['score'])}")
+
+    if strong:
+        print(f"\n  【✅ 强信号 · 可重点看】 {len(strong)} 只，显示前 {min(top, len(strong))}")
+        print(header)
+        print("  " + "-" * 98)
+        _dump(strong, top)
+    else:
+        print("\n  ❌ 无 score≥75 的强信号候选（该板块当前多为中弱档，趋势确认不足）")
+
+    if mid:
+        show_mid = min(len(mid), 10)
+        print(f"\n  【⚠️ 观察 · 中档 55~74 · 仅跟踪、不急于买】 {len(mid)} 只，显示前 {show_mid}")
+        print(header)
+        print("  " + "-" * 98)
+        _dump(mid, show_mid)
+
+    if weak_n:
+        print(f"\n  （另有 {weak_n} 只 score<55 弱档未显示——只跟随大盘、无增量信息）")
 
     print()
     print("  说明:")
     print("    - 板块=成分归属；5日涨%=近5个交易日涨幅；量比=今日量/前5日均量（≥1.2 放量，≥2 显著放量）")
     print("    - 换手%=今日换手率（<1% 地量 / 1~3% 正常 / 3~5% 活跃 / ≥5% 高换手），高换手确认真放量、低换手则量比可能虚高存疑")
     print("    - 均线：多头排列(MA5>10>20>60 最强) / MA5>10>20 / MA5>10 / 站MA20；突破=创20/60日新高或逼近高点")
-    print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
-    print("    - 右侧是突破确认后的顺势仓，回踩 MA5/MA10 是常见买点，跌破 MA20 止损；确认单只对 stock-analysis 或 intraday-signal 细看")
-    print("    - ⚠️ 右侧属「顺势追涨」策略，仅在上升市有效；震荡/弱势市追高易被套（回测 fut20 强档反为最差）")
+    print("    - 分级：✅强(≥75 主信号) / ⚠️中(55~74 观察) / 🔸弱(<55 不显示)")
+    print("    - ⚠️ 右侧是「趋势确认」信号，不是「选出来就买」：候选≠买点，买点=回踩 MA5/MA10 或突破位不破再进，止损=跌破 MA20 收盘确认即走")
+    print("      回测（3 年 × 沪深300/中证500/中证1000）显示右侧确认信号净 edge 仅 ±0.2%，本质上跟随大盘；追高被套多发生在震荡/弱势市")
     print("      建议配合 market-heat 判断市场情绪，弱势市右侧信号降级或仅轻仓试错。")
 
     _flow_check(results, top)

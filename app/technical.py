@@ -438,13 +438,28 @@ def calc_sma(values: list[float], period: int) -> list[float]:
     if not values or len(values) < period:
         return []
     sma_vals: list[Optional[float]] = [None] * (period - 1)
-    for i in range(period - 1, len(values)):
-        window = [v for v in values[i - period + 1:i + 1] if v is not None]
-        if len(window) < period:
-            # 窗口内混入 None（如停牌缺 K），无法算满周期均线，置 None 而非抛异常
-            sma_vals.append(None)
+    # O(n) 滚动和：窗口 [i-period+1, i]，含 None 计数（停牌缺 K 时满周期才出值，否则置 None）。
+    window_sum = 0.0
+    none_count = 0
+    for i in range(period):
+        v = values[i]
+        if v is None:
+            none_count += 1
         else:
-            sma_vals.append(sum(window) / period)
+            window_sum += v
+    for i in range(period - 1, len(values)):
+        sma_vals.append(window_sum / period if none_count == 0 else None)
+        if i + 1 < len(values):
+            out_v = values[i - period + 1]
+            in_v = values[i + 1]
+            if out_v is None:
+                none_count -= 1
+            else:
+                window_sum -= out_v
+            if in_v is None:
+                none_count += 1
+            else:
+                window_sum += in_v
     return sma_vals  # type: ignore[return-value]
 
 
