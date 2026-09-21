@@ -324,6 +324,8 @@ def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
         reasons.append("无有效现价")
     if is_trend:
         reasons.append(f"单边行情({ma_align})，做 T 易踏空/套牢")
+    elif ma_align == "数据不足":
+        reasons.append("5 分钟均线数据不足，无法判断单边/震荡，暂不建议做 T")
     if amp is None or amp < min_amp:
         if amp is None:
             reasons.append(f"日内振幅不足(无高低价，门槛 {min_amp}%)")
@@ -356,9 +358,9 @@ def evaluate_t0_measure(quote: Quote, min_klines: List[KlineData]) -> dict:
         "min_amp": min_amp,
         "buy_price": suggested["buy_price"],
         "sell_price": suggested["sell_price"],
-        "vol_trend": vol_info["trend"],
-        "vol_price": vol_info["vol_price"],
-        "vol_tail": vol_info["tail"],
+        "vol_trend": vol_info.get("trend", "数据不足"),
+        "vol_price": vol_info.get("vol_price", "数据不足"),
+        "vol_tail": vol_info.get("tail", "数据不足"),
     }
 
 
