@@ -648,3 +648,23 @@ def fetch_fund_company(company_id: str) -> list[dict]:
     """基金公司详情。company_id 来自 fetch_fund_profile 的 company_id。"""
     data = _get("/api/fund/companies/detail", {"company_id": company_id})
     return list(data.get("item") or []) if data else []
+
+
+# ============================================================
+# 期货（商品价格作为 A 股行业的领先信号）
+# ============================================================
+
+def fetch_futures_daily(thscode_: str, days: int = 60) -> list[dict]:
+    """主力连续合约日线（近约 100 交易日，取最近 days 根）。
+
+    返回 [{date, close}]（date=YYYY-MM-DD，升序）。thscode 需带交易所后缀（如 SCZL.INE）。
+    """
+    data = _get("/api/futures/prices/daily", {"thscode": thscode_})
+    items = list(data.get("item") or []) if data else []
+    out: list[dict] = []
+    for it in items:
+        close = it.get("close_price")
+        if close is None:
+            continue
+        out.append({"date": _fmt_date(it.get("timestamp")), "close": float(close)})
+    return out[-days:] if days > 0 else out
