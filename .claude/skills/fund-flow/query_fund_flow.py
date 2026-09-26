@@ -195,6 +195,77 @@ def _today_row_from_eastmoney(code: str):
         return None
 
 
+def _read_intraday_series(code: str) -> list[dict]:
+    """读盯盘落库的当日日内资金流时序（data/fund_flow_intraday.duckdb）。
+
+    盯盘时 BackgroundDataCache 每 ~300s 把当日 5 档资金流 + 来源写入 duckdb，
+    这里读回来补「当日盘中资金怎么走的」——妙想只给当日累计值，无盘中时序。
+
+    返回按时间升序的快照列表；无 duckdb（系统 python3）/ 无数据 / 非当日 → []。
+    """
+    db_path = _ROOT / "data" / "fund_flow_intraday.duckdb"
+    if not db_path.exists():
+        return []
+    try:
+        import duckdb
+    except ImportError:
+        return []
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows = con.execute(
+                "SELECT ts, main_net, super_large_net, large_net, medium_net, small_net, source "
+                "FROM fund_flow_intraday WHERE code = ? ORDER BY ts ASC",
+                [code],
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return []
+    today = date.today().strftime("%Y-%m-%d")
+    out = []
+    for r in rows:
+        if not str(r[0]).startswith(today):
+            continue
+        out.append({
+            "ts": r[0],
+            "main_net": r[1],
+            "super_large_net": r[2],
+            "large_net": r[3],
+            "medium_net": r[4],
+            "small_net": r[5],
+            "source": r[6],
+        })
+    return out
+
+
+def _print_intraday_series(code: str) -> None:
+    """打印盯盘落库的当日日内时序（无数据则静默跳过）。"""
+    rows = _read_intraday_series(code)
+    if not rows:
+        return
+    sources = {r["source"] for r in rows}
+    print("=" * 72)
+    print(f"【当日日内时序 · 盯盘落库】{code}  共 {len(rows)} 个快照")
+    print("=" * 72)
+    if len(sources) > 1:
+        print("  ⚠️ 本日快照混用「东财/妙想」两个渠道，主力口径可能不一致，趋势仅参考")
+    print("  时间      主力      超大单   大单     中单     小单     来源")
+    for r in rows:
+        ts = r["ts"]
+        hhmm = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)[11:16]
+        src = "妙想" if r["source"] == "miaoxiang" else "东财"
+        cells = [
+            _fmt_amount(r["main_net"]),
+            _fmt_amount(r["super_large_net"]),
+            _fmt_amount(r["large_net"]),
+            _fmt_amount(r["medium_net"]),
+            _fmt_amount(r["small_net"]),
+        ]
+        print(f"  {hhmm:<8}  " + "  ".join(cells) + f"   {src}")
+    print()
+
+
 def _parse_args(argv):
     """解析命令行参数，返回 (code, name, days)"""
     code = argv[1].strip()
@@ -219,6 +290,8 @@ def main():
     load_env(_ROOT)
     # 量比 / 换手率（不依赖 MX_APIKEY，失败静默跳过，不影响资金流主流程）
     _print_quote(code, name)
+    # 当日日内时序（盯盘落库的 duckdb，无数据/无 duckdb 时静默跳过，不依赖妙想）
+    _print_intraday_series(code)
 
     config = Config(_ROOT / "watchlist_config.json")
     api_keys = config.mx_apikeys
