@@ -123,6 +123,7 @@ def validate_holding(item: dict, source: str = "unknown") -> Optional[Holding]:
 
         amount = _safe_positive_int(item.get("amount", 0))
         cost = _safe_positive_float(item.get("cost", 0.0))
+        show_flow = _safe_positive_int(item.get("show_flow", 0))
 
         # 标记异常成本
         if cost <= 0:
@@ -138,6 +139,7 @@ def validate_holding(item: dict, source: str = "unknown") -> Optional[Holding]:
             market=market,
             amount=amount,
             cost=cost,
+            show_flow=show_flow,
         )
     except Exception as e:
         log.error(f"Failed to validate holding: {e}")

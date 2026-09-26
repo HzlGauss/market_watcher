@@ -192,7 +192,7 @@ class Config:
                                 row[key] = ""
 
                         # 只转换特定的数字字段（amount, cost 等），字符串字段保持原样
-                        numeric_fields = ["amount", "cost", "quantity", "price"]
+                        numeric_fields = ["amount", "cost", "quantity", "price", "show_flow"]
                         for key in numeric_fields:
                             if key in row and row[key]:
                                 try:

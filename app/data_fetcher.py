@@ -650,7 +650,10 @@ def fetch_fund_flow_miaoxiang(code: str, market: str = "SZ", name: str = "") -> 
     if not keys:
         return None
     client = MXClient(keys)
-    return client.stock_fund_flow(code, name)
+    flow = client.stock_fund_flow(code, name)
+    if flow is not None:
+        flow.source = "miaoxiang"
+    return flow
 
 
 def enrich_quotes_with_flow(quotes: list[Quote]) -> None:
@@ -1442,7 +1445,7 @@ class BackgroundDataCache:
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
-        """刷新资金流向明细（东方财富，静默失败）"""
+        """刷新资金流向明细（东财主源，反爬不稳定时回退妙想；静默失败）"""
         if not self._items:
             return
 
@@ -1450,8 +1453,10 @@ class BackgroundDataCache:
             if self._stop_event.is_set():
                 return
             code = item.code
-            # 获取完整资金流向明细
+            # 获取完整资金流向明细（东财 fflow 反爬易断连，失败回退妙想独立数据源）
             detail = fetch_fund_flow_detail(code, item.market)
+            if detail is None:
+                detail = fetch_fund_flow_miaoxiang(code, item.market, item.name)
             with self._lock:
                 if code not in self._cache:
                     self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "fund_flow": None}
@@ -1460,6 +1465,13 @@ class BackgroundDataCache:
                     # 向后兼容：同时存 main_net_inflow
                     if detail.main_net is not None:
                         self._cache[code]["main_net_inflow"] = detail.main_net
+            # 落库日内时序（含来源标注），供 skill 复用当日盘中历史
+            if detail is not None:
+                try:
+                    from app.intraday_store import write_snapshot
+                    write_snapshot(code, item.name, detail)
+                except Exception:
+                    pass  # 落库失败不影响盯盘主流程
             time.sleep(0.5)  # 请求间隔
 
 

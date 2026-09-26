@@ -152,6 +152,9 @@ def print_quotes_table(quotes: list[Quote]) -> None:
                 flow_str = f"{Color.RED}{flow_str}{Color.RESET}"
             elif flow_val < 0:
                 flow_str = f"{Color.GREEN}{flow_str}{Color.RESET}"
+            # 妙想数据源标注：东财与妙想的主力划分口径可能不一致
+            if q.fund_flow is not None and q.fund_flow.source == "miaoxiang":
+                flow_str += f"{Color.YELLOW}〔妙〕{Color.RESET}"
         else:
             flow_str = f"{Color.DIM}  ---  {Color.RESET}"
 
@@ -213,6 +216,55 @@ def print_quotes_table(quotes: list[Quote]) -> None:
             f"{vr_str:>6} {tr_str:>8} {bar_str:>7} {bar_diff_str:>7} {amp_str:>7}"
         )
         print(f"  {line}")
+
+
+def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str]) -> None:
+    """打印标记持仓（show_flow=1）的当天资金流 5 档明细，独立成表。
+
+    Args:
+        quotes: 行情列表
+        flagged_codes: 标记持仓的代码集合
+    """
+    if not flagged_codes:
+        return
+
+    flagged = [q for q in quotes if q.code in flagged_codes]
+    if not flagged:
+        return
+
+    print(f"\n{Color.BOLD}{Color.CYAN}═══ 重点持仓资金流（5 档） ═══{Color.RESET}")
+    header = (
+        f"{'代码':>8} {'名称':<12} {'来源':>5} "
+        f"{'主力净流入':>11} {'超大单':>11} {'大单':>11} {'中单':>11} {'小单':>11}"
+    )
+    print(f"{Color.DIM}{header}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 92}{Color.RESET}")
+
+    def _cell(v: Optional[float]) -> str:
+        s = _format_compact_flow(v)
+        if v is not None and v > 0:
+            s = f"{Color.RED}{s}{Color.RESET}"
+        elif v is not None and v < 0:
+            s = f"{Color.GREEN}{s}{Color.RESET}"
+        return s
+
+    for q in flagged:
+        ff = q.fund_flow
+        if ff is None or not ff.is_valid:
+            print(f"  {q.code:>8} {q.name:<12} {Color.DIM}暂无资金流数据{Color.RESET}")
+            continue
+
+        src = ff.source_label
+        if ff.source == "miaoxiang":
+            src = f"{Color.YELLOW}{src}{Color.RESET}"
+
+        line = (
+            f"{q.code:>8} {q.name:<12} {src:>5} "
+            f"{_cell(ff.main_net):>11} {_cell(ff.super_large_net):>11} "
+            f"{_cell(ff.large_net):>11} {_cell(ff.medium_net):>11} {_cell(ff.small_net):>11}"
+        )
+        print(f"  {line}")
+    print()
 
 
 def print_sentiment(stats: AnalysisStats) -> None:

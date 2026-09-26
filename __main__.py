@@ -600,7 +600,8 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
     from app.notifier import push_alert, send_desktop_notification
     from app.presenter import (
         print_quotes_table, print_sentiment, print_alerts,
-        print_llm_result, print_tail, save_brief, print_key_levels, Color
+        print_llm_result, print_tail, save_brief, print_key_levels, Color,
+        print_flagged_fundflow,
     )
     from app.technical import get_technical_summary, TechnicalSummary
     from app.models import ScanRecord, FundScanStatus, TechSnapshot, Alert
@@ -675,6 +676,10 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
             tech_summaries[code] = get_technical_summary(quote_map[code], klines)
 
     print_quotes_table(quotes)
+
+    # 重点持仓（show_flow=1）单独列当天资金流 5 档明细表
+    flagged_codes = {h.code for h in config.holdings if h.show_flow == 1}
+    print_flagged_fundflow(quotes, flagged_codes)
 
     # Print holdings-specific statistics + portfolio P&L
     if holdings_quotes:

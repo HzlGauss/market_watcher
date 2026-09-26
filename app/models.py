@@ -50,6 +50,7 @@ class Holding:
     amount: int = 0
     cost: float = 0.0
     industry: str = ""  # 所属行业板块
+    show_flow: int = 0  # 0/1：为 1 时盯盘结果单独列该持仓的当天资金流表
 
 
 @dataclass
@@ -81,6 +82,12 @@ class FundFlowDetail:
     medium_pct: Optional[float] = None
     small_net: Optional[float] = None
     small_pct: Optional[float] = None
+    source: str = "eastmoney"  # 数据来源：eastmoney(东财) / miaoxiang(妙想)，两渠道主力划分口径可能不同
+
+    @property
+    def source_label(self) -> str:
+        """数据来源中文标签（显示/落库时标注，混用两渠道数据时需注意口径）"""
+        return "妙想" if self.source == "miaoxiang" else "东财"
 
     @property
     def is_valid(self) -> bool:
