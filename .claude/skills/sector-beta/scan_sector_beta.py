@@ -178,17 +178,6 @@ def _fetch_bull_tickers() -> tuple[list[str], str]:
         return [], ""
 
 
-def _pct_ranks(values: list) -> list[float]:
-    """值 → 0~1 分位（降序：最高值分位 1.0，最低 0.0，None 当 0）。"""
-    n = len(values)
-    cleaned = [(0.0 if v is None else float(v)) for v in values]
-    order = sorted(range(n), key=lambda i: cleaned[i])
-    ranks = [0.0] * n
-    for pos, i in enumerate(order):
-        ranks[i] = pos / (n - 1) if n > 1 else 0.5
-    return ranks
-
-
 def _fetch_commodity_momentum() -> dict[str, dict]:
     """上游商品动量 → {thscode: {name, close, mom_20, mom_60}}。缺 key / 失败返回空 dict。"""
     if not os.environ.get("HITHINK_FINANCE_API_KEY"):
@@ -282,14 +271,16 @@ def _collect() -> tuple[list[dict], str, dict[str, dict]]:
             r["commodity"] = ""
             r["commodity_mom"] = None
 
-    # 综合分 = 加权分位
-    d_pct = _pct_ranks([r["bull_density"] for r in rows])
-    m_pct = _pct_ranks([r["change_pct_10d"] for r in rows])
-    f_pct = _pct_ranks([r["main_net_10d"] for r in rows])
+    # 综合分 = 加权分位（pandas rank(pct=True)：None 当 0，并列取平均）
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    score = (
+        W_DENSITY * df["bull_density"].rank(pct=True)
+        + W_MOMENTUM * df["change_pct_10d"].fillna(0).rank(pct=True)
+        + W_FLOW * df["main_net_10d"].fillna(0).rank(pct=True)
+    ).round(4)
     for i, r in enumerate(rows):
-        r["score"] = round(
-            W_DENSITY * d_pct[i] + W_MOMENTUM * m_pct[i] + W_FLOW * f_pct[i], 4
-        )
+        r["score"] = float(score.iloc[i])
 
     rows.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(rows, start=1):
