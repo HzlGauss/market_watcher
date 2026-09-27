@@ -10,10 +10,12 @@ API Key 从环境变量 HITHINK_FINANCE_API_KEY 按次读取（避免模块 impo
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from app.http_client import hithink_client
@@ -46,11 +48,16 @@ def thscode(code: str, market: str = "") -> str:
     return f"{c}.{m}"
 
 
+# 业务层瞬时错误重试码：429 限流 + 4001/5001/5002/5003（上游 DataAPI 超时/不可用/异常）。
+# 这些通常退避重试即可恢复；其余业务错误（1002 参数非法、3001 代码不存在等）直接返回 None。
+_RETRY_CODES = {429, 4001, 5001, 5002, 5003}
+
+
 def _get(path: str, params: Optional[dict] = None, _retries: int = 2):
     """带鉴权 GET，返回 payload 的 data 字段；key 缺失 / 失败 / 业务错误返回 None。
 
-    HTTP 层 429/5xx 由 HttpClient 重试；业务层 code=429（限流，HTTP 200 返回）在此
-    额外重试 _retries 次（退避）。
+    HTTP 层 429/5xx 由 HttpClient 重试；业务层 _RETRY_CODES（限流/上游瞬时故障，HTTP 200
+    返回）在此额外重试 _retries 次（退避）。
     """
     key = _api_key()
     if not key:
@@ -66,9 +73,9 @@ def _get(path: str, params: Optional[dict] = None, _retries: int = 2):
         code = payload.get("code")
         if code == 0:
             return payload.get("data")
-        if code == 429 and attempt < _retries:
+        if code in _RETRY_CODES and attempt < _retries:
             wait = 1.5 * (attempt + 1)
-            log.warning(f"同花顺接口限流(code=429)，{wait:.1f}s 后重试({attempt + 1}/{_retries})...")
+            log.warning(f"同花顺接口瞬时错误(code={code})，{wait:.1f}s 后重试({attempt + 1}/{_retries})...")
             time.sleep(wait)
             continue
         log.warning(f"同花顺接口返回错误: code={code} {payload.get('message')}")
@@ -114,12 +121,93 @@ def _ymd_to_ms(date: str) -> int:
         return 0
 
 
+# 标的目录本地缓存（TTL 12h）：同花顺代码表几乎不变，本地缓存可省请求、抗限流。
+# 缓存全量目录，search 先本地子串匹配，命中即返回；miss / 缓存过期再打远端。
+_TICKERS_CACHE_PATH = Path(__file__).resolve().parents[1] / "data" / "tickers_cache.json"
+_TICKERS_CACHE_TTL = 12 * 3600
+
+
+def _load_tickers_cache() -> tuple[list[dict] | None, float | None]:
+    try:
+        if not _TICKERS_CACHE_PATH.exists():
+            return None, None
+        blob = json.loads(_TICKERS_CACHE_PATH.read_text(encoding="utf-8"))
+        return list(blob.get("item") or []), float(blob.get("cached_at") or 0)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None, None
+
+
+def _write_tickers_cache(items: list[dict]) -> None:
+    try:
+        _TICKERS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _TICKERS_CACHE_PATH.write_text(
+            json.dumps({"cached_at": time.time(), "item": items}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def fetch_tickers_list(asset_type: str = "", refresh: bool = False) -> list[dict]:
+    """分页拉全量标的目录。asset_type 空=全部类型；refresh=True 时刷新本地缓存。
+
+    返回 item 列表，字段含 thscode/ticker/name/exchange/asset_type/currency/list_date。
+    """
+    if not refresh:
+        items, cached_at = _load_tickers_cache()
+        if items and cached_at and (time.time() - cached_at) < _TICKERS_CACHE_TTL:
+            return items
+    out: list[dict] = []
+    offset = 0
+    limit = 1000
+    while True:
+        params: dict = {"limit": limit, "offset": offset}
+        if asset_type:
+            params["asset_type"] = asset_type
+        data = _get("/api/meta/tickers/list", params)
+        if not data:
+            break
+        items = list(data.get("item") or [])
+        out.extend(items)
+        if len(items) < limit:
+            break
+        offset += limit
+    if out and refresh:
+        _write_tickers_cache(out)
+    return out
+
+
+def _local_ticker_search(items: list[dict], q: str, asset_type: str, limit: int) -> list[dict]:
+    ql = q.lower()
+    asset_types = {t for t in (asset_type or "").split(",") if t}
+    out: list[dict] = []
+    for it in items:
+        if asset_types and it.get("asset_type") not in asset_types:
+            continue
+        hay = " ".join(str(it.get(k) or "") for k in ("thscode", "ticker", "name")).lower()
+        if ql in hay:
+            out.append(it)
+            if len(out) >= limit:
+                break
+    return out
+
+
 def fetch_meta_search(q: str, asset_type: str = "", limit: int = 10) -> list[dict]:
     """标的检索/消歧：按 thscode/ticker/中文名/英文名 跨市场搜索。
 
     asset_type: a-share / a-share-index / fund-otc / fund-etf / fund-lof / ...（逗号分隔）。
+    先走本地缓存（全量目录子串匹配），未命中或缓存缺失再打远端。
+    缓存可用 fetch_tickers_list(refresh=True) 预热。
     """
-    params: dict = {"q": q, "limit": min(int(limit), 50)}
+    if not q:
+        return []
+    limit = max(1, min(int(limit), 50))
+    items, cached_at = _load_tickers_cache()
+    if items and cached_at and (time.time() - cached_at) < _TICKERS_CACHE_TTL:
+        hits = _local_ticker_search(items, q, asset_type, limit)
+        if hits:
+            return hits
+    params: dict = {"q": q, "limit": limit}
     if asset_type:
         params["asset_type"] = asset_type
     data = _get("/api/meta/tickers/search", params)
@@ -651,6 +739,81 @@ def fetch_fund_company(company_id: str) -> list[dict]:
 
 
 # ============================================================
+# 公募基金在线回测 / 通用指标 / QDII 额度
+# ============================================================
+
+def _json_param(v) -> Optional[str]:
+    """对象/数组序列化为 JSON 字符串；字符串原样返回；None 返回 None。"""
+    if v is None:
+        return None
+    return v if isinstance(v, str) else json.dumps(v)
+
+
+def fetch_fund_backtest_indicators() -> list[dict]:
+    """基金在线回测可用指标目录（indicator_code/indicator_name/support_operation 等）。"""
+    data = _get("/api/fund/backtest/indicators")
+    return data if isinstance(data, list) else []
+
+
+def fetch_fund_backtest(code: str, market: str = "", buy_conditions=None, sell_conditions=None,
+                        buy_frequency_type: str = "", max_buy_times=None, per_buy_amount=None) -> dict:
+    """基金在线回测，返回原始 data（start_date/end_date/metrics/trades/curve_points）。
+
+    buy_conditions/sell_conditions 为 dict/list（自动序列化）或已序列化的 JSON 字符串；
+    指标编码与操作符以 fetch_fund_backtest_indicators 返回为准。
+    """
+    params: dict = {"thscode": _fund_thscode(code, market)}
+    if buy_conditions is not None:
+        params["buy_conditions"] = _json_param(buy_conditions)
+    if sell_conditions is not None:
+        params["sell_conditions"] = _json_param(sell_conditions)
+    if buy_frequency_type:
+        params["buy_frequency_type"] = buy_frequency_type
+    if max_buy_times is not None:
+        params["max_buy_times"] = max_buy_times
+    if per_buy_amount is not None:
+        params["per_buy_amount"] = per_buy_amount
+    return _get("/api/fund/backtest/result", params) or {}
+
+
+def fetch_fund_indicators_line(indexes, time_range) -> dict:
+    """基金画线指标。indexes 为指标分组数组（每项含 thscodes 与 index_info），
+    time_range 为时间范围对象（含 time_type 与可选 start/end/offset）；均可传对象自动序列化。
+    返回原始 data（time_range/indexes/data 三段）。"""
+    return _get("/api/fund/indicators/line",
+                {"indexes": _json_param(indexes), "time_range": _json_param(time_range)}) or {}
+
+
+def fetch_fund_indicators_table(code_selectors=None, indexes=None, page_info=None, sort=None) -> dict:
+    """基金表格指标。各参数均为 JSON 对象/数组（可传对象自动序列化，省略不注入默认值）。"""
+    params: dict = {}
+    if code_selectors is not None:
+        params["code_selectors"] = _json_param(code_selectors)
+    if indexes is not None:
+        params["indexes"] = _json_param(indexes)
+    if page_info is not None:
+        params["page_info"] = _json_param(page_info)
+    if sort is not None:
+        params["sort"] = _json_param(sort)
+    return _get("/api/fund/indicators/table", params) or {}
+
+
+def fetch_fund_quota_summary(tab) -> list[dict]:
+    """QDII 额度汇总。tab 为分类数组（可传 list 自动序列化，如 ["nazhi100"]）。"""
+    data = _get("/api/fund/quota/summary", {"tab": _json_param(tab)})
+    return data if isinstance(data, list) else []
+
+
+def fetch_fund_quota_list(tab, buy: Optional[bool] = None) -> list[dict]:
+    """QDII 额度列表。tab 为分类数组；buy 可选可购状态过滤（省略不注入默认值）。"""
+    params: dict = {"tab": _json_param(tab)}
+    if buy is not None:
+        params["buy"] = buy
+    data = _get("/api/fund/quota/list", params)
+    return data if isinstance(data, list) else []
+
+
+# ============================================================
 # 期货（商品价格作为 A 股行业的领先信号）
 # ============================================================
 
@@ -668,3 +831,65 @@ def fetch_futures_daily(thscode_: str, days: int = 60) -> list[dict]:
             continue
         out.append({"date": _fmt_date(it.get("timestamp")), "close": float(close)})
     return out[-days:] if days > 0 else out
+
+
+def fetch_futures_variety_positions(date: str) -> list[dict]:
+    """期货品种日持仓（全品种）。date: YYYY-MM-DD。
+
+    返回 item 列表，字段: variety_code/variety_name/volume/volume_change/
+    long_position/short_position/net_position 及各自 change、twenty_day_avg_price 等。
+    """
+    data = _get("/api/futures/positions/variety-daily", {"date": date})
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_company_variety_positions(date: str, varieties: str) -> list[dict]:
+    """期货公司品种日持仓。varieties: 1~5 个大写品种代码逗号分隔（如 CU,AU）。"""
+    data = _get("/api/futures/positions/company-variety-daily", {"date": date, "varieties": varieties})
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_contract_positions(thscode_: str, variety: str, date: str) -> dict:
+    """期货公司合约日持仓，返回原始 data（含 position_item/average_item 两个独立序列）。"""
+    return _get("/api/futures/positions/contract-daily",
+                {"thscode": thscode_, "variety": variety, "date": date}) or {}
+
+
+def fetch_futures_contract_position_history(thscode_: str, variety: str, company: str, start_date: str) -> dict:
+    """期货公司合约历史持仓（start_date 至调用日，一年内），返回原始 data。"""
+    return _get("/api/futures/positions/contract-historical",
+                {"thscode": thscode_, "variety": variety, "company": company, "start_date": start_date}) or {}
+
+
+def fetch_futures_position_companies() -> list[dict]:
+    """期货公司列表，返回 [{company_id, company_name}]。"""
+    data = _get("/api/futures/positions/company-list")
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_warehouse_receipts(thscode_: str, start_date: str, end_date: str) -> list[dict]:
+    """期货历史仓单，返回 [{date, amount, amount_change, equivalent_lots}]。"""
+    data = _get("/api/futures/warehouse-receipts/historical",
+                {"thscode": thscode_, "start_date": start_date, "end_date": end_date})
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_latest_basis() -> list[dict]:
+    """期货主连最新基差（全品种），返回 item 列表（含 close_basis/settle_basis/spot_price 等）。"""
+    data = _get("/api/futures/basis/main-continuous-latest")
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_basis_history(thscode_: str, spot_indicator_id: str = "") -> list[dict]:
+    """指定合约历史基差。spot_indicator_id 可选现货指标 ID，空则上游默认口径。"""
+    params: dict = {"thscode": thscode_}
+    if spot_indicator_id:
+        params["spot_indicator_id"] = spot_indicator_id
+    data = _get("/api/futures/basis/historical", params)
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_futures_commodity_indexes() -> list[dict]:
+    """商品指数合约列表，返回 [{thscode, ticker, name, list_date, end_date}]。"""
+    data = _get("/api/futures/contracts/commodity-index-list")
+    return list(data.get("item") or []) if data else []

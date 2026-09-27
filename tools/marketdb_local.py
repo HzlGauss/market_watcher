@@ -184,6 +184,7 @@ def cmd_bootstrap(args) -> int:
 
     print("==> 状态")
     _cli("status", db=db)
+    _validate(db)
     print(f"\n✅ 完成。本地库: {db}")
     print("   示例: py tools/marketdb_local.py daily 600519.SH --adjust forward")
     return 0
@@ -771,6 +772,26 @@ def prescreen_codes(codes, kinds, min_days: int = 2, lookback_days: int = 3,
     return result if got_any else None
 
 
+def _validate(db: Path) -> None:
+    """auto-sync 后跑数据质量校验（8 项）；失败只告警、不改变 sync 退出码。
+
+    校验失败多为半截同步/坏库，早期暴露可避免批量扫描静默读到脏数据。
+    """
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    r = subprocess.run(
+        [sys.executable, "-m", "marketdb.cli", "validate", "--json", "--db", str(db)],
+        capture_output=True, text=True, env=env,
+    )
+    if r.returncode == 0:
+        print("    ✅ 数据质量校验通过")
+        return
+    out = (r.stdout or "").strip() or (r.stderr or "").strip()
+    print(f"    ⚠️ 数据质量校验未通过（exit {r.returncode}），可 `marketdb validate --json --db {db}` 排查")
+    if out:
+        print("    " + out.replace("\n", "\n    ")[:800])
+
+
 def sync_db(db=None) -> int:
     """增量同步（auto-sync，自动判断 skip/incremental/full）。不装依赖、不重建库。"""
     _load_key()
@@ -783,7 +804,10 @@ def sync_db(db=None) -> int:
     except ImportError:
         print("❌ marketdb 未安装（先运行 bootstrap）")
         return 1
-    return _cli("auto-sync", db=db_path).returncode
+    rc = _cli("auto-sync", db=db_path).returncode
+    if rc == 0:
+        _validate(db_path)
+    return rc
 
 
 def sync_db_echo(db=None) -> None:
