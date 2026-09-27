@@ -287,6 +287,93 @@ def _pool_from_ths_board(key: str) -> dict[str, dict]:
     return pool
 
 
+# ---------------------------------------------------------------- 本地行业映射缓存兜底
+
+def _read_industry_cache() -> dict[str, str]:
+    """读东财 f100 全市场行业映射缓存 {code: 行业名}（东财接口不可达时的离线兜底）。
+
+    缓存由 sector-beta 扫描生成（state/industry_cache.json），行业分类稳定、不校验日期。
+    """
+    import json
+
+    cache = _ROOT / "state" / "industry_cache.json"
+    if not cache.exists():
+        return {}
+    try:
+        with open(cache, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+    except Exception:
+        return {}
+    return {k: v for k, v in cached.items() if not k.startswith("_")}
+
+
+def _local_symbol_names(codes: set[str]) -> dict[str, str]:
+    """从本地 duckdb v_symbol 补 {code: name}（惰性 import，失败返回空）。"""
+    try:
+        import os
+
+        import duckdb
+    except Exception:
+        return {}
+    p = os.environ.get("MARKETDB_DB_PATH")
+    db = Path(p).expanduser() if p else _ROOT / "data" / "market.duckdb"
+    if not db.exists():
+        return {}
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+        rows = con.execute("select ticker, name from v_symbol").fetchall()
+        con.close()
+    except Exception:
+        return {}
+    return {t: n for t, n in rows if t in codes}
+
+
+def _pool_from_industry_cache(key: str) -> dict[str, dict]:
+    """东财细分行业名 → 成分股池（本地 f100 行业映射缓存反推，东财在线不可达时兜底）。
+
+    匹配策略沿用精确 → 前缀 → 包含（只查「行业名」正向包含 key，不做双向包含，
+    避免「化工」反向命中「磷肥及磷化工」之类的误匹配）。名称从本地 v_symbol 补。
+    """
+    mapping = _read_industry_cache()
+    if not mapping:
+        return {}
+    by_industry: dict[str, list[str]] = {}
+    for code, ind in mapping.items():
+        by_industry.setdefault(ind, []).append(code)
+    names = sorted(by_industry.keys())
+
+    hit = None
+    for n in names:            # 精确
+        if n == key:
+            hit = n
+            break
+    if hit is None:
+        for n in names:        # 前缀（「电子化学」→「电子化学品Ⅱ」）
+            if n.startswith(key):
+                hit = n
+                break
+    if hit is None:
+        for n in names:        # 包含（最后兜底）
+            if key in n:
+                hit = n
+                break
+    if hit is None:
+        return {}
+
+    name_map = _local_symbol_names(set(by_industry[hit]))
+    pool: dict[str, dict] = {}
+    for c in by_industry[hit]:
+        c6 = _norm_code(c)
+        if not c6:
+            continue
+        pool[c6] = {
+            "name": name_map.get(c6, ""),
+            "industry": hit,
+            "source": hit,
+        }
+    return pool
+
+
 # ---------------------------------------------------------------- 入口
 
 def resolve_board_pool(query: str) -> dict[str, dict]:
@@ -324,6 +411,11 @@ def resolve_board_pool(query: str) -> dict[str, dict]:
 
     # 4) 行业/概念板块名模糊匹配（精确→前缀→包含，仅作兜底）
     pool = _pool_from_board_name(key)
+    if pool:
+        return _filter_scannable(pool)
+
+    # 4.5) 本地行业映射缓存兜底（东财细分行业名，接口不可达时离线反推）
+    pool = _pool_from_industry_cache(key)
     if pool:
         return _filter_scannable(pool)
 
