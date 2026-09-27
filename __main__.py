@@ -87,15 +87,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}W{Color.RESET}. Weekly Review (周报·持仓+自选)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
     print(f"  {Color.CYAN}U{Color.RESET}. Data Sync (日K + 估值 本地库更新)")
+    print(f"  {Color.CYAN}F{Color.RESET}. Financial Statements Sync (三张报表落库·财报季后)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M/S/W/G/U]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G", "U"):
+            choice = input(f" Enter option [0-9/D/M/S/W/G/U/F]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G", "U", "F"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W, G or U{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W, G, U or F{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -1225,23 +1226,12 @@ def _run_monitoring_loop(config: Config, north_fetcher: NorthFlowFetcher) -> Non
         log.info("All threads stopped")
 
 
-def _run_data_sync() -> None:
-    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积。
+def _run_marketdb_steps(steps) -> None:
+    """跑 tools/marketdb_local.py 的若干子命令（各自加载 .env 的 HITHINK_FINANCE_API_KEY）。
 
-    两项都走 tools/marketdb_local.py 子命令（各自加载 .env 的 HITHINK_FINANCE_API_KEY）：
-    - sync: auto-sync 自动判断 skip/incremental/full，把本地日K补齐到最近交易日（T+1，最多到昨天）
-    - sync-valuation --all: 全市场估值快照落库（PE/PB/PS/PCF），历史分位需每日收盘后累积
+    marketdb/duckdb 装在独立环境（如 miniconda）时用 MARKETDB_PYTHON 指定解释器，否则回退当前解释器。
     """
     tool = BASE_DIR / "tools" / "marketdb_local.py"
-    steps = [
-        ("日K 增量同步", ["sync"]),
-        ("估值快照累积", ["sync-valuation", "--all"]),
-    ]
-    print(f"\n{Color.BOLD}{Color.CYAN}🔄 数据更新（本地行情库）{Color.RESET}")
-    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）{Color.RESET}")
-    print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
-
-    # marketdb/duckdb 装在独立环境（如 miniconda）时，用 MARKETDB_PYTHON 指定其解释器，否则回退当前解释器
     py = os.environ.get("MARKETDB_PYTHON") or sys.executable
     if py != sys.executable:
         print(f"{Color.DIM}  使用 marketdb 解释器: {py}{Color.RESET}\n")
@@ -1259,6 +1249,32 @@ def _run_data_sync() -> None:
                 print(f"{Color.YELLOW}  ⚠️ {label}退出码 {rc}（可能已是最新，或触发同花顺限流，稍后重试）{Color.RESET}\n")
         except Exception as e:
             print(f"{Color.RED}  ❌ {label}失败: {e}{Color.RESET}\n")
+
+
+def _run_data_sync() -> None:
+    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积（每日用）。
+
+    两项都走 tools/marketdb_local.py 子命令：
+    - sync: auto-sync 自动判断 skip/incremental/full，把本地日K补齐到最近交易日（T+1，最多到昨天）
+    - sync-valuation --all: 全市场估值快照落库（PE/PB/PS/PCF），历史分位需每日收盘后累积
+    """
+    print(f"\n{Color.BOLD}{Color.CYAN}🔄 数据更新（本地行情库）{Color.RESET}")
+    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）{Color.RESET}")
+    print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
+    _run_marketdb_steps([
+        ("日K 增量同步", ["sync"]),
+        ("估值快照累积", ["sync-valuation", "--all"]),
+    ])
+
+
+def _run_financials_sync() -> None:
+    """主菜单「三张报表落库」：利润/资产负债/现金流量全市场落库（季度披露数据，财报季后跑一次即可）。"""
+    print(f"\n{Color.BOLD}{Color.CYAN}📊 三张报表落库（利润/资产负债/现金流量）{Color.RESET}")
+    print(f"{Color.DIM}  财务报表按季度披露、季内数值基本不变，财报季结束后跑一次即可，无需每个交易日更新。{Color.RESET}")
+    print(f"{Color.DIM}  全市场约 1.6 万次请求较慢（数十分钟），可 Ctrl+C 中断，已落库部分保留。{Color.RESET}\n")
+    _run_marketdb_steps([
+        ("三张报表落库", ["sync-financials", "--all"]),
+    ])
 
 
 def main() -> None:
@@ -1600,6 +1616,8 @@ def main() -> None:
             _run_miaoxiang_menu(config)
         elif choice == "U":
             _run_data_sync()
+        elif choice == "F":
+            _run_financials_sync()
 
 
 def _run_miaoxiang_menu(config: Config) -> None:
