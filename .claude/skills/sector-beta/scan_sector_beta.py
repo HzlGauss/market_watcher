@@ -6,6 +6,8 @@
   2. 板块动量 —— 行业近 10 日涨跌幅（东财板块资金流）
   3. 主力资金流 —— 行业近 10 日主力净流入（东财板块资金流）
 
+另有上游商品领先信号（不参与打分）：价格动量 + 基差 + 仓单变化。
+
 每次运行把全行业排名落到 data/sector_beta.duckdb，供 --history 长期观测
 （持续性 / 轮动 / 新晋主线）。
 
@@ -85,14 +87,21 @@ MIN_STOCKS = 15
 COMM_WIN_20 = 20
 COMM_WIN_60 = 60
 
+# 仓单变化窗口（交易日）：仓单量上升=累库(供给宽松/偏空)，下降=去库(供给紧张/偏多)
+WH_WIN_20 = 20
+WH_WIN_60 = 60
+# 仓单拉取日历天数（60 交易日 + 节假日缓冲）
+WH_CAL_DAYS = 100
+
 # 行业板块名 → (主力连续合约 thscode, 商品显示名)。商品价格领先对应 A 股板块，
 # 作为「行业景气」的前瞻信号（同花顺期货接口，需 HITHINK_FINANCE_API_KEY）。
 INDUSTRY_COMMODITY: dict[str, tuple[str, str]] = {
     # 能源
     "石油石化": ("SCZL.INE", "原油"),
-    "煤炭": ("ZCZL.CZC", "动力煤"),
-    "煤炭开采": ("ZCZL.CZC", "动力煤"),
-    "动力煤": ("ZCZL.CZC", "动力煤"),
+    # 动力煤期货(ZCZL.CZC)已停交易无数据，改用焦煤代理煤炭板块价格
+    "煤炭": ("JMZL.DCE", "焦煤"),
+    "煤炭开采": ("JMZL.DCE", "焦煤"),
+    "动力煤": ("JMZL.DCE", "焦煤"),
     # 金属
     "钢铁": ("RBZL.SHF", "螺纹钢"),
     "普钢": ("RBZL.SHF", "螺纹钢"),
@@ -186,8 +195,13 @@ def _fetch_bull_tickers() -> tuple[list[str], str]:
         return [], ""
 
 
-def _fetch_commodity_momentum() -> dict[str, dict]:
-    """上游商品动量 → {thscode: {name, close, mom_20, mom_60}}。缺 key / 失败返回空 dict。"""
+def _fetch_commodity_signal() -> dict[str, dict]:
+    """上游商品信号 → {thscode: {name, close, mom_20, mom_60, basis, basis_rate, wh_amount, wh_change_20, wh_change_60}}。
+
+    三部分：价格动量（fetch_futures_daily）+ 基差（fetch_futures_latest_basis 一次拉全品种，
+    取 default_value=='Y' 默认现货口径）+ 仓单变化（fetch_futures_warehouse_receipts 逐品种）。
+    缺 key / 失败返回空 dict。
+    """
     if not os.environ.get("HITHINK_FINANCE_API_KEY"):
         return {}
     try:
@@ -196,6 +210,26 @@ def _fetch_commodity_momentum() -> dict[str, dict]:
         return {}
     thscodes = sorted({ts for ts, _ in INDUSTRY_COMMODITY.values()})
     name_by_ts = {ts: name for ts, name in INDUSTRY_COMMODITY.values()}
+
+    # 1) 基差：一次拉全品种主连最新基差，按 thscode 匹配，default_value=='Y' 去重
+    basis_by_ts: dict[str, dict] = {}
+    try:
+        for b in hithink.fetch_futures_latest_basis():
+            ts = b.get("thscode")
+            if not ts or ts not in name_by_ts:
+                continue
+            prev = basis_by_ts.get(ts)
+            # 同品种多现货口径 → 优先 default_value=='Y' 默认口径，否则保留首个
+            if prev is None or (b.get("default_value") == "Y" and prev.get("default_value") != "Y"):
+                basis_by_ts[ts] = b
+    except Exception:
+        pass
+
+    # 2) 仓单：拉取区间（近 WH_CAL_DAYS 日历天）
+    import datetime as _dt
+    end = _dt.date.today().isoformat()
+    start = (_dt.date.today() - _dt.timedelta(days=WH_CAL_DAYS)).isoformat()
+
     out: dict[str, dict] = {}
     for ts in thscodes:
         try:
@@ -210,12 +244,40 @@ def _fetch_commodity_momentum() -> dict[str, dict]:
                 return None
             base = closes[-win - 1]
             return round((closes[-1] / base - 1) * 100, 2) if base else None
-        out[ts] = {
+
+        rec = {
             "name": name_by_ts.get(ts, ts),
             "close": closes[-1],
             "mom_20": mom(COMM_WIN_20),
             "mom_60": mom(COMM_WIN_60),
+            "basis": None,
+            "basis_rate": None,
+            "wh_amount": None,
+            "wh_change_20": None,
+            "wh_change_60": None,
         }
+
+        b = basis_by_ts.get(ts)
+        if b:
+            rec["basis"] = b.get("close_basis")
+            rec["basis_rate"] = b.get("close_basis_rate")
+
+        try:
+            wh = hithink.fetch_futures_warehouse_receipts(ts, start, end)
+        except Exception:
+            wh = []
+        amounts = [(it.get("date"), it.get("amount")) for it in wh if it.get("amount") is not None]
+        if len(amounts) >= WH_WIN_20 + 1 and amounts[-1][1]:
+            rec["wh_amount"] = amounts[-1][1]
+            def wh_change(win: int):
+                if len(amounts) <= win:
+                    return None
+                base = amounts[-win - 1][1]
+                return round((amounts[-1][1] / base - 1) * 100, 2) if base else None
+            rec["wh_change_20"] = wh_change(WH_WIN_20)
+            rec["wh_change_60"] = wh_change(WH_WIN_60)
+
+        out[ts] = rec
     return out
 
 
@@ -234,16 +296,20 @@ def _read_full_industry_map() -> dict[str, str]:
     return {k: v for k, v in cached.items() if not k.startswith("_")}
 
 
-def _attach_commodity(rows: list[dict], comm_mom: dict[str, dict]) -> None:
-    """给每行业附上游商品动量（仅映射行业，不影响综合分）。"""
+def _attach_commodity(rows: list[dict], comm_sig: dict[str, dict]) -> None:
+    """给每行业附上游商品信号（仅映射行业，不影响综合分）。"""
     for r in rows:
         ts, cname = INDUSTRY_COMMODITY.get(r["sector_name"], (None, None))
-        if ts and ts in comm_mom:
+        if ts and ts in comm_sig:
             r["commodity"] = cname
-            r["commodity_mom"] = comm_mom[ts]["mom_60"]
+            r["commodity_mom"] = comm_sig[ts]["mom_60"]
+            r["commodity_basis_rate"] = comm_sig[ts].get("basis_rate")
+            r["commodity_wh_change"] = comm_sig[ts].get("wh_change_20")
         else:
             r["commodity"] = ""
             r["commodity_mom"] = None
+            r["commodity_basis_rate"] = None
+            r["commodity_wh_change"] = None
 
 
 def _th_industry_momentum(industry_names: list[str]) -> dict[str, float | None]:
@@ -334,8 +400,8 @@ def _collect_ths_fallback(
             "top_stock": "",
         })
 
-    comm_mom = _fetch_commodity_momentum()
-    _attach_commodity(rows, comm_mom)
+    comm_sig = _fetch_commodity_signal()
+    _attach_commodity(rows, comm_sig)
 
     import pandas as pd
 
@@ -349,11 +415,11 @@ def _collect_ths_fallback(
     rows.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(rows, start=1):
         r["rank"] = i
-    return rows, max_date, comm_mom
+    return rows, max_date, comm_sig
 
 
 def _collect() -> tuple[list[dict], str, dict[str, dict]]:
-    """汇总三信号 → 每行业一行 {name, code, stock_count, bull_count, ...}，返回 (rows, trade_date, comm_mom)。"""
+    """汇总三信号 → 每行业一行 {name, code, stock_count, bull_count, ...}，返回 (rows, trade_date, comm_sig)。"""
     bull_tickers, max_date = _fetch_bull_tickers()
 
     if not bull_tickers:
@@ -401,9 +467,9 @@ def _collect() -> tuple[list[dict], str, dict[str, dict]]:
             "top_stock": flow.top_stock if flow else "",
         })
 
-    # 上游商品动量（领先信号，仅映射行业，不影响综合分）
-    comm_mom = _fetch_commodity_momentum()
-    _attach_commodity(rows, comm_mom)
+    # 上游商品信号（领先信号，仅映射行业，不影响综合分）
+    comm_sig = _fetch_commodity_signal()
+    _attach_commodity(rows, comm_sig)
 
     # 综合分 = 加权分位（pandas rank(pct=True)：None 当 0，并列取平均）
     import pandas as pd
@@ -419,10 +485,10 @@ def _collect() -> tuple[list[dict], str, dict[str, dict]]:
     rows.sort(key=lambda r: r["score"], reverse=True)
     for i, r in enumerate(rows, start=1):
         r["rank"] = i
-    return rows, max_date, comm_mom
+    return rows, max_date, comm_sig
 
 
-def _write_db(rows: list[dict], trade_date: str, comm_mom: dict[str, dict] | None = None) -> bool:
+def _write_db(rows: list[dict], trade_date: str, comm_sig: dict[str, dict] | None = None) -> bool:
     """落库 sector_rank + commodity_rank（同日 DELETE+INSERT 幂等 upsert），失败静默返回 False。"""
     if not rows or not trade_date or _DUCKDB is None:
         return False
@@ -436,6 +502,7 @@ def _write_db(rows: list[dict], trade_date: str, comm_mom: dict[str, dict] | Non
                   stock_count INTEGER, bull_count INTEGER, bull_density DOUBLE,
                   change_pct_10d DOUBLE, main_net_10d DOUBLE, main_pct_10d DOUBLE,
                   top_stock TEXT, commodity TEXT, commodity_mom DOUBLE,
+                  commodity_basis_rate DOUBLE, commodity_wh_change DOUBLE,
                   score DOUBLE, rank INTEGER
                 )
                 """
@@ -443,6 +510,8 @@ def _write_db(rows: list[dict], trade_date: str, comm_mom: dict[str, dict] | Non
             # 兼容旧表（无 commodity 列）
             con.execute("ALTER TABLE sector_rank ADD COLUMN IF NOT EXISTS commodity TEXT")
             con.execute("ALTER TABLE sector_rank ADD COLUMN IF NOT EXISTS commodity_mom DOUBLE")
+            con.execute("ALTER TABLE sector_rank ADD COLUMN IF NOT EXISTS commodity_basis_rate DOUBLE")
+            con.execute("ALTER TABLE sector_rank ADD COLUMN IF NOT EXISTS commodity_wh_change DOUBLE")
             con.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sector_rank "
                 "ON sector_rank(trade_date, sector_name)"
@@ -452,27 +521,30 @@ def _write_db(rows: list[dict], trade_date: str, comm_mom: dict[str, dict] | Non
                 "INSERT INTO sector_rank "
                 "(trade_date, sector_code, sector_name, stock_count, bull_count, bull_density, "
                 " change_pct_10d, main_net_10d, main_pct_10d, top_stock, commodity, commodity_mom, "
-                " score, rank) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " commodity_basis_rate, commodity_wh_change, score, rank) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         trade_date, r["sector_code"], r["sector_name"], r["stock_count"],
                         r["bull_count"], r["bull_density"], r["change_pct_10d"],
                         r["main_net_10d"], r["main_pct_10d"], r["top_stock"],
                         r.get("commodity") or "", r.get("commodity_mom"),
+                        r.get("commodity_basis_rate"), r.get("commodity_wh_change"),
                         r["score"], r["rank"],
                     )
                     for r in rows
                 ],
             )
 
-            # 商品动量单独落表（领先信号的时间序列）
-            if comm_mom:
+            # 商品信号单独落表（领先信号的时间序列）
+            if comm_sig:
                 con.execute(
                     """
                     CREATE TABLE IF NOT EXISTS commodity_rank (
                       trade_date TEXT, thscode TEXT, name TEXT,
-                      close DOUBLE, mom_20 DOUBLE, mom_60 DOUBLE
+                      close DOUBLE, mom_20 DOUBLE, mom_60 DOUBLE,
+                      basis DOUBLE, basis_rate DOUBLE, wh_amount DOUBLE,
+                      wh_change_20 DOUBLE, wh_change_60 DOUBLE
                     )
                     """
                 )
@@ -480,13 +552,23 @@ def _write_db(rows: list[dict], trade_date: str, comm_mom: dict[str, dict] | Non
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_commodity_rank "
                     "ON commodity_rank(trade_date, thscode)"
                 )
+                con.execute("ALTER TABLE commodity_rank ADD COLUMN IF NOT EXISTS basis DOUBLE")
+                con.execute("ALTER TABLE commodity_rank ADD COLUMN IF NOT EXISTS basis_rate DOUBLE")
+                con.execute("ALTER TABLE commodity_rank ADD COLUMN IF NOT EXISTS wh_amount DOUBLE")
+                con.execute("ALTER TABLE commodity_rank ADD COLUMN IF NOT EXISTS wh_change_20 DOUBLE")
+                con.execute("ALTER TABLE commodity_rank ADD COLUMN IF NOT EXISTS wh_change_60 DOUBLE")
                 con.execute("DELETE FROM commodity_rank WHERE trade_date = ?", [trade_date])
                 con.executemany(
-                    "INSERT INTO commodity_rank (trade_date, thscode, name, close, mom_20, mom_60) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO commodity_rank (trade_date, thscode, name, close, mom_20, mom_60, "
+                    " basis, basis_rate, wh_amount, wh_change_20, wh_change_60) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
-                        (trade_date, ts, v["name"], v["close"], v["mom_20"], v["mom_60"])
-                        for ts, v in comm_mom.items()
+                        (
+                            trade_date, ts, v["name"], v["close"], v["mom_20"], v["mom_60"],
+                            v.get("basis"), v.get("basis_rate"), v.get("wh_amount"),
+                            v.get("wh_change_20"), v.get("wh_change_60"),
+                        )
+                        for ts, v in comm_sig.items()
                     ],
                 )
         finally:
@@ -508,7 +590,7 @@ def _is_fallback(rows: list[dict]) -> bool:
     return bool(rows) and all(r.get("main_net_10d") is None for r in rows)
 
 
-def _print_scan(rows: list[dict], trade_date: str, limit: int, comm_mom: dict[str, dict] | None = None) -> None:
+def _print_scan(rows: list[dict], trade_date: str, limit: int, comm_sig: dict[str, dict] | None = None) -> None:
     fallback = _is_fallback(rows)
     print("=" * 78)
     print(f"行业景气雷达（sector-beta）· 数据日 {trade_date or '--'}")
@@ -540,7 +622,12 @@ def _print_scan(rows: list[dict], trade_date: str, limit: int, comm_mom: dict[st
         if r["top_stock"]:
             extra.append(f"主力最大股 {r['top_stock']}")
         if r.get("commodity_mom") is not None:
-            extra.append(f"上游 {r['commodity']} 60日{r['commodity_mom']:+.1f}%")
+            parts = [f"上游 {r['commodity']} 60日{r['commodity_mom']:+.1f}%"]
+            if r.get("commodity_basis_rate") is not None:
+                parts.append(f"基差{r['commodity_basis_rate']:+.1f}%")
+            if r.get("commodity_wh_change") is not None:
+                parts.append(f"仓单20日{r['commodity_wh_change']:+.1f}%")
+            extra.append(" ".join(parts))
         if extra:
             print("        └─ " + "；".join(extra))
 
@@ -549,16 +636,21 @@ def _print_scan(rows: list[dict], trade_date: str, limit: int, comm_mom: dict[st
     for r in rows[-limit:][::-1]:
         print("  " + _row(r))
 
-    if comm_mom:
+    if comm_sig:
         print()
         print("  ── 🔥 上游商品景气（领先信号，60日动量降序）──")
-        for ts, v in sorted(comm_mom.items(), key=lambda kv: -(kv[1].get("mom_60") or -1e9)):
+        print(f"    {'品种':<6} {'20日':>8}  {'60日':>8}  {'基差':>8}  {'仓单20日':>9}")
+        for ts, v in sorted(comm_sig.items(), key=lambda kv: -(kv[1].get("mom_60") or -1e9)):
             mom20 = v.get("mom_20")
             mom60 = v.get("mom_60")
+            basis_rate = v.get("basis_rate")
+            wh20 = v.get("wh_change_20")
             m20 = f"{mom20:+.1f}%" if mom20 is not None else "--"
             m60 = f"{mom60:+.1f}%" if mom60 is not None else "--"
-            print(f"    {v['name']:<6} 20日{m20:>8}  60日{m60:>8}")
-        print("        └─ 商品价格领先 A 股对应板块，60日上行=成本推动/需求回暖的前瞻确认")
+            br = f"{basis_rate:+.1f}%" if basis_rate is not None else "--"
+            w20 = f"{wh20:+.1f}%" if wh20 is not None else "--"
+            print(f"    {v['name']:<6} {m20:>8}  {m60:>8}  {br:>8}  {w20:>9}")
+        print("        └─ 基差>0=现货升水(供给偏紧/需求强)；仓单20日>0=累库(偏空)，<0=去库(偏多)")
 
     print()
     print("  说明:")
@@ -663,13 +755,13 @@ def main() -> int:
         _print_history(limit)
         return 0
 
-    rows, trade_date, comm_mom = _collect()
+    rows, trade_date, comm_sig = _collect()
     if rows:
-        _print_scan(rows, trade_date, limit, comm_mom)
+        _print_scan(rows, trade_date, limit, comm_sig)
         if _is_fallback(rows):
             print("  ⚠️ 降级结果不落库（资金流腿缺失、行业口径较粗），东财恢复后重跑可落库。")
         else:
-            _write_db(rows, trade_date, comm_mom)
+            _write_db(rows, trade_date, comm_sig)
     return 0
 
 
