@@ -13,7 +13,7 @@ from app.utils import log
 
 
 def _detect_market(code: str, provided_market: str = "") -> str:
-    """根据代码特征自动识别市场 (SH/SZ/HK)"""
+    """根据代码特征自动识别市场 (SH/SZ/HK/BJ)"""
     market = str(provided_market).strip().upper()
     if market in VALID_MARKETS:
         return market
@@ -21,11 +21,15 @@ def _detect_market(code: str, provided_market: str = "") -> str:
     # 自动识别逻辑
     if len(code) == 5:
         return "HK"
-    
+
+    # 北交所代码特征：92（新号段）/ 43、83、87（原新三板精选层转入）
+    if code.startswith(("92", "43", "83", "87")):
+        return "BJ"
+
     # 深圳代码特征：00, 30, 15, 16, 18
     if code.startswith(("00", "30", "15", "16", "18")):
         return "SZ"
-    
+
     # 上海代码特征：60, 68, 51, 58
     if code.startswith(("60", "68", "51", "58")):
         return "SH"

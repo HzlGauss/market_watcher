@@ -1105,7 +1105,7 @@ MARKET_PREFIX: dict[str, str] = {
 INDEX_TYPE = "指数"
 
 # 有效的市场标识
-VALID_MARKETS = frozenset(["SH", "SZ", "HK"])
+VALID_MARKETS = frozenset(["SH", "SZ", "HK", "BJ"])
 
 # 有效的标的类型
 VALID_TYPES = frozenset(["宽基 ETF", "行业 ETF", "港股 ETF", "指数", "其他"])
