@@ -242,6 +242,10 @@ def _print_breadth(b: dict):
         print("  ⚠️ 无全市场数据（东财 clist 断连）")
         return
     up_ratio = b["up"] / b["total"] * 100 if b["total"] else 0
+    if b["total"] < 4500:  # 全 A 股约 5000+，分页被截断时广度/成交额不可信
+        print(f"  ⚠️ 全市场数据不完整（仅 {b['total']} 只，疑似分页截断），上涨占比/成交额不可用")
+        print(f"  （已拉取样本按涨跌幅降序截断，仅含当日领涨股，不代表全市场：上涨 {b['up']} / 下跌 {b['down']} / 平盘 {b['flat']}）")
+        return
     print(f"  涨跌家数: 上涨 {b['up']} / 下跌 {b['down']} / 平盘 {b['flat']}  （上涨占比 {up_ratio:.1f}%）")
     print(f"  涨停(≥9.9%) {b['limit_up']} / 跌停(≤-9.9%) {b['limit_down']}   |   全市场成交额 {b['amount_yi']:.0f} 亿")
     print(f"  （注：涨跌停为 9.9% 近似口径，精确梯队/炸板率请走 /limit-analysis）")

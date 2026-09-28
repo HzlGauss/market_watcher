@@ -1491,11 +1491,17 @@ _EM_CLIST_HOSTS = (
 )
 
 
-def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80) -> list[dict]:
+def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80,
+                    page_retries: int = 3, retry_backoff: float = 1.2) -> list[dict]:
     """分页拉取东方财富 clist 接口，返回原始 item dict 列表
 
     clist 每页最多返回 100 条（pz 上限），按 fid 排序逐页拉取直至 total。
     优先 push2delay，失败回退 push2；任一 host 拉到数据即返回。
+
+    接口限频/抖动时会间歇返回空页（diff 为空）或连接失败，本函数对每页做
+    ``page_retries`` 次退避重试，尽量拉满 total，避免静默返回被截断的残缺列表。
+    若最终仍不完整（分页截断），返回已拉取的部分并记 warning——全市场快照类
+    调用方需按条目数（全 A 股约 5000+）自行判断广度/成交额是否可信。
     """
     params = {
         "pn": "1", "pz": "100", "po": "1", "np": "1",
@@ -1511,24 +1517,34 @@ def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80)
         total = None
         for pn in range(1, max_pages + 1):
             params["pn"] = str(pn)
-            resp = eastmoney_client.get(host, params=params, headers=headers, timeout=15)
-            if resp is None:
-                break
-            try:
-                payload = resp.json()
-            except ValueError:
-                break
-            data = payload.get("data") or {}
-            total = data.get("total")
-            diff = data.get("diff") or []
-            if isinstance(diff, dict):  # 个别响应 diff 为 dict（键为页码）
-                diff = list(diff.values())
+            diff = None
+            for attempt in range(page_retries):
+                if attempt:
+                    time.sleep(retry_backoff * attempt)
+                resp = eastmoney_client.get(host, params=params, headers=headers, timeout=15)
+                if resp is None:
+                    continue
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    continue
+                data = payload.get("data") or {}
+                if total is None:
+                    total = data.get("total")
+                diff = data.get("diff") or []
+                if isinstance(diff, dict):  # 个别响应 diff 为 dict（键为页码）
+                    diff = list(diff.values())
+                if diff:
+                    break
+                diff = None  # 空页 → 退避重试
             if not diff:
-                break
+                break  # 本页重试仍失败 → 换 host
             items.extend(diff)
             if total is not None and len(items) >= total:
                 break
         if items:
+            if total is not None and len(items) < total:
+                log.warning(f"clist 拉取不完整 {len(items)}/{total} (fs={fs[:40]})")
             return items
     return []
 
