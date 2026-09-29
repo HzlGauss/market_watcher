@@ -218,12 +218,17 @@ def print_quotes_table(quotes: list[Quote]) -> None:
         print(f"  {line}")
 
 
-def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str]) -> None:
+def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str],
+                           prev_fund_flow: Optional[dict[str, tuple[float, str]]] = None) -> None:
     """打印标记持仓（show_flow=1）的当天资金流 5 档明细，独立成表。
+
+    在 5 档之外附带：主力净流入较上次扫描的增量（源一致时才可比）、量比、换手率。
 
     Args:
         quotes: 行情列表
         flagged_codes: 标记持仓的代码集合
+        prev_fund_flow: 上次扫描的主力净流入快照 {code: (main_net, source)}，
+            用于算增量；源（东财/妙想）口径不一致时不跨源比较。
     """
     if not flagged_codes:
         return
@@ -232,19 +237,35 @@ def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str]) -> None
     if not flagged:
         return
 
-    print(f"\n{Color.BOLD}{Color.CYAN}═══ 重点持仓资金流（5 档） ═══{Color.RESET}")
+    prev_fund_flow = prev_fund_flow or {}
+
+    print(f"\n{Color.BOLD}{Color.CYAN}═══ 重点持仓资金流（5 档 + 量比/换手） ═══{Color.RESET}")
     header = (
         f"{'代码':>8} {'名称':<12} {'来源':>5} "
-        f"{'主力净流入':>11} {'超大单':>11} {'大单':>11} {'中单':>11} {'小单':>11}"
+        f"{'主力净流入':>11} {'增量':>7} "
+        f"{'超大单':>11} {'大单':>11} {'中单':>11} {'小单':>11} "
+        f"{'量比':>6} {'换手率':>8}"
     )
     print(f"{Color.DIM}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 92}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 116}{Color.RESET}")
 
     def _cell(v: Optional[float]) -> str:
         s = _format_compact_flow(v)
         if v is not None and v > 0:
             s = f"{Color.RED}{s}{Color.RESET}"
         elif v is not None and v < 0:
+            s = f"{Color.GREEN}{s}{Color.RESET}"
+        return s
+
+    def _delta_cell(delta: Optional[float]) -> str:
+        if delta is None:
+            return f"{Color.DIM}  --  {Color.RESET}"
+        if delta == 0:
+            return f"{Color.DIM}  0  {Color.RESET}"
+        s = _format_compact_flow(delta)
+        if delta > 0:
+            s = f"{Color.RED}{s}{Color.RESET}"
+        else:
             s = f"{Color.GREEN}{s}{Color.RESET}"
         return s
 
@@ -258,10 +279,38 @@ def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str]) -> None
         if ff.source == "miaoxiang":
             src = f"{Color.YELLOW}{src}{Color.RESET}"
 
+        # 增量：与上次扫描比，仅当数据源一致时才可比
+        delta: Optional[float] = None
+        prev = prev_fund_flow.get(q.code)
+        if prev is not None and ff.main_net is not None:
+            prev_net, prev_src = prev
+            if prev_src == ff.source and prev_net is not None:
+                delta = ff.main_net - prev_net
+
+        # 量比（腾讯源，与主行情表同口径）
+        if q.volume_ratio is not None:
+            vr_str = f"{q.volume_ratio:.2f}"
+            if q.volume_ratio >= 1.5:
+                vr_str = f"{Color.RED}{vr_str}{Color.RESET}"
+            elif q.volume_ratio <= 0.5:
+                vr_str = f"{Color.GREEN}{vr_str}{Color.RESET}"
+        else:
+            vr_str = f"{Color.DIM}--{Color.RESET}"
+
+        # 换手率
+        if q.turnover_rate is not None:
+            tr_str = f"{q.turnover_rate:.2f}%"
+            if q.turnover_rate >= 10:
+                tr_str = f"{Color.YELLOW}{tr_str}{Color.RESET}"
+        else:
+            tr_str = f"{Color.DIM}--{Color.RESET}"
+
         line = (
             f"{q.code:>8} {q.name:<12} {src:>5} "
-            f"{_cell(ff.main_net):>11} {_cell(ff.super_large_net):>11} "
-            f"{_cell(ff.large_net):>11} {_cell(ff.medium_net):>11} {_cell(ff.small_net):>11}"
+            f"{_cell(ff.main_net):>11} {_delta_cell(delta):>7} "
+            f"{_cell(ff.super_large_net):>11} "
+            f"{_cell(ff.large_net):>11} {_cell(ff.medium_net):>11} {_cell(ff.small_net):>11} "
+            f"{vr_str:>6} {tr_str:>8}"
         )
         print(f"  {line}")
     print()

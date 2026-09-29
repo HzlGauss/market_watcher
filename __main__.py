@@ -678,9 +678,15 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     print_quotes_table(quotes)
 
-    # 重点持仓（show_flow=1）单独列当天资金流 5 档明细表
+    # 重点持仓（show_flow=1）单独列当天资金流 5 档明细表（含较上次扫描增量 + 量比/换手率）
     flagged_codes = {h.code for h in config.holdings if h.show_flow == 1}
-    print_flagged_fundflow(quotes, flagged_codes)
+    _prev_flow = getattr(_run_once_new, "_prev_fund_flow", {})
+    print_flagged_fundflow(quotes, flagged_codes, prev_fund_flow=_prev_flow)
+    _run_once_new._prev_fund_flow = {
+        q.code: (q.fund_flow.main_net, q.fund_flow.source)
+        for q in quotes
+        if q.code in flagged_codes and q.fund_flow is not None and q.fund_flow.main_net is not None
+    }
 
     # Print holdings-specific statistics + portfolio P&L
     if holdings_quotes:
