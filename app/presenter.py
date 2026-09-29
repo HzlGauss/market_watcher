@@ -219,15 +219,16 @@ def print_quotes_table(quotes: list[Quote]) -> None:
 
 
 def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str],
-                           prev_fund_flow: Optional[dict[str, tuple[float, str]]] = None) -> None:
+                           prev_fund_flow: Optional[dict] = None) -> None:
     """打印标记持仓（show_flow=1）的当天资金流 5 档明细，独立成表。
 
-    在 5 档之外附带：主力净流入较上次扫描的增量（源一致时才可比）、量比、换手率。
+    每档以「数值(增量)」呈现：括号内为该档较上次快照的增量，仅当数据源
+    （东财/妙想）一致时才可比，否则显示 --。另附量比、换手率。
 
     Args:
         quotes: 行情列表
         flagged_codes: 标记持仓的代码集合
-        prev_fund_flow: 上次扫描的主力净流入快照 {code: (main_net, source)}，
+        prev_fund_flow: 上次快照 {code: {main, super_large, large, medium, small, source}}，
             用于算增量；源（东财/妙想）口径不一致时不跨源比较。
     """
     if not flagged_codes:
@@ -239,35 +240,35 @@ def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str],
 
     prev_fund_flow = prev_fund_flow or {}
 
-    print(f"\n{Color.BOLD}{Color.CYAN}═══ 重点持仓资金流（5 档 + 量比/换手） ═══{Color.RESET}")
+    print(f"\n{Color.BOLD}{Color.CYAN}═══ 重点持仓资金流（5 档 · 括号内=较上次增量） ═══{Color.RESET}")
     header = (
         f"{'代码':>8} {'名称':<12} {'来源':>5} "
-        f"{'主力净流入':>11} {'增量':>7} "
-        f"{'超大单':>11} {'大单':>11} {'中单':>11} {'小单':>11} "
+        f"{'主力净流入(增量)':<18} {'超大单(增量)':<18} {'大单(增量)':<18} "
+        f"{'中单(增量)':<18} {'小单(增量)':<18} "
         f"{'量比':>6} {'换手率':>8}"
     )
     print(f"{Color.DIM}{header}{Color.RESET}")
-    print(f"{Color.DIM}{'-' * 116}{Color.RESET}")
+    print(f"{Color.DIM}{'-' * 134}{Color.RESET}")
 
-    def _cell(v: Optional[float]) -> str:
-        s = _format_compact_flow(v)
+    def _plain(v: Optional[float]) -> str:
+        """非 None 时返回无 ANSI 的紧凑金额（None 用占位符）。"""
+        if v is None:
+            return "  ---  "
+        return _format_compact_flow(v)
+
+    def _tier(v: Optional[float], d: Optional[float]) -> str:
+        """单档「数值(增量)」单元格：先按纯文本定宽，再上色，保证列对齐。"""
+        v_text = _plain(v).rjust(8)
+        d_text = ("--" if d is None else ("0" if d == 0 else _format_compact_flow(d))).rjust(8)
         if v is not None and v > 0:
-            s = f"{Color.RED}{s}{Color.RESET}"
+            v_text = f"{Color.RED}{v_text}{Color.RESET}"
         elif v is not None and v < 0:
-            s = f"{Color.GREEN}{s}{Color.RESET}"
-        return s
-
-    def _delta_cell(delta: Optional[float]) -> str:
-        if delta is None:
-            return f"{Color.DIM}  --  {Color.RESET}"
-        if delta == 0:
-            return f"{Color.DIM}  0  {Color.RESET}"
-        s = _format_compact_flow(delta)
-        if delta > 0:
-            s = f"{Color.RED}{s}{Color.RESET}"
-        else:
-            s = f"{Color.GREEN}{s}{Color.RESET}"
-        return s
+            v_text = f"{Color.GREEN}{v_text}{Color.RESET}"
+        if d is not None and d > 0:
+            d_text = f"{Color.RED}{d_text}{Color.RESET}"
+        elif d is not None and d < 0:
+            d_text = f"{Color.GREEN}{d_text}{Color.RESET}"
+        return f"{v_text}({d_text})"
 
     for q in flagged:
         ff = q.fund_flow
@@ -275,42 +276,50 @@ def print_flagged_fundflow(quotes: list[Quote], flagged_codes: set[str],
             print(f"  {q.code:>8} {q.name:<12} {Color.DIM}暂无资金流数据{Color.RESET}")
             continue
 
-        src = ff.source_label
+        # 来源：先定宽再上色（妙想黄色标注），避免 ANSI 干扰列对齐
+        src = f"{ff.source_label:>5}"
         if ff.source == "miaoxiang":
             src = f"{Color.YELLOW}{src}{Color.RESET}"
 
-        # 增量：与上次扫描比，仅当数据源一致时才可比
-        delta: Optional[float] = None
+        # 增量：与上次快照比，仅当数据源一致时才可比（每档独立算）
         prev = prev_fund_flow.get(q.code)
-        if prev is not None and ff.main_net is not None:
-            prev_net, prev_src = prev
-            if prev_src == ff.source and prev_net is not None:
-                delta = ff.main_net - prev_net
+        if prev is not None and prev.get("source") == ff.source:
+            def _d(cur: Optional[float], pv: Optional[float]) -> Optional[float]:
+                return (cur - pv) if (cur is not None and pv is not None) else None
+            d_main = _d(ff.main_net, prev.get("main"))
+            d_super = _d(ff.super_large_net, prev.get("super_large"))
+            d_large = _d(ff.large_net, prev.get("large"))
+            d_medium = _d(ff.medium_net, prev.get("medium"))
+            d_small = _d(ff.small_net, prev.get("small"))
+        else:
+            d_main = d_super = d_large = d_medium = d_small = None
 
         # 量比（腾讯源，与主行情表同口径）
         if q.volume_ratio is not None:
-            vr_str = f"{q.volume_ratio:.2f}"
+            vr_str = f"{q.volume_ratio:.2f}".rjust(6)
             if q.volume_ratio >= 1.5:
                 vr_str = f"{Color.RED}{vr_str}{Color.RESET}"
             elif q.volume_ratio <= 0.5:
                 vr_str = f"{Color.GREEN}{vr_str}{Color.RESET}"
         else:
-            vr_str = f"{Color.DIM}--{Color.RESET}"
+            vr_str = f"{Color.DIM}  --  {Color.RESET}"
 
         # 换手率
         if q.turnover_rate is not None:
-            tr_str = f"{q.turnover_rate:.2f}%"
+            tr_str = f"{q.turnover_rate:.2f}%".rjust(8)
             if q.turnover_rate >= 10:
                 tr_str = f"{Color.YELLOW}{tr_str}{Color.RESET}"
         else:
-            tr_str = f"{Color.DIM}--{Color.RESET}"
+            tr_str = f"{Color.DIM}  --  {Color.RESET}"
 
         line = (
-            f"{q.code:>8} {q.name:<12} {src:>5} "
-            f"{_cell(ff.main_net):>11} {_delta_cell(delta):>7} "
-            f"{_cell(ff.super_large_net):>11} "
-            f"{_cell(ff.large_net):>11} {_cell(ff.medium_net):>11} {_cell(ff.small_net):>11} "
-            f"{vr_str:>6} {tr_str:>8}"
+            f"{q.code:>8} {q.name:<12} {src} "
+            f"{_tier(ff.main_net, d_main)} "
+            f"{_tier(ff.super_large_net, d_super)} "
+            f"{_tier(ff.large_net, d_large)} "
+            f"{_tier(ff.medium_net, d_medium)} "
+            f"{_tier(ff.small_net, d_small)} "
+            f"{vr_str} {tr_str}"
         )
         print(f"  {line}")
     print()

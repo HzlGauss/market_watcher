@@ -48,6 +48,69 @@ def _ensure_schema(con) -> None:
     )
 
 
+def snapshot_from_detail(detail) -> dict:
+    """FundFlowDetail → 增量计算用的快照 dict（含各档净流入 + source）。
+
+    与 latest_snapshot() 返回同构，供 __main__ 跨扫描/跨进程统一比较。
+    """
+    return {
+        "main": detail.main_net,
+        "super_large": detail.super_large_net,
+        "large": detail.large_net,
+        "medium": detail.medium_net,
+        "small": detail.small_net,
+        "source": detail.source,
+    }
+
+
+def latest_snapshot(code: str, source: Optional[str] = None,
+                    exclude_main: Optional[float] = None) -> Optional[dict]:
+    """读某代码最近一条资金流快照（进程重启首轮扫描的内存兜底）。
+
+    指定 source 时只取同源（东财/妙想口径不一致，不跨源比较）。duckdb 缺失或无记录返回 None。
+    exclude_main 给定时，跳过 main_net 与其相等的最新快照（即本次扫描刚由后台
+    write_snapshot 写入的自身快照），从而拿到「上一次」真实快照、算出有意义的增量。
+    """
+    try:
+        with _lock:
+            con = _connect()
+            try:
+                _ensure_schema(con)
+                cols = "main_net, super_large_net, large_net, medium_net, small_net, source"
+                limit = 3 if exclude_main is not None else 1
+                if source:
+                    rows = con.execute(
+                        f"SELECT {cols} FROM fund_flow_intraday "
+                        "WHERE code = ? AND source = ? ORDER BY ts DESC LIMIT ?",
+                        [code, source, limit],
+                    ).fetchall()
+                else:
+                    rows = con.execute(
+                        f"SELECT {cols} FROM fund_flow_intraday "
+                        "WHERE code = ? ORDER BY ts DESC LIMIT ?",
+                        [code, limit],
+                    ).fetchall()
+                for r in rows:
+                    if exclude_main is not None and r[0] == exclude_main:
+                        continue  # 跳过自身快照
+                    return {
+                        "main": r[0],
+                        "super_large": r[1],
+                        "large": r[2],
+                        "medium": r[3],
+                        "small": r[4],
+                        "source": r[5],
+                    }
+                return None
+            finally:
+                con.close()
+    except ImportError:
+        return None  # 无 duckdb（系统 python3），静默降级
+    except Exception as e:
+        log.debug(f"读资金流快照失败: {e}")
+        return None
+
+
 def write_snapshot(code: str, name: str, detail) -> None:
     """落一条资金流快照（detail: FundFlowDetail）。duckdb 缺失时静默跳过。"""
     if detail is None:

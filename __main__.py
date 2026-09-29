@@ -678,12 +678,25 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     print_quotes_table(quotes)
 
-    # 重点持仓（show_flow=1）单独列当天资金流 5 档明细表（含较上次扫描增量 + 量比/换手率）
+    # 重点持仓（show_flow=1）单独列当天资金流 5 档明细表（每档含较上次扫描增量 + 量比/换手率）
     flagged_codes = {h.code for h in config.holdings if h.show_flow == 1}
     _prev_flow = getattr(_run_once_new, "_prev_fund_flow", {})
-    print_flagged_fundflow(quotes, flagged_codes, prev_fund_flow=_prev_flow)
+
+    # 内存快照缺失（进程首轮扫描）时，用 duckdb 最近一条同源快照兜底算增量
+    from app.intraday_store import latest_snapshot, snapshot_from_detail
+    prev_map: dict = {}
+    for q in quotes:
+        if q.code not in flagged_codes or q.fund_flow is None:
+            continue
+        prev = _prev_flow.get(q.code)
+        if prev is None:
+            prev = latest_snapshot(q.code, q.fund_flow.source, exclude_main=q.fund_flow.main_net)
+        if prev is not None:
+            prev_map[q.code] = prev
+
+    print_flagged_fundflow(quotes, flagged_codes, prev_fund_flow=prev_map)
     _run_once_new._prev_fund_flow = {
-        q.code: (q.fund_flow.main_net, q.fund_flow.source)
+        q.code: snapshot_from_detail(q.fund_flow)
         for q in quotes
         if q.code in flagged_codes and q.fund_flow is not None and q.fund_flow.main_net is not None
     }
