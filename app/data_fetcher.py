@@ -3,6 +3,7 @@
 """
 
 from __future__ import annotations
+import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -1400,8 +1401,8 @@ class BackgroundDataCache:
             if self._stop_event.is_set():
                 return
             time.sleep(1)
-        # 主力净流入刷新间隔更长（300秒=5分钟），因为API容易被屏蔽
-        flow_interval = 300
+        # 主力净流入刷新间隔更长（600秒=10分钟），因为API容易被屏蔽
+        flow_interval = 600
         while not self._stop_event.is_set():
             try:
                 self._refresh_flow()
@@ -1472,7 +1473,7 @@ class BackgroundDataCache:
                     write_snapshot(code, item.name, detail)
                 except Exception:
                     pass  # 落库失败不影响盯盘主流程
-            time.sleep(0.5)  # 请求间隔
+            time.sleep(1.0 + random.random() * 0.4)  # 请求间隔 1.0~1.4s 随机抖动，避免规律性触发限频
 
 
 # ============================================================
