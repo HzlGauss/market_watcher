@@ -106,6 +106,18 @@ def _norm_date(s) -> str:
     return m.group(1) if m else ""
 
 
+def _norm_row(r: dict) -> dict:
+    """归一化行 dict 键名：妙想「近N日」聚合列名带「(区间)」前缀（如 (区间)主力净流入资金），
+    去掉前缀后与 _TIERS / _row_main_net 的无前缀键名对齐。"""
+    out = {}
+    for k, v in r.items():
+        k = str(k)
+        if k.startswith("(") and ")" in k:
+            k = k.split(")", 1)[1]
+        out[k] = v
+    return out
+
+
 def _fmt_amount(v) -> str:
     """元 -> 亿元字符串（保留符号，2 位小数）"""
     if v is None:
@@ -116,6 +128,69 @@ def _fmt_amount(v) -> str:
 def _f(x, nd=2) -> str:
     """浮点 -> 定宽字符串（None 显示 --）。"""
     return f"{x:.{nd}f}" if x is not None else "  --"
+
+
+# --- 五档净流入 迷你条形（diverging bar：│ 为零轴，右=流入 / 左=流出，柱长=规模） ---
+
+_BLOCKS = "▏▎▍▌▋▊▉█"  # 1/8 .. 8/8 填充块
+
+
+def _display_width(s: str) -> int:
+    """字符串终端显示宽度（CJK 按 2 列计，用于对齐中文标签）。"""
+    return sum(2 if ord(c) > 0x2E7F else 1 for c in s)
+
+
+def _pad_display(s: str, width: int) -> str:
+    """按终端显示宽度补齐到 width 列。"""
+    return s + " " * max(0, width - _display_width(s))
+
+
+def _bar_fill(n: float, max_len: int) -> str:
+    """把 n（块数，可含小数）渲染成向右延伸的 █ 块串，长度 ≤ max_len。"""
+    n = max(0.0, min(float(n), float(max_len)))
+    full = int(n)
+    s = "█" * full
+    k = round((n - full) * 8)
+    if k >= 1 and full < max_len:
+        s += _BLOCKS[k - 1]
+    return s
+
+
+def _diverging_bar(v, scale: float, half: int = 12) -> str:
+    """单个净流入 v(元) -> 定宽 diverging bar：零轴│在 half 列，正值向右、负值向左。"""
+    if v is None or scale <= 0 or abs(v) < scale * 1e-6:
+        return " " * half + "│" + " " * half
+    n = abs(v) / scale * half
+    if v < 0:
+        return _bar_fill(n, half).rjust(half) + "│" + " " * half
+    return " " * half + "│" + _bar_fill(n, half).ljust(half)
+
+
+def _print_tier_bars(rows, today_str: str) -> None:
+    """五档表下方打印 diverging 迷你条形（│零轴、右流入/左流出、全表同比）。
+
+    rows: [(日期, row_dict)]，row_dict 键名与妙想结构化结果对齐。
+    任一档均无数据时静默跳过。
+    """
+    entries, scale = [], 0.0
+    for d, r in rows:
+        vals = []
+        for label, key in _TIERS:
+            v = _parse_amount(r.get(key))
+            if v is not None:
+                scale = max(scale, abs(v))
+            vals.append((label, v))
+        entries.append((d, vals))
+    if scale <= 0:
+        return
+    print()
+    print("五档净流入 迷你条形（│=零轴 · →净流入 ←净流出 · 柱长=规模 · 全表同比）")
+    for d, vals in entries:
+        tag = " (今日·实时)" if d == today_str else ""
+        print(f"  {d}{tag}")
+        for label, v in vals:
+            bar = _diverging_bar(v, scale)
+            print(f"    {_pad_display(label, 6)} {_fmt_amount(v):>6}  {bar}")
 
 
 # 场内基金（ETF/LOF）号段，与 app/hithink.py 一致
@@ -419,6 +494,7 @@ def main():
     rows, seen = [], set()
     for t in mx.query_structured(query):
         for r in t.get("rows") or []:
+            r = _norm_row(r)
             d = _norm_date(r.get("日期"))
             main = _row_main_net(r)
             if not d or main is None or d in seen:
@@ -473,6 +549,9 @@ def main():
         tag = " (今日·实时)" if d == today_str else ""
         cells = [_fmt_amount(_parse_amount(r.get(key))) for _, key in _TIERS]
         print(f"  {d}{tag:<9}  " + "  ".join(cells))
+
+    # 五档净流入 迷你条形（diverging bar，全表同比，直观对比各档/各日的流入流出方向与规模）
+    _print_tier_bars(rows, today_str)
 
     # 拆单检测（纯净额版，最新交易日）：小单单边活跃 + 大单/超大单近乎沉默 = 疑似拆单
     _, latest_r = rows[0]
