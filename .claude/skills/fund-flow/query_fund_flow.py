@@ -20,7 +20,7 @@
 """
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
@@ -239,6 +239,113 @@ def _read_intraday_series(code: str) -> list[dict]:
     return out
 
 
+# --- 终端 braille 折线（把当日时序画成 Unicode 盲文字符曲线，直接在 CMD 内显示） ---
+
+# braille 点阵：每个字符 2×4 个点，(x_sub, y_sub) -> 位掩码（x_sub∈{0,1}, y_sub∈{0..3}）
+_BRAILLE_BITS = {
+    (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+    (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+}
+_CURVE_DOT_HEIGHT = 12   # 纵向点分辨率（12 点 = 3 行 braille 字符，曲线更舒展）
+_CURVE_WIDTH = 56        # 横向 braille 字符列数（每列 2 个采样点 = 112 个横轴位置）
+
+
+def _ts_epoch(ts) -> float:
+    """duckdb TIMESTAMP(datetime) -> epoch 秒；其他类型尽量转 float。"""
+    return ts.timestamp() if hasattr(ts, "timestamp") else float(ts)
+
+
+def _interp_value(pts, t):
+    """pts 已按时间升序的 (t_epoch, value) 列表；返回 t 处的线性插值。"""
+    if t <= pts[0][0]:
+        return pts[0][1]
+    if t >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(1, len(pts)):
+        if pts[i][0] >= t:
+            ta, va = pts[i - 1]
+            tb, vb = pts[i]
+            return va + (vb - va) * (t - ta) / (tb - ta) if tb != ta else vb
+    return pts[-1][1]
+
+
+def _render_braille_curve(rows, field="main_net", height=_CURVE_DOT_HEIGHT, width=_CURVE_WIDTH):
+    """把单一时序渲染成 braille 折线。
+
+    rows: 含 ts(时间) 与 field(元) 的 dict 列表；按时间连续、对横轴逐点线性插值连线。
+    返回 (lines, hi, lo, t0, t1)：lines 为字符串列表（每条一行）、hi/lo 为 y 上下界(元)，
+    t0/t1 为起止 epoch 秒；数据不足 2 点返回 None。
+    """
+    pts = []
+    for r in rows:
+        v = r.get(field)
+        ts = r.get("ts")
+        if v is None or ts is None:
+            continue
+        pts.append((_ts_epoch(ts), v))
+    if len(pts) < 2:
+        return None
+    pts.sort()
+    t0, t1 = pts[0][0], pts[-1][0]
+    lo, hi = min(v for _, v in pts), max(v for _, v in pts)
+    # 范围强制覆盖 0（净流入/净流出分界可见），并上下各留 5% 余量
+    lo = min(lo, 0.0)
+    hi = max(hi, 0.0)
+    if hi - lo < 1e-9:
+        hi = lo + 1.0
+    span = hi - lo
+    lo -= span * 0.05
+    hi += span * 0.05
+    span = hi - lo
+
+    n_char_rows = (height + 3) // 4
+    grid = [[0] * width for _ in range(n_char_rows)]
+    n_sub = width * 2
+    for i in range(n_sub):
+        t = t0 + (t1 - t0) * (i / (n_sub - 1)) if n_sub > 1 else t0
+        v = _interp_value(pts, t)
+        frac = (hi - v) / span                      # v=hi -> 0(顶)，v=lo -> 1(底)
+        y = max(0, min(height - 1, round(frac * (height - 1))))
+        x_char, x_sub = divmod(i, 2)
+        grid[y // 4][x_char] |= _BRAILLE_BITS[(x_sub, y % 4)]
+
+    lines = ["".join(chr(0x2800 + bits) for bits in row) for row in grid]
+    return lines, hi, lo, t0, t1
+
+
+def _print_intraday_curve(rows) -> None:
+    """打印当日主力净流入 braille 折线（rows 已读回；数据不足/无数据静默跳过）。"""
+    # 双源口径可能不一致，取快照较多的一方画，避免主力线无端跳变
+    by_src = {}
+    for r in rows:
+        by_src.setdefault(r.get("source") or "eastmoney", []).append(r)
+    if not by_src:
+        return
+    src_rows = max(by_src.values(), key=len)
+    res = _render_braille_curve(src_rows)
+    if res is None:
+        return
+    lines, hi, lo, t0, t1 = res
+    src_name = "东财" if src_rows[0].get("source") == "eastmoney" else "妙想"
+    top = f"{hi / 1e8:+.2f}亿"
+    bot = f"{lo / 1e8:+.2f}亿"
+    lw = max(len(top), len(bot))
+    t0s = datetime.fromtimestamp(t0).strftime("%H:%M")
+    t1s = datetime.fromtimestamp(t1).strftime("%H:%M")
+
+    print(f"  主力净流入 当日日内走势（{src_name}源，{len(src_rows)} 个快照）  单位:亿元")
+    if len(by_src) > 1:
+        print("  ⚠️ 本日混用东财/妙想两渠道，曲线仅取快照较多的一方")
+    print(f"  {top:>{lw}} ┤{lines[0]}")
+    for ln in lines[1:-1]:
+        print(f"  {'':>{lw}} │{ln}")
+    print(f"  {bot:>{lw}} ┤{lines[-1]}")
+    axis = f"{t0s}" + "─" * max(1, len(lines[0]) - len(t0s) - len(t1s)) + f"{t1s}"
+    print(f"  {'':>{lw}}  {axis}")
+    print("  （正值=净流入 · 负值=净流出）")
+    print()
+
+
 def _print_intraday_series(code: str) -> None:
     """打印盯盘落库的当日日内时序（无数据则静默跳过）。"""
     rows = _read_intraday_series(code)
@@ -250,6 +357,7 @@ def _print_intraday_series(code: str) -> None:
     print("=" * 72)
     if len(sources) > 1:
         print("  ⚠️ 本日快照混用「东财/妙想」两个渠道，主力口径可能不一致，趋势仅参考")
+    _print_intraday_curve(rows)
     print("  时间      主力      超大单   大单     中单     小单     来源")
     for r in rows:
         ts = r["ts"]

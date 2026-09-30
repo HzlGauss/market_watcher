@@ -431,9 +431,9 @@ def cmd_sync_valuation(args) -> int:
 
     估值无历史回填，历史分位只能从今天起每日收盘后跑一次累积。幂等：按 trade_date 删旧插新，
     当日重跑自愈（覆盖当天已落库的）。估值允许 null（未披露）或负数（亏损/负现金流），原样保留。
+    trade_date 取同花顺最近交易日（非 date.today()），周末/节假日重跑会覆盖上一交易日快照，不产生脏日期。
     """
     import time as _time
-    from datetime import date as _date
 
     _load_key()
     db = _db_path(args.db)
@@ -471,7 +471,7 @@ def cmd_sync_valuation(args) -> int:
         con.close()
         return 0
 
-    trade_date = _date.today().isoformat()
+    trade_date = _latest_trade_day_str()
     con.execute("DELETE FROM valuation_daily WHERE trade_date = ?", [trade_date])
 
     batch = max(1, min(args.batch, 100))  # 接口一次最多 100 只
