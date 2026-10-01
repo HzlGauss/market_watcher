@@ -143,14 +143,15 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
     else:
         score += 8
 
-    # 突破 25（放量突破才算有效突破；无量创新高 = 假突破嫌疑，降级）
+    # 突破 25（放量突破才算有效突破；无量创新高/逼近前高 = 假突破/滞涨嫌疑，降级）
     vol_confirm = vol_ratio is not None and vol_ratio >= 1.2
+    near_high = high20 is not None and price >= high20 * 0.98
     if broke20:
         score += 25 if vol_confirm else 12
     elif broke60:
         score += 20 if vol_confirm else 10
-    elif high20 is not None and price >= high20 * 0.98:
-        score += 12
+    elif near_high:
+        score += 12 if vol_confirm else 6   # 缩量逼近前高 = 滞涨，减半
     elif ma60 is not None and price >= ma60:
         score += 8
 
@@ -193,8 +194,8 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
     align_txt = ("多头排列" if full_align else
                  "MA5>10>20" if bull_align else
                  "MA5>10" if ma5_gt_ma10 else "站MA20")
-    _no_vol = "（无量）" if (broke20 or broke60) and not vol_confirm else ""
-    breakout_txt = ("创20日新高" if broke20 else "创60日新高" if broke60 else ("逼近高点" if (high20 is not None and price >= high20 * 0.98) else "站MA60" if (ma60 is not None and price >= ma60) else "—")) + _no_vol
+    _no_vol = "（无量）" if (broke20 or broke60 or near_high) and not vol_confirm else ""
+    breakout_txt = ("创20日新高" if broke20 else "创60日新高" if broke60 else ("逼近高点" if near_high else "站MA60" if (ma60 is not None and price >= ma60) else "—")) + _no_vol
 
     return {
         "code": code,
@@ -207,6 +208,8 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         "align": align_txt,
         "macd_sig": macd.signal if macd else "",
         "breakout": breakout_txt,
+        "stop": round(ma20, 2) if ma20 else None,          # 止损位 = MA20
+        "brk": round(high20, 2) if high20 else (round(high60, 2) if high60 else None),  # 突破位 = 前高
         "score": score,
     }
 
@@ -328,6 +331,7 @@ def _score_pullback(code: str, stock: dict, klines, turnover: float | None = Non
         "dist_ma10": round(dist_ma10, 1),
         "align": align_txt,
         "recent_high": round(recent_high, 2),
+        "stop": round(ma20, 2) if ma20 else None,   # 止损位 = MA20
         "score": score,
     }
 
@@ -430,6 +434,117 @@ def _flow_check(results, top: int) -> None:
     print("  说明: 右侧追的是「资金 + 趋势」共振，主力近5日净流入更稳；净流出则追高风险大，谨慎。")
 
 
+def _find_val_col(tables, *keywords) -> float | None:
+    """在妙想 query_structured 表格里找列名同时含所有关键词的列，返回最新一行的数值（百分位）。"""
+    for t in tables or []:
+        for col in (t.get("columns") or []):
+            if all(k in col for k in keywords):
+                for r in (t.get("rows") or []):
+                    v = _num_with_unit(r.get(col))
+                    if v is not None:
+                        return v
+    return None
+
+
+def _valuation_check(results, top: int) -> None:
+    """对 top 候选查 PB/PE 历史分位（本地 valuation_daily 优先、妙想兜底），>70 = 高位周期顶风险。
+
+    右侧追涨最大的坑是买在周期/白马的历史高位（如万华化学），估值分位是唯一能在技术上提示
+    「价格已在高位」的门槛。本地库估值快照累积 <20 日时返回 None，回退妙想；都缺失则显示
+    -- 待查（不做静默空转）。
+    """
+    try:
+        from app.config import Config
+        from app.utils import load_env
+        from app import fundamental_local
+    except Exception:
+        return
+    mx = None
+    try:
+        load_env(_ROOT)
+        config = Config(_ROOT / "watchlist_config.json")
+        keys = config.mx_apikeys
+        if keys:
+            from app.miaoxiang import MXClient
+            mx = MXClient(keys)
+    except Exception:
+        mx = None
+
+    n_val = min(top, len(results), 10)
+    print()
+    print("=" * 72)
+    print(f"估值分位确认（前 {n_val} 名，本地库逐日累积 + 妙想兜底）")
+    print("=" * 72)
+    print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'PE分位':>8}  判定")
+    print("  " + "-" * 50)
+    for r in results[:n_val]:
+        pb_pct = pe_pct = None
+        try:
+            v = fundamental_local.valuation_percentile(r["code"])
+            if v:
+                pb_pct, pe_pct = v.get("pb_pct"), v.get("pe_pct")
+        except Exception:
+            pass
+        if pb_pct is None and mx is not None:
+            try:
+                tables = mx.query_structured(f"{r['name']} {r['code']} 市净率 历史分位")
+                pb_pct = _find_val_col(tables, "市净率", "百分位")
+            except Exception:
+                pass
+        if pe_pct is None and mx is not None:
+            try:
+                tables = mx.query_structured(f"{r['name']} {r['code']} 市盈率 历史分位")
+                pe_pct = _find_val_col(tables, "市盈率", "百分位")
+            except Exception:
+                pass
+        r["pb_pct"] = pb_pct
+        r["pe_pct"] = pe_pct
+        high = (pb_pct is not None and pb_pct > 70) or (pe_pct is not None and pe_pct > 70)
+        tag = ("⚠️ 高位" if high else "✅ 不高" if (pb_pct is not None or pe_pct is not None) else "-- 待查")
+        pb_txt = f"{pb_pct:.0f}%" if pb_pct is not None else "  --"
+        pe_txt = f"{pe_pct:.0f}%" if pe_pct is not None else "  --"
+        print(f"  {r['code']:<8}{r['name']:<10}{pb_txt:>8}{pe_txt:>8}  {tag}")
+    print()
+    print("  说明: PB/PE 历史分位 >70 = 估值在高位（周期/白马顶），右侧追高风险大，建议回避或轻仓；-- 待查 = 数据缺失需人工确认。")
+
+
+def _board_beta_warning(pool: dict) -> None:
+    """板块资金流退潮检测：查询板块近5日主力净流出时，输出右侧追高风险提示。
+
+    右侧本质是跟随 beta，板块资金退潮（5日主力净流出）时追高最易被套。取成分股池的
+    source(板块名) 去重，在东财 5日 行业+概念资金流里查这些板块累计净流入；指数/板
+    (沪深300/创业板等) 无对应东财行业板块，自然跳过。查不到则静默（不误报）。
+    """
+    from app.board_pool import INDEX_ALIASES, BOARD_FS
+    from app.data_fetcher import fetch_sector_fund_flow_rank
+
+    skip = set(INDEX_ALIASES.keys()) | set(BOARD_FS.keys())
+    sources = set()
+    for st in pool.values():
+        s = st.get("source", "")
+        if s and not s.startswith("同花顺·") and s not in skip:
+            sources.add(s)
+    if not sources:
+        return
+    flows: dict[str, float | None] = {}
+    try:
+        for st in ("行业资金流", "概念资金流"):
+            for f in fetch_sector_fund_flow_rank("5日", st):
+                flows.setdefault(f.name, f.main_net)
+    except Exception:
+        return
+    if not flows:
+        return
+    matched = {s: flows[s] for s in sources if s in flows}
+    if not matched:
+        return
+    net = sum(v for v in matched.values() if v is not None)
+    if net < 0:
+        names = "/".join(sorted(matched))
+        print()
+        print(f"  ⚠️ 板块退潮：{names} 近5日主力净流出 {net / 1e8:.1f} 亿，右侧追高风险大，建议降级/观望")
+
+
 # ---------------------------------------------------------------- 本地库 streaks 初筛
 
 def _prescreen(pool: dict, kinds: list, min_pool: int = 40) -> tuple[dict, str]:
@@ -483,6 +598,7 @@ def main():
         print("   支持: 指数(沪深300/中证500/中证1000/上证50) / 板(创业板/科创板) / 行业(半导体/化工/白酒...)")
         return 1
     print(f"  成分股池: {len(pool)} 只（已剔除北交所/B股等无新浪K线的标的）")
+    _board_beta_warning(pool)
 
     if not full:
         pool, prescreen_note = _prescreen(pool, ["vol-price-up", "new-high"])
@@ -493,6 +609,7 @@ def main():
     print(f"  逐股检测中（{len(pool)} 只，约需 1~3 分钟）...")
     turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
+    pullback_results = []
     done = 0
     for code, stock in pool.items():
         try:
@@ -503,13 +620,16 @@ def main():
             r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
                 results.append(r)
+            p = _score_pullback(code, stock, klines, turnover_map.get(code))
+            if p is not None:
+                pullback_results.append(p)
         except Exception:
             pass
         done += 1
         if done % 50 == 0:
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
-    if not results:
+    if not results and not pullback_results:
         print("\n❌ 当前该板块/行业无符合条件的右侧机会候选（多处于「未站上MA20」或「无量无突破」状态）")
         return 0
 
@@ -519,16 +639,18 @@ def main():
     weak_n = len(results) - len(strong) - len(mid)
 
     header = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'5日涨%':>7}{'量比':>6}{'换手%':>6}"
-              f"{'均线':<10}{'MACD':>6}{'突破':<10}{'分':>4}  分级")
+              f"{'均线':<10}{'MACD':>6}{'突破':<10}{'止损':>8}{'突破位':>8}{'分':>4}  分级")
 
     def _dump(rows, limit):
         for r in rows[:limit]:
             gain_txt = f"{r['gain5']:.1f}" if r["gain5"] is not None else "  --"
             vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
             tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
+            stop_txt = f"{r['stop']:.2f}" if r.get("stop") is not None else "  --"
+            brk_txt = f"{r['brk']:.2f}" if r.get("brk") is not None else "  --"
             print(f"  {r['code']:<8}{r['name']:<10}{r['source']:<12}{r['price']:>8.2f}{gain_txt:>7}"
                   f"{vol_txt:>6}{tr_txt:>6}{r['align']:<10}{r['macd_sig']:>6}{r['breakout']:<10}"
-                  f"{r['score']:>4}  {_verdict(r['score'])}")
+                  f"{stop_txt:>8}{brk_txt:>8}{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
     print("=" * 72)
@@ -538,7 +660,7 @@ def main():
     if strong:
         print(f"\n  【✅ 强信号 · 可重点看】 {len(strong)} 只，显示前 {min(top, len(strong))}")
         print(header)
-        print("  " + "-" * 98)
+        print("  " + "-" * 114)
         _dump(strong, top)
     else:
         print("\n  ❌ 无 score≥75 的强信号候选（该板块当前多为中弱档，趋势确认不足）")
@@ -547,23 +669,44 @@ def main():
         show_mid = min(len(mid), 10)
         print(f"\n  【⚠️ 观察 · 中档 55~74 · 仅跟踪、不急于买】 {len(mid)} 只，显示前 {show_mid}")
         print(header)
-        print("  " + "-" * 98)
+        print("  " + "-" * 114)
         _dump(mid, show_mid)
 
     if weak_n:
         print(f"\n  （另有 {weak_n} 只 score<55 弱档未显示——只跟随大盘、无增量信息）")
 
+    # ---- 回踩买点：趋势多头 + 近期创新高 + 现价回踩缩量 + 未破 MA20（真正的右侧入场点） ----
+    if pullback_results:
+        pullback_results.sort(key=lambda x: -x["score"])
+        pheader = (f"  {'代码':<8}{'名称':<10}{'板块':<12}{'现价':>8}{'回撤%':>7}{'量比':>6}{'换手%':>6}"
+                   f"{'位置':<10}{'止损':>8}{'分':>4}  分级")
+        print()
+        print("=" * 72)
+        print(f"🎯 回踩买点候选（趋势已确认 + 现价缩量回踩不破位 = 可介入的右侧入场点，共 {len(pullback_results)} 只）")
+        print("=" * 72)
+        print(pheader)
+        print("  " + "-" * 96)
+        for p in pullback_results[:top]:
+            vol_txt = f"{p['vol_ratio']:.2f}" if p["vol_ratio"] is not None else "  --"
+            tr_txt = f"{p['turnover']:.1f}" if p["turnover"] is not None else "  --"
+            stop_txt = f"{p['stop']:.2f}" if p.get("stop") is not None else "  --"
+            print(f"  {p['code']:<8}{p['name']:<10}{p['source']:<12}{p['price']:>8.2f}{p['drawdown']:>7.1f}"
+                  f"{vol_txt:>6}{tr_txt:>6}{p['align']:<10}{stop_txt:>8}"
+                  f"{p['score']:>4}  {_verdict(p['score'])}")
+
     print()
     print("  说明:")
     print("    - 板块=成分归属；5日涨%=近5个交易日涨幅；量比=今日量/前5日均量（≥1.2 放量，≥2 显著放量）")
     print("    - 换手%=今日换手率（<1% 地量 / 1~3% 正常 / 3~5% 活跃 / ≥5% 高换手），高换手确认真放量、低换手则量比可能虚高存疑")
-    print("    - 均线：多头排列(MA5>10>20>60 最强) / MA5>10>20 / MA5>10 / 站MA20；突破=创20/60日新高或逼近高点")
+    print("    - 均线：多头排列(MA5>10>20>60 最强) / MA5>10>20 / MA5>10 / 站MA20；突破=创20/60日新高或逼近高点；「（无量）」=缩量创新高/逼近前高，滞涨嫌疑")
+    print("    - 止损=MA20（收盘跌破即离场）；突破位=前高（近20/60日高点，回踩不破可再进）")
     print("    - 分级：✅强(≥75 主信号) / ⚠️中(55~74 观察) / 🔸弱(<55 不显示)")
-    print("    - ⚠️ 右侧是「趋势确认」信号，不是「选出来就买」：候选≠买点，买点=回踩 MA5/MA10 或突破位不破再进，止损=跌破 MA20 收盘确认即走")
+    print("    - ⚠️ 右侧是「趋势确认」信号，不是「选出来就买」：候选≠买点，买点=🎯回踩买点候选（缩量回踩不破）或回踩 MA5/MA10/突破位不破再进，止损=跌破 MA20 收盘确认即走")
     print("      回测（3 年 × 沪深300/中证500/中证1000）显示右侧确认信号净 edge 仅 ±0.2%，本质上跟随大盘；追高被套多发生在震荡/弱势市")
-    print("      建议配合 market-heat 判断市场情绪，弱势市右侧信号降级或仅轻仓试错。")
+    print("      叠加板块退潮提示 + 估值分位门槛（PB/PE>70 高位）与 market-heat 判断，弱势市/高位周期股右侧信号降级或仅轻仓试错。")
 
     _flow_check(results, top)
+    _valuation_check(results, top)
     return 0
 
 
