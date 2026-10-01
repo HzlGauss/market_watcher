@@ -109,9 +109,6 @@ py .claude/skills/limit-analysis/scan_limit.py [日期YYYYMMDD]
 # Auction scan (早盘竞价雷达：个股竞价强弱 + 全市场短线风向标 → 竞价情绪)
 py .claude/skills/auction/scan_auction.py [板块/行业|代码列表] [数量]
 
-# Marketdb sync (本地行情库增量同步：auto-sync 自动判断 skip/incremental/full)
-py .claude/skills/marketdb-sync/sync_marketdb.py
-
 # Sector-beta scan (行业景气雷达：牛股密度+板块动量+主力资金流 三信号给行业打分排名，落库长期观测)
 py .claude/skills/sector-beta/scan_sector_beta.py [数量] [--history]
 
@@ -147,7 +144,6 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`market-watch`** — 大盘盯盘：拉 8 大核心指数实时行情 + 近 60 日位置 + 全市场广度（涨跌家数/成交额/涨跌停）+ 行业/概念板块领涨领跌 + 两融余额（替代已停披露的北向资金），判断当前大盘强弱与进攻/防守。用户问「今天大盘怎么样」「大盘强不强」「现在该进攻还是防守」「指数什么位置」「市场广度/情绪如何」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-watch/SKILL.md`。
 - **`limit-analysis`** — 涨跌停深度分析：拉最近交易日涨停池/炸板池/跌停池，算涨停梯队（连板高度分层）、炸板率、封单额 TOP、题材归类、跌停池，判断短线情绪周期与主线题材。涨跌停用同花顺/东财精确口径（10%/20%/ST 5%），非 9.9% 近似。用户问「今天多少涨停/跌停」「涨停梯队/连板高度」「炸板率」「谁在涨停、什么题材」「短线情绪怎么样」「空间板是谁」时使用。同花顺主源 + akshare 兜底（无 key 需 `pip install akshare`）。详见 `.claude/skills/limit-analysis/SKILL.md`。
 - **`auction`** — 早盘竞价雷达：拉全市场短线风向标竞价基准 + 自选/持仓/指定板块个股集合竞价快照，算竞价涨跌幅/量比/竞价换手/昨量比/未匹配量，输出「高开强势/低开弱势」分层。用户问「今天竞价怎么样」「早盘竞价强弱」「XX 竞价高开/低开」「竞价能不能追/要不要竞价卖」「竞价情绪怎么样」时使用。仅支持 A 股（自动过滤 ETF/基金），需 `HITHINK_FINANCE_API_KEY`，不依赖 `MX_APIKEY`。详见 `.claude/skills/auction/SKILL.md`。
-- **`marketdb-sync`** — 本地行情库增量同步：跑同花顺 marketdb 的 `auto-sync`，按本地日K最大日期与远端最新交易日的差距自动判断 skip/incremental/full，把本地 DuckDB 日K补齐到最新。用户说「更新本地行情库」「增量更新 marketdb」「把日K同步到最新」时使用。首次需先 `python tools/marketdb_local.py bootstrap` 建库。路径经 `MARKETDB_SRC`/`MARKETDB_DB_PATH` 环境变量动态定位。详见 `.claude/skills/marketdb-sync/SKILL.md`。
 - **`sector-beta`** — 行业景气雷达：用「牛股密度（行业近 250 日翻倍股占比）+ 板块动量（10 日涨跌）+ 主力资金流（10 日净流入）」三信号给全市场行业打分排名，输出主线行业；每次结果落库 `data/sector_beta.duckdb`，`--history` 看持续性/轮动/新晋。用户问「现在主线行业是什么」「哪些行业有大机会/持续性」「行业轮动到哪了」「哪个行业牛股多」时使用。自上而下选行业（行业 beta 是牛股主因）。不依赖 `MX_APIKEY`，需本地 duckdb（miniconda python）。详见 `.claude/skills/sector-beta/SKILL.md`。
 
 ## Configuration
