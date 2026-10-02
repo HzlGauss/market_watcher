@@ -51,6 +51,7 @@ from app.technical import (
     calc_kdj,
 )
 from app.kline_local import fetch_daily_local_first
+from app.regime import gate_side
 
 
 # 候选池指数（代码 -> 白马成色分）：上证50(超大盘) > 沪深300(大盘蓝筹) > 中证红利(高股息白马)
@@ -494,12 +495,17 @@ def main():
     turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     deep_results = []
+    suppressed = 0
     done = 0
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
             klines = fetch_daily_local_first(code, market, days=250)
             if not klines or len(klines) < 60:
+                continue
+            ok, note = gate_side(code, "left")
+            if not ok:
+                suppressed += 1
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
@@ -511,7 +517,10 @@ def main():
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
     if not results and not deep_results:
-        print("\n❌ 当前无符合条件的黄金坑候选（成分股多处于「未明显回调」或「已破位走坏」状态）")
+        msg = "当前无符合条件的黄金坑候选（成分股多处于「未明显回调」或「已破位走坏」状态）"
+        if suppressed:
+            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（牛市禁左侧埋伏）被抑制"
+        print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])
@@ -543,6 +552,8 @@ def main():
         print("  （无 20%~45% 区间的常规黄金坑候选）")
 
     print()
+    if suppressed:
+        print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（牛市禁左侧埋伏——广度高时超跌是真弱）")
     print("  说明:")
     print("    - 指数=候选所属指数（上证50/沪深300/中证红利）；市值=总市值（行情源未覆盖的新纳入成分显示 —）；回撤%=现价距近120日高点跌幅")
     print("    - 缩量比=坑段均量/高点前20日均量（<0.6 健康）；站MA20/MACD金叉/KDJ金叉/止跌形态=企稳信号")

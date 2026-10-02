@@ -183,6 +183,17 @@ def _print_identity(code: str, name: str, board: str):
         print(f"  指数成分: {' / '.join(membership)}（{'核心白马蓝筹' if '上证50' in membership else '白马/蓝筹'}）")
     else:
         print("  指数成分: 不在 沪深300/上证50/中证红利 中（是否「白马」需看下方基本面）")
+    try:
+        from app.regime import gate_side, get_board_regime
+        reg = get_board_regime(code)
+        if reg:
+            ok, note = gate_side(code, "left")
+            txt = f"  板块广度 regime: {reg['regime']}（{reg['board']}，asof {reg['asof']}）"
+            if not ok:
+                txt += f" — ⚠️ {note}"
+            print(txt)
+    except Exception:
+        pass
     print("  （基本面质地见【4】，估值分位见【4】）")
 
 

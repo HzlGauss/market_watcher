@@ -238,6 +238,17 @@ def _print_dragon_id(code: str, name: str, board: str, pcts: list[float],
     print("=" * 72)
     limit = _limit_pct(code) * 100
     print(f"  涨跌停幅度 ±{limit:.0f}%（{board}）")
+    try:
+        from app.regime import gate_side, get_board_regime
+        reg = get_board_regime(code)
+        if reg:
+            ok, note = gate_side(code, "right")
+            txt = f"  板块广度 regime: {reg['regime']}（{reg['board']}，asof {reg['asof']}）"
+            if not ok:
+                txt += f" — ⚠️ {note}"
+            print(txt)
+    except Exception:
+        pass
     # 首波连板 = 在首波顶点往前数连续涨停（龙头成色的关键）。龙回头标的当前已回调，
     # 若从最新一根往回数会把「连板」漏成 0/1，须定位到首波顶点 hi。
     wave_consec = _consecutive_limit_ups(pcts, code, wave["hi"]) if wave else 0

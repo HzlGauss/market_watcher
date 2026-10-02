@@ -53,6 +53,7 @@ from app.technical import (
     calc_kdj,
 )
 from app.kline_local import fetch_daily_local_first
+from app.regime import gate_side
 
 
 def _f(x, nd=2) -> str:
@@ -466,6 +467,7 @@ def main():
     turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     deep_results = []
+    suppressed = 0
     done = 0
     for code, stock in pool.items():
         try:
@@ -475,6 +477,10 @@ def main():
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
+                ok, note = gate_side(code, "left")
+                if not ok:
+                    suppressed += 1
+                    continue
                 (deep_results if r.get("overdeep") else results).append(r)
         except Exception:
             pass
@@ -483,7 +489,10 @@ def main():
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
     if not results and not deep_results:
-        print("\n❌ 当前该板块/行业无符合条件的左侧机会候选（多处于「未明显回调」或「已破位走坏」状态）")
+        msg = "当前该板块/行业无符合条件的左侧机会候选（多处于「未明显回调」或「已破位走坏」状态）"
+        if suppressed:
+            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（牛市禁左侧埋伏）被抑制"
+        print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])
@@ -512,6 +521,8 @@ def main():
               f"{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
+    if suppressed:
+        print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（牛市禁左侧埋伏——广度高时超跌是真弱）")
     print("  说明:")
     print("    - 板块=成分归属（指数名/行业名）；回撤%=现价距近120日高点跌幅；缩量比=回调段均量/高点前20日均量（<0.6 抛压衰竭）")
     print("    - 换手%=今日换手率（<1% 地量确认真缩量 / ≥5% 高换手则缩量存疑）")

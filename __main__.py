@@ -424,6 +424,7 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
 
     # 展示组合策略信号（盯盘实时）
     from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    from app.regime import annotate_strategy_alert
     all_strategy_signals: list[tuple[str, str, str]] = []  # (name, code, signal_text)
     for code in quote_map:
         quote = quote_map[code]
@@ -438,7 +439,8 @@ def _run_once(config: Config, north_fetcher: NorthFlowFetcher, call_llm: bool = 
         triggering = [s for s in signals if s.is_triggering]
         if triggering:
             for s in triggering:
-                all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code, s.to_alert_text()))
+                all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code,
+                                             annotate_strategy_alert(code, s.strategy_name, s.direction, s.to_alert_text())))
         else:
             # 没有触发信号时显示"无信号"
             all_strategy_signals.append((item_map.get(code, monitor_items[0]).name, code, "⚪ [无信号]"))
@@ -785,6 +787,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
 
     # Evaluate strategy signals
     from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    from app.regime import annotate_strategy_alert
     from app.models import Alert as StrategyAlert
     all_strategy_signals: list[tuple[str, str, str]] = []
     strategy_alerts: list[StrategyAlert] = []
@@ -808,7 +811,7 @@ def _run_once_new(config: Config, north_fetcher: NorthFlowFetcher, data_pool,
                     # Build alert text and strategy-alert for pipeline
                     messages = []
                     for s in triggering:
-                        alert_text = s.to_alert_text()
+                        alert_text = annotate_strategy_alert(code, s.strategy_name, s.direction, s.to_alert_text())
                         if alert_text:
                             all_strategy_signals.append((quote.name, code, alert_text))
                             messages.append(alert_text)
@@ -1271,19 +1274,32 @@ def _run_marketdb_steps(steps) -> None:
 
 
 def _run_data_sync() -> None:
-    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积（每日用）。
+    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积 + regime 重算（每日用）。
 
-    两项都走 tools/marketdb_local.py 子命令：
+    前两项走 tools/marketdb_local.py 子命令：
     - sync: auto-sync 自动判断 skip/incremental/full，把本地日K补齐到最近交易日（T+1，最多到昨天）
     - sync-valuation --all: 全市场估值快照落库（PE/PB/PS/PCF），历史分位需每日收盘后累积
+    第三项走 app/regime.py --update：离线重算分层广度 regime（站上MA20占比 → 牛/熊/震荡），
+    供盘中买卖门控用（scan_position / left-side / right-side 等热路径只做 JSON 查表）。
     """
     print(f"\n{Color.BOLD}{Color.CYAN}🔄 数据更新（本地行情库）{Color.RESET}")
-    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）{Color.RESET}")
+    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）  ③ regime 重算（广度牛熊）{Color.RESET}")
     print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
     _run_marketdb_steps([
         ("日K 增量同步", ["sync"]),
         ("估值快照累积", ["sync-valuation", "--all"]),
     ])
+    # ③ 分层广度 regime 重算（依赖 duckdb/pandas，与 marketdb 同解释器）
+    py = os.environ.get("MARKETDB_PYTHON") or sys.executable
+    print(f"{Color.BOLD}分层广度 regime 重算:{Color.RESET}")
+    try:
+        rc = subprocess.run([py, "-m", "app.regime", "--update"], cwd=str(BASE_DIR)).returncode
+        if rc == 0:
+            print(f"{Color.GREEN}  ✅ regime 重算完成{Color.RESET}\n")
+        else:
+            print(f"{Color.YELLOW}  ⚠️ regime 重算退出码 {rc}（可能缺 duckdb/pandas，回退指数 MA20/MA60）{Color.RESET}\n")
+    except Exception as e:
+        print(f"{Color.RED}  ❌ regime 重算失败: {e}{Color.RESET}\n")
 
 
 def _run_financials_sync() -> None:

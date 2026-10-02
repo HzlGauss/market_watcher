@@ -154,6 +154,7 @@ def _get_holdings_strategy_signals(
     """
     from app.technical import get_technical_summary
     from app.strategy import evaluate_all_strategies, calc_macd_dif_series
+    from app.regime import annotate_strategy_alert
     from app.models import TechSnapshot, tech_snapshot_to_summary
     from app.analyzer import _load_scan_history
     from concurrent.futures import ThreadPoolExecutor
@@ -192,7 +193,10 @@ def _get_holdings_strategy_signals(
             return {
                 "name": h.name,
                 "code": h.code,
-                "signals": [s.to_alert_text() for s in triggering],
+                "signals": [
+                    annotate_strategy_alert(h.code, s.strategy_name, s.direction, s.to_alert_text())
+                    for s in triggering
+                ],
             }
         else:
             # 没有触发信号时显示"无信号"

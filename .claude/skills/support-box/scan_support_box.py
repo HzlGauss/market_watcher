@@ -48,6 +48,7 @@ except Exception:
 logging.disable(logging.WARNING)
 
 from app.board_pool import resolve_board_pool
+from app.regime import gate_side
 from app.helpers import _detect_market
 from app.technical import (
     detect_box_regime,
@@ -245,6 +246,7 @@ def main():
     print()
     print(f"  逐股检测中（{len(pool)} 只，约需 1~4 分钟）...")
     results = []
+    suppressed = 0
     done = 0
     for code, stock in pool.items():
         try:
@@ -254,6 +256,10 @@ def main():
                 continue
             r = _score_support_box(code, stock, klines)
             if r is not None:
+                ok, note = gate_side(code, "left")
+                if not ok:
+                    suppressed += 1
+                    continue
                 results.append(r)
         except Exception:
             pass
@@ -262,7 +268,10 @@ def main():
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
     if not results:
-        print("\n❌ 当前该板块/行业无符合「箱体极低位 + 强支撑」的候选（多处于箱体中高位、距支撑较远、或已深破支撑）")
+        msg = "当前该板块/行业无符合「箱体极低位 + 强支撑」的候选（多处于箱体中高位、距支撑较远、或已深破支撑）"
+        if suppressed:
+            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（牛市禁左侧埋伏）被抑制"
+        print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])

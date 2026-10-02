@@ -367,6 +367,19 @@ def main():
                 if stage.reasons:
                     print(f"    判据: " + "；".join(stage.reasons))
                 print(f"    建议: {stage.action}")
+                try:
+                    from app.regime import get_board_regime, gate_position
+                    reg = get_board_regime(code)
+                    if reg:
+                        print(f"  板块广度 regime: {reg['regime']}（{reg['board']}，asof {reg['asof']}）")
+                        action = ("add" if stage.stage in ("启动期", "磨底期", "下跌期")
+                                  else "reduce" if stage.stage in ("赶顶期", "派发期") else "")
+                        if action:
+                            g = gate_position(code, stage.stage, action)
+                            if not g["ok"]:
+                                print(f"    ⚠️ regime 抑制该信号: {g['note']}")
+                except Exception:
+                    pass
         except Exception:
             pass
 

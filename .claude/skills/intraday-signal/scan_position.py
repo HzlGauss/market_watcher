@@ -150,8 +150,9 @@ def main():
                 sugg = f"｜加仓挂单价 {s.suggested_price:.2f}"
             else:
                 sugg = ""
+            reg = f" [{s.regime}]" if getattr(s, "regime", "") else ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
-                  f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
+                  f"阶段[{s.stage}]{reg} 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
                 print(f"      └─ {'；'.join(s.reasons)}")
 
@@ -166,8 +167,9 @@ def main():
                 sugg = f"｜减仓挂单价 {s.suggested_price:.2f}"
             else:
                 sugg = ""
+            reg = f" [{s.regime}]" if getattr(s, "regime", "") else ""
             print(f"  {s.action_label}  {s.name}({s.code})  现价 {s.price:.2f}  "
-                  f"阶段[{s.stage}] 置信{s.confidence_label}({s.confidence}%){sugg}")
+                  f"阶段[{s.stage}]{reg} 置信{s.confidence_label}({s.confidence}%){sugg}")
             if s.reasons:
                 print(f"      └─ {'；'.join(s.reasons)}")
 
@@ -176,6 +178,8 @@ def main():
     print("    - 阶段映射：启动期/磨底期/下跌期=加仓（右侧/左侧埋伏/左侧接刀），赶顶期/派发期=减仓")
     print("    - 置信度 = detect_stage 阶段判定置信；挂单区间=加仓支撑上方低吸、减仓压力下方高抛")
     print("    - 日K级慢变量，盘中/盘后均可运行；是否操作由 AI 依据 SKILL.md 框架生成")
+    print("    - 已按板块广度 regime 门控：熊市只留左侧买/赶顶减，牛市只留右侧买/派发减/前低止损；")
+    print("      反向信号（熊市追涨、牛市抄底、牛市赶顶减仓等）已抑制，不在上方列出")
     return 0
 
 

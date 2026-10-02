@@ -17,6 +17,7 @@ from .models import Quote, WatchItem, KlineData
 from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary, detect_stage
 from .technical import fetch_historical_kline
 from .http_client import serverchan_client
+from .regime import gate_position
 
 API_BASE = "https://sctapi.ftqq.com"
 
@@ -80,7 +81,8 @@ class PositionSignal:
     def __init__(self, code: str, name: str, action: str, stage: str,
                  confidence: int, reasons: list[str], price: float,
                  suggested_price: float = 0.0,
-                 suggested_low: float = 0.0, suggested_high: float = 0.0):
+                 suggested_low: float = 0.0, suggested_high: float = 0.0,
+                 regime: str = ""):
         self.code = code
         self.name = name
         self.action = action
@@ -91,6 +93,7 @@ class PositionSignal:
         self.suggested_price = suggested_price  # 建议挂单价（加仓=买入、减仓=卖出）
         self.suggested_low = suggested_low      # 挂单区间下沿（加仓=买入、减仓=卖出）
         self.suggested_high = suggested_high    # 挂单区间上沿
+        self.regime = regime                    # 板块广度 regime（牛/熊/震荡），门控后附加
         self.timestamp = time.time()
 
     def is_valid(self, max_age: float = 900) -> bool:
@@ -442,6 +445,12 @@ def evaluate_position_signal(item: WatchItem, quote: Quote,
     if not action:
         return None
 
+    # regime 门控：按该股所在板块广度（站上MA20占比）抑制反向信号（回测结论固化）
+    gate = gate_position(item.code, stage_result.stage, action)
+    if not gate["ok"]:
+        log.info(f"regime 抑制 {item.code} {stage_result.stage}: {gate['note']}")
+        return None
+
     reasons = list(stage_result.reasons or [])
     # 左侧加仓信号补一句操作口径：区分「埋伏」与「接刀」，避免与 detect_stage 原文冲突
     if action == PositionSignal.ACTION_ADD:
@@ -471,6 +480,7 @@ def evaluate_position_signal(item: WatchItem, quote: Quote,
         stage=stage_result.stage, confidence=stage_result.confidence,
         reasons=reasons, price=price, suggested_price=suggested,
         suggested_low=suggested_low, suggested_high=suggested_high,
+        regime=gate["regime"],
     )
 
 

@@ -51,6 +51,7 @@ from app.technical import (
     calc_macd,
 )
 from app.kline_local import fetch_daily_local_first
+from app.regime import gate_side
 
 
 def _f(x, nd=2) -> str:
@@ -610,12 +611,17 @@ def main():
     turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
     pullback_results = []
+    suppressed = 0
     done = 0
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
             klines = fetch_daily_local_first(code, market, days=120)
             if not klines or len(klines) < 60:
+                continue
+            ok, note = gate_side(code, "right")
+            if not ok:
+                suppressed += 1
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
@@ -630,7 +636,10 @@ def main():
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
     if not results and not pullback_results:
-        print("\n❌ 当前该板块/行业无符合条件的右侧机会候选（多处于「未站上MA20」或「无量无突破」状态）")
+        msg = "当前该板块/行业无符合条件的右侧机会候选（多处于「未站上MA20」或「无量无突破」状态）"
+        if suppressed:
+            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（熊市禁右侧追涨）被抑制"
+        print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])
@@ -695,6 +704,8 @@ def main():
                   f"{p['score']:>4}  {_verdict(p['score'])}")
 
     print()
+    if suppressed:
+        print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（熊市禁右侧追涨——广度低时突破是接飞刀）")
     print("  说明:")
     print("    - 板块=成分归属；5日涨%=近5个交易日涨幅；量比=今日量/前5日均量（≥1.2 放量，≥2 显著放量）")
     print("    - 换手%=今日换手率（<1% 地量 / 1~3% 正常 / 3~5% 活跃 / ≥5% 高换手），高换手确认真放量、低换手则量比可能虚高存疑")

@@ -55,6 +55,7 @@ from app.models import KlineData
 from app.data_fetcher import fetch_turnover_map
 from app.technical import calc_sma
 from app.kline_local import fetch_daily_local_first
+from app.regime import gate_side
 
 
 def _f(x, nd=2) -> str:
@@ -398,12 +399,17 @@ def main():
     print(f"  逐股检测中（{len(pool)} 只，约需 1~2 分钟）...")
     turnover_map = fetch_turnover_map(list(pool.keys()))
     results = []
+    suppressed = 0
     done = 0
     for code, stock in pool.items():
         try:
             market = _detect_market(code)
             klines = fetch_daily_local_first(code, market, days=60)
             if not klines or len(klines) < 20:
+                continue
+            ok, note = gate_side(code, "right")
+            if not ok:
+                suppressed += 1
                 continue
             r = _score_candidate(code, stock, klines, turnover_map.get(code))
             if r is not None:
@@ -416,7 +422,10 @@ def main():
             print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
 
     if not results:
-        print("\n❌ 当前无符合条件的龙回头候选（近期涨停股多处于「还在连板」或「已破位退潮」状态）")
+        msg = "当前无符合条件的龙回头候选（近期涨停股多处于「还在连板」或「已破位退潮」状态）"
+        if suppressed:
+            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（熊市禁右侧追涨）被抑制"
+        print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])
@@ -437,6 +446,8 @@ def main():
               f"{r['rise']:>7.1f}{r['retrace']:>7.1f}{vol_txt:>7}{tr_txt:>6}{fib_txt:>7}{r['score']:>4}  {_verdict(r['score'])}")
 
     print()
+    if suppressed:
+        print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（熊市禁右侧追涨——广度低时突破是接飞刀）")
     print("  说明:")
     print("    - 连板=近N日最高连板数；缩量比=回调均量/首波均量（<0.7 健康）；黄金位=回撤占首波涨幅比例")
     print("    - 换手%=今日换手率（连板股换手=人气：0.5~8% 洗盘充分 / <0.5% 人气散尽 / ≥15% 分歧出货）")
