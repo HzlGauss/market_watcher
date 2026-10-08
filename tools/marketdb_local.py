@@ -478,12 +478,27 @@ def cmd_sync_valuation(args) -> int:
     n_batch = (len(tickers) + batch - 1) // batch
     print(f"==> 估值快照落库：{len(tickers)} 只（{n_batch} 批，trade_date={trade_date}）")
     ok = 0
+    skipped: list[str] = []
     for i in range(0, len(tickers), batch):
         chunk = tickers[i:i + batch]
         try:
             items = hithink.fetch_valuations_snapshot(chunk)
         except Exception:
             items = []
+        if not items:
+            # 整批失败（多为批内混入退市/*ST 等已从 API 代码表剔除的代码，接口按整批 3001 拒绝）。
+            # 退化为逐只请求：跳过查不到的代码，避免一只坏码拖垮同批其余 99 只。
+            items = []
+            for tk in chunk:
+                try:
+                    one = hithink.fetch_valuations_snapshot([tk])
+                except Exception:
+                    one = []
+                if one:
+                    items.extend(one)
+                else:
+                    skipped.append(tk)
+                    print(f"    ⚠️ 跳过 {tk}（同花顺代码表查不到，可能已退市）", flush=True)
         rows = []
         for it in items or []:
             thscode_s = it.get("thscode") or _norm_thscode(it.get("ticker") or "")
@@ -502,6 +517,8 @@ def cmd_sync_valuation(args) -> int:
     days = con.execute("SELECT COUNT(DISTINCT trade_date) FROM valuation_daily").fetchone()[0]
     con.close()
     print(f"  今日落库 {cnt} 条，累计 {days} 个交易日")
+    if skipped:
+        print(f"  ⚠️ 跳过 {len(skipped)} 只（同花顺代码表查不到，多为退市/*ST）：{', '.join(skipped)}")
     print(f"✅ 完成：成功落库 {ok}/{len(tickers)} 只")
     return 0
 
