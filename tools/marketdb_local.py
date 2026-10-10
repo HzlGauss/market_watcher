@@ -16,6 +16,7 @@
     sync-symbols        刷新 dim_symbol 证券维度表（symbols 子命令依赖）
     sync-financials     三张报表落库（利润/资产负债/现金流量，同花顺 REST，非 marketdb Parquet）
     sync-valuation      估值快照逐日累积（PE/PB/PS/PCF，同花顺 REST，历史分位需每日积累）
+    sync-valuation-history  估值历史回填（东财 akshare，PE/PB/PS/PCF 自上市起全历史，补历史分位）
     streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
 
 用法:
@@ -310,13 +311,14 @@ _FIN_NUMS = {
 
 
 def _fin_num(v):
-    """数值列安全转换：None/空串 → None，否则 float。"""
+    """数值列安全转换：None/空串/NaN → None，否则 float。"""
     if v is None or v == "":
         return None
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    return None if f != f else f  # NaN（akshare/东财缺值）→ None
 
 
 def _ensure_fin_tables(con) -> None:
@@ -418,12 +420,18 @@ def cmd_sync_financials(args) -> int:
 # ---------------------------------------------------------------- 估值逐日累积
 
 _VAL_NUMS = ["pe_ttm", "pe_mrq", "pb_mrq", "ps_ttm", "pcf_ttm"]
+# 东财个股估值（akshare stock_value_em）源列名，顺序与 _VAL_NUMS 一一对应
+_VAL_SRC_COLS = ["PE(TTM)", "PE(静)", "市净率", "市销率", "市现率"]
+_VAL_DATE_COL = "数据日期"
 
 
 def _ensure_valuation_table(con) -> None:
     cols = ["thscode VARCHAR", "ticker VARCHAR", "name VARCHAR", "trade_date VARCHAR"] + \
            [f"{n} DOUBLE" for n in _VAL_NUMS]
     con.execute(f"CREATE TABLE IF NOT EXISTS valuation_daily ({', '.join(cols)})")
+    # 索引：回填按 thscode 删旧插新、每日增量按 trade_date 删旧，避免全表扫描
+    con.execute("CREATE INDEX IF NOT EXISTS idx_valuation_thscode ON valuation_daily(thscode)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_valuation_trade_date ON valuation_daily(trade_date)")
 
 
 def cmd_sync_valuation(args) -> int:
@@ -520,6 +528,118 @@ def cmd_sync_valuation(args) -> int:
     if skipped:
         print(f"  ⚠️ 跳过 {len(skipped)} 只（同花顺代码表查不到，多为退市/*ST）：{', '.join(skipped)}")
     print(f"✅ 完成：成功落库 {ok}/{len(tickers)} 只")
+    return 0
+
+
+def cmd_sync_valuation_history(args) -> int:
+    """估值历史回填（东财数据中心 akshare stock_value_em，逐日 PE/PB/PS/PCF 自上市起全历史）。
+
+    同花顺 fetch_valuations_snapshot 只有当前快照、无历史，历史分位原本靠妙想（已配额用尽）或
+    valuation_daily 数月累积。本命令用东财逐日估值一次性补全历史，使 fundamental_local.
+    valuation_percentile 的本地分位立刻可用（分位只需 pe_ttm/pb_mrq，二者东财直接提供）。
+    免费、无需 key（区别于妙想）。幂等：按 thscode 删旧插新；--resume 跳过已回填，断点续传。
+    """
+    import time
+
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+    try:
+        import akshare as ak
+        import pandas as pd
+    except ImportError:
+        print("❌ akshare 未安装（pip install akshare）")
+        return 1
+
+    con = duckdb.connect(str(db))
+    _ensure_valuation_table(con)
+
+    sym_rows = con.execute(
+        "SELECT ticker, thscode, name FROM dim_symbol WHERE asset_type='a-share' ORDER BY ticker").fetchall()
+    sym_map = {r[0]: (r[1], r[2]) for r in sym_rows}
+
+    if args.codes:
+        tickers = [c.strip().split(".", 1)[0] for c in args.codes.split(",") if c.strip()]
+    else:
+        tickers = [r[0] for r in sym_rows]
+        if args.limit and args.limit > 0:
+            tickers = tickers[:args.limit]
+
+    if not tickers:
+        print("⚠️ 无目标代码（dim_symbol 为空？先跑 sync-symbols）")
+        con.close()
+        return 0
+
+    # 断点续传：跳过已回填的股票（--resume 时行数 >= --resume-min 视为已回填）
+    todo: list[str] = []
+    skipped = 0
+    for tk in tickers:
+        ths = sym_map.get(tk, (_norm_thscode(tk), ""))[0]
+        if args.resume:
+            n = con.execute("SELECT COUNT(*) FROM valuation_daily WHERE thscode = ?", [ths]).fetchone()[0]
+            if n >= args.resume_min:
+                skipped += 1
+                continue
+        todo.append(tk)
+
+    est_min = len(todo) * (args.sleep + 0.7) / 60
+    print(f"==> 估值历史回填（东财 akshare stock_value_em）：{len(todo)} 只，预计 ~{est_min:.0f} 分钟"
+          + (f"（已回填跳过 {skipped} 只）" if skipped else ""))
+    ok = 0
+    fail: list[str] = []
+    t0 = time.time()
+    total_rows = 0
+    for i, tk in enumerate(todo, 1):
+        ths, name = sym_map.get(tk, (_norm_thscode(tk), ""))
+        try:
+            df = ak.stock_value_em(symbol=tk)
+        except Exception as e:
+            fail.append(tk)
+            print(f"  ⚠️ [{i}/{len(todo)}] {tk} 拉取失败: {e}", flush=True)
+            if args.sleep:
+                time.sleep(args.sleep)
+            continue
+        if df is None or len(df) == 0:
+            fail.append(tk)
+            print(f"  ⚠️ [{i}/{len(todo)}] {tk} 无数据（可能已退市/北交所不覆盖）", flush=True)
+            if args.sleep:
+                time.sleep(args.sleep)
+            continue
+
+        con.execute("DELETE FROM valuation_daily WHERE thscode = ?", [ths])
+        # pandas register + INSERT SELECT（DuckDB 零拷贝快路径）；executemany 逐行慢约 300 倍
+        ins = pd.DataFrame({
+            "thscode": ths, "ticker": tk, "name": name,
+            "trade_date": df[_VAL_DATE_COL].astype(str).str[:10],
+        })
+        for dst, src in zip(_VAL_NUMS, _VAL_SRC_COLS):
+            ins[dst] = pd.to_numeric(df[src], errors="coerce")
+        con.register("df_ins", ins)
+        con.execute("INSERT INTO valuation_daily SELECT * FROM df_ins")
+        con.unregister("df_ins")
+        total_rows += len(ins)
+        ok += 1
+        print(f"  [{i}/{len(todo)}] {tk} {name} → {len(ins)} 行", flush=True)
+        if args.sleep:
+            time.sleep(args.sleep)
+
+    con.close()
+
+    con = duckdb.connect(str(db), read_only=True)
+    tot = con.execute("SELECT COUNT(*) FROM valuation_daily").fetchone()[0]
+    nsym = con.execute("SELECT COUNT(DISTINCT thscode) FROM valuation_daily").fetchone()[0]
+    con.close()
+    print(f"✅ 完成：成功 {ok}/{len(todo)} 只（失败 {len(fail)}），本次新增 {total_rows} 行，"
+          f"估值表累计 {tot} 行 / {nsym} 只，耗时 {time.time()-t0:.0f}s")
+    if fail:
+        tail = fail[:50] + (["..."] if len(fail) > 50 else [])
+        print(f"  ⚠️ 失败 {len(fail)} 只（重跑加 --resume 自动跳过已成功的）：{', '.join(tail)}")
     return 0
 
 
@@ -1219,6 +1339,15 @@ def main() -> int:
     sv.add_argument("--sleep", type=float, default=0.1, help="每批之间休眠秒数，限频保护（默认 0.1）")
     sv.add_argument("--db")
 
+    svh = sub.add_parser("sync-valuation-history", help="估值历史回填（东财 akshare，PE/PB/PS/PCF 自上市起全历史）")
+    svh.add_argument("--codes", help="逗号分隔代码（如 600519,000858），与 --limit/--all 互斥")
+    svh.add_argument("--limit", type=int, default=0, help="只回填前 N 只 A 股（默认 0=全部）")
+    svh.add_argument("--all", action="store_true", help="全市场回填（默认即全部，等价 --limit 0）")
+    svh.add_argument("--sleep", type=float, default=0.2, help="每只之间休眠秒数，限频保护（默认 0.2）")
+    svh.add_argument("--resume", action="store_true", help="跳过已有 >=--resume-min 行的股票（断点续传）")
+    svh.add_argument("--resume-min", type=int, default=20, help="--resume 时判定已回填的最少行数（默认 20）")
+    svh.add_argument("--db")
+
     sk = sub.add_parser("streaks", help="全市场连续区间扫描（上涨/下跌/放量/缩量/量价齐升/量价齐缩/站稳均线/创新高）")
     sk.add_argument("kind", choices=["up", "down", "vol-up", "vol-down",
                                      "vol-price-up", "vol-price-down", "above-ma", "new-high"],
@@ -1266,6 +1395,7 @@ def main() -> int:
         "sync-symbols": cmd_sync_symbols,
         "sync-financials": cmd_sync_financials,
         "sync-valuation": cmd_sync_valuation,
+        "sync-valuation-history": cmd_sync_valuation_history,
         "streaks": cmd_streaks,
         "streaks-backtest": cmd_streaks_backtest,
     }[args.cmd](args)
