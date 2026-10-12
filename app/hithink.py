@@ -250,6 +250,29 @@ def fetch_snapshot(thscodes: list[str]) -> dict[str, dict]:
     return out
 
 
+def fetch_all_market_snapshot(limit: int = 1000) -> list[dict]:
+    """全市场 A 股实时快照（limit/offset 分页拉满），返回 item 列表。
+
+    用于市场广度统计：prices/snapshot 的 total 给全市场总只数，逐页拉取直至拉满。
+    每项含 ticker/last_price/price_change_ratio_pct/turnover(元)/volume，
+    可本地重建涨跌家数、成交额合计。失败/断连返回空列表（调用方回退）。
+    """
+    out: list[dict] = []
+    offset = 0
+    limit = max(100, min(int(limit), 2000))
+    while True:
+        data = _get("/api/a-share/prices/snapshot", {"limit": limit, "offset": offset})
+        if not data:
+            break
+        items = list(data.get("item") or [])
+        out.extend(items)
+        total = data.get("total") or 0
+        if not items or len(out) >= total:
+            break
+        offset += limit
+    return out
+
+
 # ============================================================
 # 历史日K线
 # ============================================================

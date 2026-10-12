@@ -56,6 +56,11 @@ from app.data_fetcher import (
     fetch_sector_fund_flow_rank,
     fetch_margin_data,
 )
+from app.hithink import (
+    fetch_all_market_snapshot,
+    fetch_ths_index_list,
+    fetch_index_snapshot,
+)
 from app.technical import calc_ma_alignment
 
 # 东财 clist 全 A 股（沪深主板 + 创业板 + 科创板）
@@ -148,13 +153,11 @@ def _fetch_index_rows() -> list[dict]:
     return rows
 
 
-def _fetch_breadth() -> dict:
-    """拉全市场快照，聚合涨跌家数 / 成交额 / 涨跌停。"""
-    raw = _fetch_em_clist(_FS_ALL_A, _FIELDS, fid="f3")
+def _count_breadth(pairs: list) -> dict:
+    """从 (涨跌幅, 成交额) 对列表聚合涨跌家数 / 成交额 / 涨跌停（9.9% 近似）。"""
     up = down = flat = limit_up = limit_down = 0
     total_amount = 0.0
-    for it in raw:
-        chg = _num(it.get("f3"))
+    for chg, amt in pairs:
         if chg is None:
             continue
         if chg > 0:
@@ -167,7 +170,7 @@ def _fetch_breadth() -> dict:
             limit_up += 1
         if chg <= -9.9:
             limit_down += 1
-        total_amount += _num(it.get("f6")) or 0.0
+        total_amount += amt or 0.0
     return {
         "total": up + down + flat,
         "up": up,
@@ -177,6 +180,25 @@ def _fetch_breadth() -> dict:
         "limit_down": limit_down,
         "amount_yi": total_amount / 1e8,
     }
+
+
+def _fetch_breadth() -> dict:
+    """拉全市场快照，聚合涨跌家数 / 成交额 / 涨跌停。
+
+    同花顺 prices/snapshot 全市场分页优先（稳定、total 给总只数、约 6 页拉满）；
+    同花顺不可达时回退东财 clist（盘中限频易截断，拉满 60 页较慢）。
+    """
+    snap = fetch_all_market_snapshot()
+    if len(snap) >= 4500:
+        return _count_breadth([
+            (_num(it.get("price_change_ratio_pct")), _num(it.get("turnover")))
+            for it in snap
+        ])
+    raw = _fetch_em_clist(_FS_ALL_A, _FIELDS, fid="f3")
+    if len(raw) >= 4500:  # 全 A 股约 5500+，拉满才可信
+        return _count_breadth([(_num(it.get("f3")), _num(it.get("f6"))) for it in raw])
+    # 两个源都拿不到全市场 → 用东财残缺样本（total<4500，_print_breadth 会提示不可信）
+    return _count_breadth([(_num(it.get("f3")), _num(it.get("f6"))) for it in raw])
 
 
 def _fetch_sector_sides(sector_type: str, top_n: int = 8):
@@ -189,6 +211,38 @@ def _fetch_sector_sides(sector_type: str, top_n: int = 8):
     outflows = sorted(outflows, key=lambda f: f.main_net)[:top_n]
     total_main = sum(f.main_net or 0.0 for f in flows)
     return inflows, outflows, total_main
+
+
+def _fetch_index_direction(tag: str):
+    """东财板块资金流不可达时的兜底：同花顺指数涨跌幅方向（无资金流）。
+
+    tag: industry=行业指数 / cn_concept=概念指数。
+    返回按涨跌幅降序的 [{name, chg}] 列表；指数目录/快照不可达返回 None。
+    同花顺板块行情只有涨跌幅/成交额、无资金流，仅作「今天哪些板块强/弱」的方向参考。
+    """
+    idx = fetch_ths_index_list(tag)
+    if not idx:
+        return None
+    ts = [x.get("thscode") for x in idx if x.get("thscode")]
+    if not ts:
+        return None
+    snap = fetch_index_snapshot(ts)
+    if not snap:
+        return None
+    rows = []
+    for x in idx:
+        code = x.get("thscode")
+        item = snap.get(code)
+        if not item:
+            continue
+        chg = _num(item.get("price_change_ratio_pct"))
+        if chg is None:
+            continue
+        rows.append({"name": str(x.get("name") or "").strip(), "chg": chg})
+    if not rows:
+        return None
+    rows.sort(key=lambda r: r["chg"], reverse=True)
+    return rows
 
 
 # ---------------------------------------------------------------- 输出
@@ -269,6 +323,26 @@ def _print_sector(title: str, inflows, outflows, total_main=None):
         print(f"    {f.name:<14} 净流出 {_fmt_yi(f.main_net):>8}  涨跌 {_fmt_pct(f.change_pct)}  主力股 {f.top_stock}")
 
 
+def _print_index_direction(title: str, fallback_note: str, empty_note: str, rows,
+                           top_n: int = 8, label: str = "板块"):
+    """板块资金流不可达时的兜底输出：同花顺指数涨跌幅方向（无资金流）。"""
+    print()
+    print("=" * 72)
+    print(title)
+    print("=" * 72)
+    if not rows:
+        print(f"  ⚠️ {empty_note}")
+        return
+    print(f"  ⚠️ {fallback_note}")
+    n = min(top_n, len(rows))
+    print(f"  ── 领涨{label}（涨跌幅降序）──")
+    for r in rows[:n]:
+        print(f"    {r['name']:<14} 涨跌 {_fmt_pct(r['chg'])}")
+    print(f"  ── 领跌{label}（涨跌幅升序）──")
+    for r in reversed(rows[-n:]):
+        print(f"    {r['name']:<14} 涨跌 {_fmt_pct(r['chg'])}")
+
+
 def _print_margin(m):
     print()
     print("=" * 72)
@@ -300,9 +374,32 @@ def main():
 
     # 4. 板块领涨领跌
     ind_in, ind_out, ind_total = _fetch_sector_sides("行业资金流")
-    _print_sector("【4. 板块资金流 · 行业板块（今日）】", ind_in, ind_out, ind_total)
-    con_in, con_out, _ = _fetch_sector_sides("概念资金流")
-    _print_sector("【4. 板块资金流 · 概念板块（今日）】", con_in, con_out)
+    em_sector_ok = bool(ind_in or ind_out)  # 东财 push2 板块资金流是否可达
+    if em_sector_ok:
+        _print_sector("【4. 板块资金流 · 行业板块（今日）】", ind_in, ind_out, ind_total)
+    else:
+        _print_index_direction(
+            "【4. 板块资金流 · 行业板块（今日）】",
+            "东财行业资金流接口不可达，改用同花顺行业指数涨跌幅兜底（无资金流，仅方向参考）",
+            "无行业板块数据（东财资金流与同花顺行业指数均不可达）",
+            _fetch_index_direction("industry"),
+            label="行业",
+        )
+    # 行业/概念资金流同属东财 push2 板块接口，行业断连时概念大概率也断，直接短路走兜底省时
+    con_in: list = []
+    con_out: list = []
+    if em_sector_ok:
+        con_in, con_out, _ = _fetch_sector_sides("概念资金流")
+    if con_in or con_out:
+        _print_sector("【4. 板块资金流 · 概念板块（今日）】", con_in, con_out)
+    else:
+        _print_index_direction(
+            "【4. 板块资金流 · 概念板块（今日）】",
+            "东财概念资金流接口不可达，改用同花顺概念指数涨跌幅兜底（无资金流，仅方向参考）",
+            "无概念板块数据（东财资金流与同花顺概念指数均不可达）",
+            _fetch_index_direction("cn_concept"),
+            label="概念",
+        )
 
     # 5. 两融
     _print_margin(fetch_margin_data())
