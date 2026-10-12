@@ -56,6 +56,15 @@ BOARD_FS: dict[str, str] = {
     "北交所": "m:0 t:81 s:2048",
 }
 
+# 板 → 本地代码前缀（东财 clist 不可达时的离线兜底，从本地 duckdb v_symbol 取）。
+# 北交所前缀分散(43/83/87/92)且新浪 K 线不可靠，不在此列（_filter_scannable 也会剔除）。
+BOARD_PREFIX: dict[str, str] = {
+    "创业板": "30",
+    "科创板": "68",
+    "深主板": "00",
+    "沪主板": "60",
+}
+
 # 精确关键字 → 优先命中的东财板块名（精确匹配，先行业后概念）。
 # 用「精确名」而非模糊匹配，避免「白酒」命中「非白酒」、「化工」命中「磷肥及磷化工」、
 # 「光伏」命中「光伏辅材」、「军工」命中「军工电子Ⅲ」等反义词/子板块误匹配。
@@ -127,6 +136,40 @@ def _pool_from_board(fs: str, label: str) -> dict[str, dict]:
             "name": str(it.get("f14", "")),
             "industry": str(it.get("f100", "") or label),
             "source": label,
+        }
+    return pool
+
+
+def _pool_from_local_board(prefix: str, label: str) -> dict[str, dict]:
+    """板成分离线兜底：本地 duckdb v_symbol 按代码前缀过滤（东财 clist 不可达时）。"""
+    try:
+        import os
+
+        import duckdb
+    except Exception:
+        return {}
+    p = os.environ.get("MARKETDB_DB_PATH")
+    db = Path(p).expanduser() if p else _ROOT / "data" / "market.duckdb"
+    if not db.exists():
+        return {}
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+        rows = con.execute(
+            "select ticker, name from v_symbol where ticker like ?",
+            [f"{prefix}%"],
+        ).fetchall()
+        con.close()
+    except Exception:
+        return {}
+    pool: dict[str, dict] = {}
+    for ticker, name in rows:
+        code = _norm_code(ticker)
+        if not code:
+            continue
+        pool[code] = {
+            "name": str(name or ""),
+            "industry": label,
+            "source": f"{label}·本地",
         }
     return pool
 
@@ -399,10 +442,13 @@ def resolve_board_pool(query: str) -> dict[str, dict]:
         if key == alias or key == sym:
             return _filter_scannable(_pool_from_index(sym, alias))
 
-    # 2) 板（精确）
+    # 2) 板（精确）——东财 clist 优先，不可达时本地 v_symbol 前缀兜底
     for bname, fs in BOARD_FS.items():
         if key == bname:
-            return _filter_scannable(_pool_from_board(fs, bname))
+            pool = _pool_from_board(fs, bname)
+            if not pool and bname in BOARD_PREFIX:
+                pool = _pool_from_local_board(BOARD_PREFIX[bname], bname)
+            return _filter_scannable(pool)
 
     # 3) 精确关键字优先映射（白酒/化工/光伏/军工/芯片/有色/医药/新能源… 精确板块名）
     pool = _pool_from_priority(key)

@@ -869,8 +869,8 @@ def db_freshness_note(db=None) -> str:
         return ""
     if f["stale"]:
         return (f"  ⚠️ 本地库最新 {f['max_date']}，落后最近交易日 {f['latest_trade_date']}"
-                f" 约 {f['behind_days']} 天；streaks 初筛按此快照，今日/盘中新信号以新浪实时复核为准"
-                f"（可先 py tools/marketdb_local.py sync 同步）。")
+                f" 约 {f['behind_days']} 天；初筛与最终打分均按此本地日 K 快照（不补当日缺口），"
+                f"实时信息仅东财换手率（可先 py tools/marketdb_local.py sync 同步）。")
     return f"  ℹ️ 本地库已最新（{f['max_date']}）。"
 
 
