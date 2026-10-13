@@ -81,6 +81,13 @@ KEY_BOARD_PRIORITY: dict[str, list[str]] = {
     "新能源": ["电池", "光伏设备", "风电设备", "电网设备"],
 }
 
+# 本地白名单关键词 → CSV 文件名（相对项目根目录 data/）。常用「白马蓝筹」单子直接按名解析。
+WHITELIST_ALIASES: dict[str, str] = {
+    "白马蓝筹": "data/bluechip_whitelist.csv",
+    "蓝筹白马": "data/bluechip_whitelist.csv",
+    "白名单": "data/bluechip_whitelist.csv",
+}
+
 
 def _norm_code(c) -> str:
     """清洗股票代码为 6 位数字字符串（None/非数字 → 空串）。"""
@@ -417,6 +424,62 @@ def _pool_from_industry_cache(key: str) -> dict[str, dict]:
     return pool
 
 
+# ---------------------------------------------------------------- 本地白名单/CSV
+
+# CSV 白名单里可选的估值/基本面列 → fund_csv 键（存在则透传给扫描脚本的确定性门槛，
+# 复用单子里已算好的快照，免重复拉取本地库/远端）。列缺失 → 对应键为 None。
+_CSV_FUND_COLS: dict[str, str] = {
+    "ROE今%": "roe",
+    "净利同比%": "profit_growth",
+    "营收同比%": "revenue_growth",
+    "PB分位%": "pb_pct",
+    "PE分位%": "pe_pct",
+    "PB": "pb",
+    "PE-TTM": "pe",
+}
+
+
+def _num(s) -> float | None:
+    """'88.58%' / '-34.11' / 空 → float；不可解析返回 None。"""
+    if s is None or isinstance(s, bool):
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    m = re.search(r"-?\d+\.?\d*", str(s))
+    return float(m.group()) if m else None
+
+
+def _pool_from_csv(path: Path) -> dict[str, dict]:
+    """本地白名单/CSV（代码,名称[,层级] + 可选估值/基本面列）→ 成分股池。
+
+    代码列（代码/code）必含 6 位数字；名称列（名称/name）、层级列（层级）可选。
+    若含 ROE今%/净利同比%/PB分位% 等列，透传为 ``stock["fund_csv"]``，供 left-side 等
+    扫描的确定性门槛直接复用（免重复拉取）。读失败返回空 dict（由调用方提示无法解析）。
+    """
+    import csv
+
+    pool: dict[str, dict] = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                code = _norm_code(row.get("代码") or row.get("code"))
+                if not code:
+                    continue
+                name = str(row.get("名称") or row.get("name") or "").strip()
+                tier = str(row.get("层级") or row.get("tier") or "").strip()
+                fund_csv = {v: _num(row.get(k)) for k, v in _CSV_FUND_COLS.items()}
+                pool[code] = {
+                    "name": name,
+                    "industry": tier or "白名单",
+                    "source": tier or "白名单",
+                    "fund_csv": fund_csv,
+                }
+    except Exception:
+        return {}
+    return pool
+
+
 # ---------------------------------------------------------------- 入口
 
 def resolve_board_pool(query: str) -> dict[str, dict]:
@@ -436,6 +499,17 @@ def resolve_board_pool(query: str) -> dict[str, dict]:
 
     # 归一化：去尾部「板块/行业/概念/指数/成分股」后缀
     key = re.sub(r"(板块|行业|概念|指数|成分股?|ETF)$", "", q).strip() or q
+
+    # 0) 本地白名单/CSV（关键词别名，或 .csv 文件路径）
+    if key in WHITELIST_ALIASES:
+        path = _ROOT / WHITELIST_ALIASES[key]
+        return _filter_scannable(_pool_from_csv(path))
+    if key.lower().endswith(".csv"):
+        path = Path(key)
+        if not path.is_absolute():
+            path = _ROOT / path
+        if path.exists():
+            return _filter_scannable(_pool_from_csv(path))
 
     # 1) 指数成分（精确）
     for alias, sym in INDEX_ALIASES.items():

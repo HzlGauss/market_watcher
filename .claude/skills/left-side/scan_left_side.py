@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """左侧选股批量扫描：输入一个板块/行业（创业板/科创板/沪深300/中证500/中证1000/
-半导体/芯片/化工 ...），解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」
-检测打分，输出潜在的左侧机会候选排序表。
+半导体/芯片/化工 ...）或本地白名单/CSV（白马蓝筹/蓝筹白马/白名单，或 .csv 文件路径），
+解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」检测打分，输出潜在的
+左侧机会候选排序表。
 
 左侧 = 底部左侧买入（赌反转/埋伏），标的仍在下跌或磨底、尚未确认反转，靠
 「深度超跌 + 抛压衰竭 + 超卖 + 早期企稳」取胜。与 right-side（右侧：突破确认后顺势）
@@ -11,10 +12,12 @@
 analyze_golden_pit.py（白马）或 stock-analysis（通用）细看。
 
 用法:
-    py .claude/skills/left-side/scan_left_side.py <板块/行业> [输出数量]
+    py .claude/skills/left-side/scan_left_side.py <板块/行业|白名单/CSV> [输出数量]
 
 参数:
     板块/行业  板块或行业名（如 创业板 / 科创板 / 沪深300 / 中证500 / 半导体 / 化工）
+    白名单/CSV 本地白名单关键词（白马蓝筹/蓝筹白马/白名单 → data/bluechip_whitelist.csv）
+               或任意 .csv 文件路径（相对项目根目录，须含「代码」列，可选「名称/层级」列）
     输出数量    输出候选数量上限（可选，默认 20）
 
 数据源: 成分股池（app.board_pool：指数成分 akshare + 东财 clist 板块/行业 + 同花顺概念
@@ -235,6 +238,7 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         "pattern": pattern,
         "overdeep": dd > 45,
         "score": score,
+        "fund_csv": stock.get("fund_csv"),
     }
 
 
@@ -384,12 +388,17 @@ def _fundamental_check(results, top: int) -> None:
     n_fund = min(top, len(results), 10)
     print()
     print("=" * 72)
-    print(f"基本面/估值确定性门槛（前 {n_fund} 名，本地库 + 同花顺 + 妙想分位）")
+    print(f"基本面/估值确定性门槛（前 {n_fund} 名，本地库/白名单CSV + 同花顺 + 妙想分位）")
     print("=" * 72)
     print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
     print("  " + "-" * 68)
     for r in results[:n_fund]:
-        f = _fetch_fundamental(mx, r["name"], r["code"])
+        fc = r.get("fund_csv")
+        if fc and any(v is not None for v in (fc.get("pb_pct"), fc.get("roe"), fc.get("profit_growth"))):
+            # 白名单/CSV 已自带筛选当日的估值+基本面快照，直接复用（免重复拉取本地库/远端）
+            f = {"pb_pct": fc.get("pb_pct"), "roe": fc.get("roe"), "profit_growth": fc.get("profit_growth")}
+        else:
+            f = _fetch_fundamental(mx, r["name"], r["code"])
         r["fund"] = f
         r["fund_verdict"] = _fund_gate(f)
         label, note = r["fund_verdict"]
@@ -399,7 +408,8 @@ def _fundamental_check(results, top: int) -> None:
         print(f"  {r['code']:<8}{r['name']:<10}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label} {note}")
     print()
     print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
-    print("  （ROE/净利同比/当前估值由本地库+同花顺直供；PB 历史分位优先本地逐日累积、不足回退妙想，缺失时显示 --）")
+    print("  （白名单/CSV 输入直接复用其自带 ROE/净利同比/PB分位 快照；板块/行业输入由本地库+同花顺直供、")
+    print("   PB 历史分位优先本地逐日累积、不足回退妙想，缺失时显示 --）")
     print("  仅 ✅通过 才值得进一步看买点；❌/⚠️/待查 建议排除或人工补查后观望。")
 
 

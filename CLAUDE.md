@@ -88,11 +88,11 @@ py .claude/skills/golden-pit/scan_golden_pit.py [输出数量]
 # Market-heat scan (市场热度雷达：涨幅榜/跌幅榜/龙虎榜 → 热点与避坑方向)
 py .claude/skills/market-heat/scan_market_heat.py [涨幅榜数量] [跌幅榜数量]
 
-# Left-side scan (左侧选股：板块/行业超跌埋伏候选扫描)
-py .claude/skills/left-side/scan_left_side.py <板块/行业> [输出数量]
+# Left-side scan (左侧选股：板块/行业或白马蓝筹白名单超跌埋伏候选扫描)
+py .claude/skills/left-side/scan_left_side.py <板块/行业|白马蓝筹|CSV路径> [输出数量]
 
-# Right-side scan (右侧选股：板块/行业放量突破候选扫描)
-py .claude/skills/right-side/scan_right_side.py <板块/行业> [输出数量]
+# Right-side scan (右侧选股：板块/行业或白马蓝筹白名单放量突破候选扫描)
+py .claude/skills/right-side/scan_right_side.py <板块/行业|白马蓝筹|CSV路径> [输出数量]
 
 # Strong-support + box-extreme-low scan (强支撑+箱体极低位选股：单维度技术筛选)
 py .claude/skills/support-box/scan_support_box.py <板块/行业> [输出数量]
@@ -146,8 +146,8 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`dragon-pullback`** — 龙回头检测：输入单只股票，按「龙头确认→首波强度→缩量浅回调不破位→企稳→二次启动」六层逻辑，判断是否构成龙回头形态、能否参与、买点与止损；另有批量扫描版从涨停股池筛候选。用户问「XX 是不是龙回头」「能不能抓龙回头」「龙头回调到位没」「XX 缩量回调能买吗」「连板后回踩能不能上」「近期哪些票在龙回头」时使用。核心不依赖 `MX_APIKEY`（龙虎榜/涨停池同花顺主源 + akshare 兜底，无 key 需 `pip install akshare`）。详见 `.claude/skills/dragon-pullback/SKILL.md`。
 - **`golden-pit`** — 黄金坑检测：输入单只白马/蓝筹股，按「白马成色→深坑→缩量→估值低位→企稳→未破长期趋势」六层逻辑，判断是否构成黄金坑、能否参与、买点与止损；另有批量扫描版从沪深300/上证50/中证红利成分股筛候选。用户问「XX 是不是黄金坑」「有没有被错杀的白马/蓝筹」「XX 跌到位了没、能不能抄底」「哪些白马股在挖坑」「XX 深度回调能不能买」时使用。核心不依赖 `MX_APIKEY`（指数成分/估值基本面需 `pip install akshare` + `MX_APIKEY`）。详见 `.claude/skills/golden-pit/SKILL.md`。
 - **`market-heat`** — 市场热度雷达：拉取最近交易日涨幅榜、跌幅榜、龙虎榜，聚合行业与概念板块资金流，分析当前热点方向（资金在买什么板块）和避坑方向（资金在撤离什么板块），并给出市场情绪周期判断。用户问「最近热点是什么」「哪些板块在涨/在跌」「龙虎榜资金动向」「现在该关注/回避什么方向」「市场情绪怎么样」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-heat/SKILL.md`。
-- **`left-side`** — 左侧选股扫描：输入板块/行业（创业板/科创板/沪深300/中证500/中证1000/半导体/芯片/化工...），解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」检测打分，输出左侧机会（底部左侧买入、赌反转/埋伏）候选，并对 top 候选做妙想估值/基本面门槛。用户问「XX 板块/行业里有没有跌到位、可以埋伏/抄底/左侧买的票」「XX 有没有超跌机会」时使用。成分池用 app.board_pool（指数成分 akshare + 东财 clist），核心不依赖 `MX_APIKEY`。详见 `.claude/skills/left-side/SKILL.md`。
-- **`right-side`** — 右侧选股扫描：输入板块/行业，解析成分股池，逐股按「均线多头→放量突破→MACD动量→涨幅强度」检测打分，输出右侧机会（底部右侧买入、突破确认后顺势追）候选，并对 top 候选做妙想主力资金确认。用户问「XX 板块/行业里有没有已启动、可以顺势/追涨/右侧买的票」「XX 有没有突破/放量机会」时使用。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/right-side/SKILL.md`。
+- **`left-side`** — 左侧选股扫描：输入板块/行业（创业板/科创板/沪深300/中证500/中证1000/半导体/芯片/化工...）或本地白名单/CSV（`白马蓝筹`→data/bluechip_whitelist.csv，或 .csv 路径），解析成分股池，逐股按「超跌→缩量→超卖→企稳→未破长期趋势」检测打分，输出左侧机会（底部左侧买入、赌反转/埋伏）候选，并对 top 候选做估值/基本面门槛（白名单输入直接复用单子自带 ROE/净利同比/PB分位 快照）。用户问「XX 板块/行业里有没有跌到位、可以埋伏/抄底/左侧买的票」「XX 有没有超跌机会」「白马蓝筹单子里哪些在左侧挖坑」时使用。成分池用 app.board_pool（指数成分 akshare + 东财 clist），核心不依赖 `MX_APIKEY`。详见 `.claude/skills/left-side/SKILL.md`。
+- **`right-side`** — 右侧选股扫描：输入板块/行业或本地白名单/CSV（`白马蓝筹`→data/bluechip_whitelist.csv，或 .csv 路径），解析成分股池，逐股按「均线多头→放量突破→MACD动量→涨幅强度」检测打分，输出右侧机会（底部右侧买入、突破确认后顺势追）候选，并对 top 候选做妙想主力资金确认。用户问「XX 板块/行业里有没有已启动、可以顺势/追涨/右侧买的票」「XX 有没有突破/放量机会」时使用。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/right-side/SKILL.md`。
 - **`support-box`** — 强支撑+箱体极低位选股扫描：输入板块/行业，解析成分股池，逐股**只按「箱体极低位 + 到达强支撑」这一个维度**检测打分，输出已跌到近期箱体极低位、且紧贴下方强支撑位的候选。用户问「XX 板块里有没有跌到箱体底部、紧贴强支撑的票」「哪些票到了强支撑位 + 箱体下沿」时使用。纯技术维度筛选，不含基本面/缩量/超卖；需叠加左侧逻辑走 `left-side`。核心不依赖 `MX_APIKEY`。详见 `.claude/skills/support-box/SKILL.md`。
 - **`etf-screen`** — 全市场 ETF 多维度筛选：按「规模+流动性（硬门槛）→ 动量+趋势 → 估值分位 → 资金流+份额」四维打分，输出候选排名，支持按类型（宽基/行业/主题/债券/跨境/商品/货币）或跟踪方向（半导体/医药/沪深300...）过滤。用户问「有哪些 ETF 值得买/关注」「帮我筛 ETF」「ETF 选哪只」「XX 方向哪个 ETF 好」「有没有低估/资金流入的 ETF」时使用。免费层（东财快照+新浪K线）不依赖 `MX_APIKEY`，估值分位/净申购额走妙想。详见 `.claude/skills/etf-screen/SKILL.md`。
 - **`market-watch`** — 大盘盯盘：拉 8 大核心指数实时行情 + 近 60 日位置 + 全市场广度（涨跌家数/成交额/涨跌停）+ 行业/概念板块领涨领跌 + 两融余额（替代已停披露的北向资金），判断当前大盘强弱与进攻/防守。用户问「今天大盘怎么样」「大盘强不强」「现在该进攻还是防守」「指数什么位置」「市场广度/情绪如何」时使用。全部不依赖 `MX_APIKEY`。详见 `.claude/skills/market-watch/SKILL.md`。
