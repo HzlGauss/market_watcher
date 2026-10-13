@@ -88,15 +88,16 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
     print(f"  {Color.CYAN}U{Color.RESET}. Data Sync (日K + 估值 本地库更新)")
     print(f"  {Color.CYAN}F{Color.RESET}. Financial Statements Sync (三张报表落库·财报季后)")
+    print(f"  {Color.CYAN}B{Color.RESET}. Blue-Chip / White-Horse Screen (白马蓝筹筛选·本地库)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
     print()
 
     while True:
         try:
-            choice = input(f" Enter option [0-9/D/M/S/W/G/U/F]: ").strip().upper()
-            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G", "U", "F"):
+            choice = input(f" Enter option [0-9/D/M/S/W/G/U/F/B]: ").strip().upper()
+            if choice in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "D", "M", "S", "W", "G", "U", "F", "B"):
                 return choice
-            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W, G, U or F{Color.RESET}")
+            print(f"{Color.YELLOW}  Please enter 0-9, D, M, S, W, G, U, F or B{Color.RESET}")
         except (EOFError, KeyboardInterrupt):
             return "0"
 
@@ -1312,6 +1313,16 @@ def _run_financials_sync() -> None:
     ])
 
 
+def _run_bluechip_screen() -> None:
+    """主菜单「白马蓝筹筛选」：全市场基本面筛选（本地 DuckDB），落库 bluechip_screen + CSV 快照。"""
+    print(f"\n{Color.BOLD}{Color.CYAN}🐎 白马蓝筹全市场筛选（本地库）{Color.RESET}")
+    print(f"{Color.DIM}  市值=PB×净资产估算；ROE=最新年报归母净利/归母净资产；分位=当前值在估值历史中的百分位（越低越便宜）。{Color.RESET}")
+    print(f"{Color.DIM}  阈值可编辑 data/bluechip_config.json（首跑自动生成默认值），改后重跑即生效。{Color.RESET}\n")
+    _run_marketdb_steps([
+        ("白马蓝筹筛选", ["screen-bluechip"]),
+    ])
+
+
 def main() -> None:
     """Main entry - menu selection mode"""
     if sys.platform == "win32":
@@ -1653,6 +1664,8 @@ def main() -> None:
             _run_data_sync()
         elif choice == "F":
             _run_financials_sync()
+        elif choice == "B":
+            _run_bluechip_screen()
 
 
 def _run_miaoxiang_menu(config: Config) -> None:

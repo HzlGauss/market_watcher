@@ -1282,6 +1282,324 @@ def cmd_streaks(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 白马蓝筹全市场筛选
+
+_BLUECHIP_CONFIG_PATH = _ROOT / "data" / "bluechip_config.json"
+
+# 内置默认阈值（首跑自动生成 data/bluechip_config.json，用户可编辑覆盖，按 key 合并）
+_BLUECHIP_DEFAULTS: dict = {
+    "market_cap_yi": 300,       # 市值门槛（亿元）
+    "roe_min": 8.0,             # 蓝筹 ROE 门槛（%，最新年报归母净利/归母净资产；银行股普遍 7~11%，取 8 以纳入工行/建行/招行）
+    "roe_baima_min": 15.0,      # 白马 ROE 门槛（%，最新年报，在蓝筹基础上更严）
+    "roe_prior_min": 10.0,      # 白马 上年 ROE 门槛（%，滤掉「一年暴增」型次新/题材股）
+    "profit_growth_min": 0.0,   # 白马 净利同比下限（%）
+    "revenue_growth_min": 0.0,  # 白马 营收同比下限（%）
+    "pb_pct_max": 90.0,         # 蓝筹 PB 历史分位上限（%，排除极端高估；PE 分位不设硬门槛，只作展示列）
+    "years": 2,                 # 连续盈利年数（需最新 N 份年报净利均为正）
+    "exclude_st": True,         # 剔除 ST / 退市
+}
+
+
+def _load_bluechip_config() -> dict:
+    """读 data/bluechip_config.json（缺文件用默认值生成），用户文件按 key 覆盖默认值。"""
+    import json
+
+    cfg = dict(_BLUECHIP_DEFAULTS)
+    try:
+        if _BLUECHIP_CONFIG_PATH.exists():
+            with open(_BLUECHIP_CONFIG_PATH, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            if isinstance(user, dict):
+                cfg.update({k: user[k] for k in _BLUECHIP_DEFAULTS if k in user})
+        else:
+            _BLUECHIP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_BLUECHIP_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(_BLUECHIP_DEFAULTS, f, ensure_ascii=False, indent=2)
+            print(f"  ℹ️ 已生成默认配置: {_BLUECHIP_CONFIG_PATH}")
+    except Exception as e:
+        print(f"  ⚠️ 读取配置失败（改用内置默认值）: {e}")
+    return cfg
+
+
+def _num(v):
+    """None/NaN → None，否则 float。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
+
+
+def _roe(np_, eq):
+    if np_ is None or eq is None or eq <= 0:
+        return None
+    return np_ / eq * 100.0
+
+
+def _growth(cur, prior):
+    if cur is None or prior is None or prior <= 0:
+        return None
+    return (cur / prior - 1.0) * 100.0
+
+
+def _margin(rev, cost):
+    if rev is None or rev <= 0 or cost is None:
+        return None
+    return (rev - cost) / rev * 100.0
+
+
+def _ratio(num, den):
+    if num is None or den is None or den <= 0:
+        return None
+    return num / den * 100.0
+
+
+def _wpad(s, width: int) -> str:
+    """CJK 宽度感知左对齐补齐（中文占 2 显示列），用于控制台表格对齐。"""
+    s = str(s)
+    w = sum(2 if ord(ch) > 127 else 1 for ch in s)
+    return s + " " * max(0, width - w)
+
+
+def _fmt(x, nd=1) -> str:
+    return f"{x:.{nd}f}" if x is not None else "  --"
+
+
+def _r(x, nd=2):
+    """round 安全版：None/NaN → None，否则 round(x, nd)。"""
+    if x is None:
+        return None
+    try:
+        return round(float(x), nd)
+    except (TypeError, ValueError):
+        return None
+
+
+def screen_bluechip(db=None) -> int:
+    """全市场白马/蓝筹基本面筛选（纯本地 DuckDB，离线），落库 + CSV + 控制台排名表。
+
+    市值 = PB_MRQ(最新) × 净资产(最新年报)；ROE/增长用最新+上年年报；PB/PE 历史分位用
+    valuation_daily 全历史正值序列。分层：蓝筹（大盘+连续盈利+ROE 达标+估值不极端）→
+    白马（蓝筹基础上 ROE 更严 + 营收/净利正增长）。阈值全部来自 data/bluechip_config.json。
+    """
+    db_path = _db_path(db)
+    if not db_path.exists():
+        print(_bootstrap_guide())
+        return 1
+    try:
+        import duckdb
+    except ImportError:
+        print("❌ duckdb 未安装（先运行 bootstrap 安装 marketdb）")
+        return 1
+
+    cfg = _load_bluechip_config()
+    mc = float(cfg["market_cap_yi"])
+    roe_min = float(cfg["roe_min"])
+    roe_bm = float(cfg["roe_baima_min"])
+    roe_prior_min = float(cfg["roe_prior_min"])
+    pg_min = float(cfg["profit_growth_min"])
+    rg_min = float(cfg["revenue_growth_min"])
+    pb_pct_max = float(cfg["pb_pct_max"])
+    years = int(cfg["years"])
+    exclude_st = bool(cfg["exclude_st"])
+
+    print("=" * 96)
+    print(f"白马蓝筹全市场筛选（本地库）  市值≥{mc:.0f}亿 | 蓝筹ROE≥{roe_min:.0f}% | "
+          f"白马ROE≥{roe_bm:.0f}%(上年≥{roe_prior_min:.0f}%) + 营收/净利同比≥{pg_min:.0f}% | "
+          f"PB分位≤{pb_pct_max:.0f}% | 连续{years}年盈利")
+    print("=" * 96)
+
+    base_sql = """
+WITH inc AS (
+  SELECT thscode, period_end, operating_income, operating_costs, parent_holder_net_profit
+  FROM fin_income WHERE period_end LIKE '%-12-31'
+),
+bal AS (
+  SELECT thscode, period_end, holder_equity_total, assets_total, total_debt
+  FROM fin_balance WHERE period_end LIKE '%-12-31'
+),
+val AS (
+  SELECT thscode, pe_ttm, pb_mrq
+  FROM valuation_daily
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY trade_date DESC) = 1
+),
+years AS (
+  SELECT i.thscode, MAX(i.period_end) AS cur_pe
+  FROM inc i JOIN bal b ON b.thscode = i.thscode AND b.period_end = i.period_end
+  GROUP BY i.thscode
+)
+SELECT y.thscode, s.ticker, s.name, s.exchange,
+       v.pb_mrq, v.pe_ttm,
+       ic.operating_income AS rev_cur, ic.operating_costs AS cost_cur,
+       ic.parent_holder_net_profit AS np_cur,
+       ip.operating_income AS rev_prior, ip.parent_holder_net_profit AS np_prior,
+       bc.holder_equity_total AS eq_cur, bc.assets_total AS assets_cur,
+       bc.total_debt AS debt_cur, bp.holder_equity_total AS eq_prior
+FROM years y
+JOIN val v ON v.thscode = y.thscode
+JOIN dim_symbol s ON s.thscode = y.thscode
+JOIN inc ic ON ic.thscode = y.thscode AND ic.period_end = y.cur_pe
+LEFT JOIN inc ip ON ip.thscode = y.thscode
+  AND ip.period_end = CAST(CAST(LEFT(y.cur_pe, 4) AS INTEGER) - 1 AS VARCHAR) || '-12-31'
+JOIN bal bc ON bc.thscode = y.thscode AND bc.period_end = y.cur_pe
+LEFT JOIN bal bp ON bp.thscode = y.thscode
+  AND bp.period_end = CAST(CAST(LEFT(y.cur_pe, 4) AS INTEGER) - 1 AS VARCHAR) || '-12-31'
+WHERE s.asset_type = 'a-share' AND s.exchange IN ('SH', 'SZ')
+"""
+
+    pct_sql = """
+WITH cur AS (
+  SELECT thscode, pe_ttm AS pe_cur, pb_mrq AS pb_cur
+  FROM valuation_daily
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY trade_date DESC) = 1
+)
+SELECT v.thscode,
+  100.0 * SUM(CASE WHEN v.pb_mrq > 0 AND v.pb_mrq <= c.pb_cur THEN 1.0 ELSE 0.0 END)
+    / NULLIF(SUM(CASE WHEN v.pb_mrq > 0 THEN 1.0 ELSE 0.0 END), 0) AS pb_pct,
+  100.0 * SUM(CASE WHEN v.pe_ttm > 0 AND v.pe_ttm <= c.pe_cur THEN 1.0 ELSE 0.0 END)
+    / NULLIF(SUM(CASE WHEN v.pe_ttm > 0 THEN 1.0 ELSE 0.0 END), 0) AS pe_pct
+FROM valuation_daily v
+JOIN cur c ON c.thscode = v.thscode
+WHERE c.pb_cur > 0 OR c.pe_cur > 0
+GROUP BY v.thscode
+"""
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        rows = con.execute(base_sql).fetchall()
+        pct_rows = con.execute(pct_sql).fetchall()
+    finally:
+        con.close()
+    pct_map = {r[0]: (_num(r[1]), _num(r[2])) for r in pct_rows}
+
+    baima: list[dict] = []
+    lanchou: list[dict] = []
+    for r in rows:
+        (thscode, ticker, name, exchange, pb_mrq, pe_ttm,
+         rev_cur, cost_cur, np_cur, rev_prior, np_prior,
+         eq_cur, assets_cur, debt_cur, eq_prior) = r
+        name = name or ""
+        if exclude_st and ("ST" in name.upper() or "退" in name):
+            continue
+        pb_mrq = _num(pb_mrq); pe_ttm = _num(pe_ttm)
+        eq_cur = _num(eq_cur); eq_prior = _num(eq_prior)
+        np_cur = _num(np_cur); np_prior = _num(np_prior)
+        rev_cur = _num(rev_cur); rev_prior = _num(rev_prior)
+        cost_cur = _num(cost_cur)
+        assets_cur = _num(assets_cur); debt_cur = _num(debt_cur)
+
+        mkt = pb_mrq * eq_cur / 1e8 if (pb_mrq and eq_cur and pb_mrq > 0 and eq_cur > 0) else None
+        if mkt is None or mkt < mc:
+            continue
+
+        # 连续 N 年盈利（最新 + 往前 N-1 份年报净利均为正）
+        profits = [p for p in (np_cur, np_prior) if p is not None]
+        if len(profits) < years or any(p <= 0 for p in profits[:years]):
+            continue
+
+        roe_cur = _roe(np_cur, eq_cur)
+        roe_prior = _roe(np_prior, eq_prior)
+        if roe_cur is None or roe_cur < roe_min:
+            continue
+
+        pb_pct, pe_pct = pct_map.get(thscode, (None, None))
+        if pb_pct is not None and pb_pct > pb_pct_max:
+            continue
+
+        rev_g = _growth(rev_cur, rev_prior)
+        np_g = _growth(np_cur, np_prior)
+        rec = {
+            "thscode": thscode, "ticker": ticker, "name": name, "exchange": exchange,
+            "market_cap_yi": mkt, "roe_cur": roe_cur, "roe_prior": roe_prior,
+            "revenue_growth": rev_g, "profit_growth": np_g,
+            "gross_margin": _margin(rev_cur, cost_cur),
+            "debt_ratio": _ratio(debt_cur, assets_cur),
+            "pb_mrq": pb_mrq, "pe_ttm": pe_ttm, "pb_pct": pb_pct, "pe_pct": pe_pct,
+        }
+        is_bm = (roe_cur >= roe_bm and roe_prior is not None and roe_prior >= roe_prior_min
+                 and rev_g is not None and rev_g >= rg_min
+                 and np_g is not None and np_g >= pg_min)
+        rec["tier"] = "白马" if is_bm else "蓝筹"
+        (baima if is_bm else lanchou).append(rec)
+
+    for lst in (baima, lanchou):
+        lst.sort(key=lambda x: -x["market_cap_yi"])
+
+    # 落库（删旧插新，幂等）
+    w = duckdb.connect(str(db_path))
+    try:
+        w.execute("""
+CREATE TABLE IF NOT EXISTS bluechip_screen (
+  thscode VARCHAR, ticker VARCHAR, name VARCHAR, exchange VARCHAR,
+  market_cap_yi DOUBLE, roe_cur DOUBLE, roe_prior DOUBLE,
+  revenue_growth DOUBLE, profit_growth DOUBLE, gross_margin DOUBLE, debt_ratio DOUBLE,
+  pb_mrq DOUBLE, pe_ttm DOUBLE, pb_pct DOUBLE, pe_pct DOUBLE,
+  tier VARCHAR, screen_date VARCHAR
+)""")
+        w.execute("DELETE FROM bluechip_screen")
+        cols = ["thscode", "ticker", "name", "exchange", "market_cap_yi", "roe_cur",
+                "roe_prior", "revenue_growth", "profit_growth", "gross_margin",
+                "debt_ratio", "pb_mrq", "pe_ttm", "pb_pct", "pe_pct", "tier", "screen_date"]
+        screen_date = datetime.date.today().strftime("%Y-%m-%d")
+        placeholders = ",".join("?" for _ in cols)
+        for rec in baima + lanchou:
+            w.execute(f"INSERT INTO bluechip_screen ({','.join(cols)}) VALUES ({placeholders})",
+                      [rec[c] for c in cols[:-1]] + [screen_date])
+    finally:
+        w.close()
+
+    # CSV 快照（utf-8-sig，Excel 直接打开不乱码）
+    import csv
+
+    csv_path = _ROOT / "data" / "bluechip_whitelist.csv"
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["代码", "名称", "层级", "市值(亿)", "ROE今%", "ROE上年%",
+                         "营收同比%", "净利同比%", "毛利率%", "负债率%", "PB", "PE-TTM",
+                         "PB分位%", "PE分位%", "筛选日期"])
+        for rec in baima + lanchou:
+            writer.writerow([
+                rec["ticker"], rec["name"], rec["tier"],
+                _r(rec["market_cap_yi"], 1), _r(rec["roe_cur"]), _r(rec["roe_prior"]),
+                _r(rec["revenue_growth"]), _r(rec["profit_growth"]),
+                _r(rec["gross_margin"]), _r(rec["debt_ratio"]),
+                _r(rec["pb_mrq"]), _r(rec["pe_ttm"]),
+                _r(rec["pb_pct"]), _r(rec["pe_pct"]), screen_date,
+            ])
+
+    # 控制台排名表
+    def _print_section(title, lst):
+        print()
+        print(f"{title}（{len(lst)} 只）")
+        print(f"  {'代码':<7}{'名称':<12}{'市值(亿)':>9}{'ROE今%':>8}{'ROE上年%':>9}"
+              f"{'营收同比%':>9}{'净利同比%':>9}{'毛利率%':>8}{'负债率%':>8}{'PB分位%':>8}")
+        print("  " + "-" * 92)
+        if not lst:
+            print("  （无）")
+            return
+        for r in lst:
+            print(f"  {r['ticker']:<7}{_wpad(r['name'], 12)}"
+                  f"{_fmt(r['market_cap_yi'], 0):>9}{_fmt(r['roe_cur']):>8}"
+                  f"{_fmt(r['roe_prior']):>9}{_fmt(r['revenue_growth']):>9}"
+                  f"{_fmt(r['profit_growth']):>9}{_fmt(r['gross_margin']):>8}"
+                  f"{_fmt(r['debt_ratio']):>8}{_fmt(r['pb_pct']):>8}")
+
+    _print_section("🐎 白马（高ROE + 成长）", baima)
+    _print_section("🔵 蓝筹（大盘 + 稳定盈利）", lanchou)
+
+    print()
+    print(f"  合计 {len(baima) + len(lanchou)} 只（白马 {len(baima)} / 蓝筹 {len(lanchou)}）")
+    print(f"  ✅ 已落库 bluechip_screen（{len(baima) + len(lanchou)} 行）+ CSV: {csv_path}")
+    print("  说明: 市值=PB×净资产估算；ROE=最新年报归母净利/归母净资产；分位=当前值在10年估值历史中的百分位（越低越便宜）")
+    return 0
+
+
+def cmd_screen_bluechip(args) -> int:
+    return screen_bluechip(db=args.db)
+
+
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:
@@ -1381,6 +1699,9 @@ def main() -> int:
     sb.add_argument("--by-year", action="store_true", help="追加按 streak 结束年分组的收益（看信号逐年有效性）")
     sb.add_argument("--db")
 
+    sc = sub.add_parser("screen-bluechip", help="全市场白马/蓝筹基本面筛选（本地 DuckDB，落库+CSV）")
+    sc.add_argument("--db")
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -1398,6 +1719,7 @@ def main() -> int:
         "sync-valuation-history": cmd_sync_valuation_history,
         "streaks": cmd_streaks,
         "streaks-backtest": cmd_streaks_backtest,
+        "screen-bluechip": cmd_screen_bluechip,
     }[args.cmd](args)
 
 

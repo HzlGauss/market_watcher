@@ -118,6 +118,9 @@ py .claude/skills/sector-beta/scan_sector_beta.py [数量] [--history]
 # Scan holdings for bullish/bearish news (持仓个股消息面扫描：逐只扫新闻/公告/研报→利好/利空)
 py .claude/skills/holdings-news/scan_holdings_news.py [小时]
 
+# Blue-chip / white-horse screen (白马蓝筹全市场基本面筛选：本地 DuckDB 落库 + CSV)
+py tools/marketdb_local.py screen-bluechip
+
 # Threshold backtests (阈值历史收益回测：中证1000成分 + 日K线，验证各 skill 打分阈值)
 py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
 py .claude/skills/left-side/backtest_left_side.py [回测日期数]
