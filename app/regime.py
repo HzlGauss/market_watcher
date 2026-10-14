@@ -181,6 +181,37 @@ def get_board_regime(code: str) -> dict | None:
     }
 
 
+def board_regime_at(date_str: str) -> dict[str, str]:
+    """按历史广度查各板块截至 date_str 的 regime（牛市/熊市/震荡），供回测重建门控用。
+
+    读 state/regime.json 的 history.board（update_regime 落盘的逐日广度序列），对每个
+    板块取 ≤ date_str 的最新广度，经 _threshold 映射 regime。无历史/缺失返回 {}。
+    广度已 5 日平滑（后视窗口，无未来数据），故逐日 regime 可无偏重建。
+    """
+    import bisect
+
+    try:
+        data = json.loads(_REGIME_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    hist = (data.get("history") or {}).get("board", {})
+    out: dict[str, str] = {}
+    for board, series in hist.items():
+        if not series:
+            continue
+        dates = [x[0] for x in series]
+        i = bisect.bisect_right(dates, date_str) - 1
+        if i < 0:
+            continue
+        out[board] = _threshold(series[i][1])
+    return out
+
+
+def board_of(code: str) -> str:
+    """6 位代码 → 板块名（沪主板/深主板/创业板/科创板/其他）。"""
+    return _BOARD_PREFIX.get(str(code)[:2], "其他")
+
+
 def gate_position(code: str, stage: str, action: str) -> dict:
     """按该股所在板块广度 regime 门控加减仓信号（回测结论固化，见 backtest_buy/sell_side）。
 

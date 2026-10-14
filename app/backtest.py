@@ -1,8 +1,9 @@
 """回测引擎：对 skill 的候选打分函数做严格历史收益回测。
 
 供 ``.claude/skills/*/backtest_*.py`` 复用。数据源：中证1000 成分
-（akshare ``index_stock_cons``，小盘股，涨停/超跌/突破候选集中）+ 新浪日K线
-（``app.technical.fetch_historical_kline``）。
+（akshare ``index_stock_cons``，小盘股，涨停/超跌/突破候选集中，单次元数据调用）
++ 本地 duckdb 前复权日K线（``data/market.duckdb`` 的 ``v_daily_qfq``，批量一次读，
+快且不限流，与 scan 同源；本地缺该标的/库不可用时回退新浪 ``fetch_historical_kline``）。
 
 不依赖 akshare 涨停池（``stock_zt_pool_em`` 只保留 ~2 周，无法回测历史），历史
 可回溯到 K 线覆盖的任意时间。
@@ -15,10 +16,71 @@
 """
 import re
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 HORIZONS = (5, 10, 20)
 _SCANNABLE = re.compile(r"^(60|68|00|30)")
+
+
+def _num(v):
+    """duckdb/pandas 值 → float（None/NaN → None）。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f  # NaN
+
+
+def _load_local_klines(codes: list, days: int) -> dict:
+    """本地 duckdb 批量读前复权日K（v_daily_qfq）→ {6位代码: [KlineData]}。
+
+    一次查询全池历史（截到最近 ``days`` 交易日，按日期宽松过取再 tail），快、不限流。
+    库缺失/查询失败返回 {}（调用方回退新浪远端）。
+    """
+    import duckdb
+    from pathlib import Path as _Path
+
+    from app.hithink import thscode
+    from app.models import KlineData
+
+    db = _Path(__file__).resolve().parents[1] / "data" / "market.duckdb"
+    if not db.exists():
+        return {}
+    ths = [thscode(c) for c in codes]
+    ph = ",".join("?" for _ in ths)
+    # 交易日 ≈ 自然日 * 0.68，多取一段再 tail(days) 保证够
+    cutoff = date.today() - timedelta(days=int(days * 1.6) + 90)
+    try:
+        con = duckdb.connect(str(db), read_only=True)
+        df = con.execute(
+            f"select thscode, date, open, high, low, close, volume from v_daily_qfq "
+            f"where thscode in ({ph}) and date >= ? order by thscode, date",
+            [*ths, cutoff],
+        ).df()
+        con.close()
+    except Exception:
+        return {}
+    if df is None or len(df) == 0:
+        return {}
+
+    df = df.sort_values(["thscode", "date"])
+    out: dict = {}
+    for ths_code, grp in df.groupby("thscode", sort=False):
+        g = grp.tail(days)
+        out[str(ths_code)[:6]] = [
+            KlineData(
+                date=str(v["date"])[:10],
+                open=_num(v["open"]),
+                high=_num(v["high"]),
+                low=_num(v["low"]),
+                close=_num(v["close"]),
+                volume=_num(v["volume"]),
+            )
+            for _, v in g.iterrows()
+        ]
+    return out
 
 
 def _dstr(d) -> str:
@@ -35,29 +97,38 @@ def pick_dates(n: int) -> list:
 
 
 def load_universe_klines(days: int = 250) -> tuple[dict, dict]:
-    """中证1000 成分 + 日K线缓存。返回 (stocks: {code: name}, kcache: {code: [KlineData]})。"""
+    """中证1000 成分 + 日K线缓存。返回 (stocks: {code: name}, kcache: {code: [KlineData]})。
+
+    K 线优先本地 duckdb 前复权日K（批量一次读，与 scan 同源），本地缺该标的才回退新浪。
+    """
     import akshare as ak
 
     from app.helpers import _detect_market
     from app.technical import fetch_historical_kline
 
     df = ak.index_stock_cons(symbol="000852")  # 中证1000
-    stocks, kcache = {}, {}
+    stocks, codes = {}, []
     for _, r in df.iterrows():
         code = str(r.get("品种代码", "")).zfill(6)
         name = str(r.get("品种名称", ""))
         if code and code != "000000" and _SCANNABLE.match(code):
             stocks[code] = name
-    print(f"  中证1000 股票池 {len(stocks)} 只，拉日K线（days={days}）...", file=sys.stderr)
-    for i, code in enumerate(stocks):
-        try:
-            k = fetch_historical_kline(code, _detect_market(code), days=days, scale=240)
-            if k and len(k) >= 60:
-                kcache[code] = k
-        except Exception:
-            pass
-        if (i + 1) % 200 == 0:
-            print(f"    已拉 {i + 1}/{len(stocks)} ...", file=sys.stderr)
+            codes.append(code)
+    print(f"  中证1000 股票池 {len(stocks)} 只，读本地日K线（days={days}）...", file=sys.stderr)
+
+    kcache = _load_local_klines(codes, days)
+    missing = [c for c in codes if c not in kcache or not kcache[c]]
+    if missing:
+        print(f"  本地缺 {len(missing)} 只，回退新浪远端...", file=sys.stderr)
+        for i, code in enumerate(missing):
+            try:
+                k = fetch_historical_kline(code, _detect_market(code), days=days, scale=240)
+                if k and len(k) >= 60:
+                    kcache[code] = k
+            except Exception:
+                pass
+            if (i + 1) % 200 == 0:
+                print(f"    已拉 {i + 1}/{len(missing)} ...", file=sys.stderr)
     return stocks, kcache
 
 
