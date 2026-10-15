@@ -9,9 +9,11 @@
 analyze_golden_pit.py 细看。
 
 用法:
-    py .claude/skills/golden-pit/scan_golden_pit.py [输出数量] [--sync] [--full]
+    py .claude/skills/golden-pit/scan_golden_pit.py [板块/行业|白名单/CSV] [输出数量] [--sync] [--full]
 
 参数:
+    板块/行业  可选。默认扫沪深300 ∪ 上证50 ∪ 中证红利成分股；也可指定 白马蓝筹 /
+               .csv 白名单路径 / 指数名(沪深300/上证50...) / 行业名(半导体/化工...)
     输出数量   输出的候选数量上限（可选，默认 20）
     --sync    先增量同步本地 marketdb 到最新（可能触发下载，遇 429 限流会失败）
     --full    跳过本地库 streaks 初筛，全池逐股拉新浪 K 线（更慢但召回最全）
@@ -119,6 +121,31 @@ def _build_pool() -> dict[str, dict]:
     return pool
 
 
+def _build_pool_from_query(query: str) -> dict[str, dict]:
+    """白名单/CSV/板块/行业 → 候选池（复用 app.board_pool），归一成 _build_pool 同构：
+    {code: {name, indices:{source}, quality, mktcap, fund_csv}}。白马/蓝筹层级 quality 由 source 映射。"""
+    try:
+        from app.board_pool import resolve_board_pool
+    except Exception:
+        return {}
+    pool = resolve_board_pool(query)
+    if not pool:
+        return {}
+    mkt = _fetch_mktcap_map()
+    out: dict[str, dict] = {}
+    for code, stock in pool.items():
+        src = str(stock.get("source", "")).strip()
+        quality = 10 if src == "白马" else (8 if src == "蓝筹" else 6)
+        out[code] = {
+            "name": stock.get("name", ""),
+            "indices": {src} if src else {"白名单"},
+            "quality": quality,
+            "mktcap": mkt.get(code),
+            "fund_csv": stock.get("fund_csv"),
+        }
+    return out
+
+
 # ---------------------------------------------------------------- 黄金坑检测
 
 def _mean_vol(klines) -> float | None:
@@ -210,6 +237,8 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         "code": code,
         "name": stock["name"],
         "indices": stock["indices"],
+        "source": stock.get("source", ""),
+        "fund_csv": stock.get("fund_csv"),
         "mktcap": stock.get("mktcap"),
         "dd": dd,
         "gap": gap,
@@ -425,7 +454,12 @@ def _fundamental_check(results, top: int) -> None:
     print(f"  {'代码':<8}{'名称':<10}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
     print("  " + "-" * 68)
     for r in results[:n_fund]:
-        f = _fetch_fundamental(mx, r["name"], r["code"])
+        fc = r.get("fund_csv")
+        if fc and any(v is not None for v in (fc.get("pb_pct"), fc.get("roe"), fc.get("profit_growth"))):
+            # 白名单/CSV 已自带筛选当日的估值+基本面快照，直接复用（免重复拉取本地库/远端）
+            f = {"pb_pct": fc.get("pb_pct"), "roe": fc.get("roe"), "profit_growth": fc.get("profit_growth")}
+        else:
+            f = _fetch_fundamental(mx, r["name"], r["code"])
         r["fund"] = f
         r["fund_verdict"] = _fund_gate(f)
         label, note = r["fund_verdict"]
@@ -455,35 +489,48 @@ def _sync_local_db() -> None:
 # ---------------------------------------------------------------- 主流程
 
 def _parse_args(argv):
+    query = None
     top = 20
     sync = False
     full = False
     for a in argv[1:]:
         a = a.strip()
+        if not a:
+            continue
         if a.isdigit():
             top = max(5, min(int(a), 50))
         elif a == "--sync":
             sync = True
         elif a in ("--full", "--no-prescreen"):
             full = True
-    return top, sync, full
+        elif query is None:
+            query = a
+    return query, top, sync, full
 
 
 def main():
-    top, sync, full = _parse_args(sys.argv)
+    query, top, sync, full = _parse_args(sys.argv)
 
+    scope = query if query else "沪深300 ∪ 上证50 ∪ 中证红利"
     print("=" * 72)
-    print("黄金坑批量扫描（沪深300 ∪ 上证50 ∪ 中证红利）")
+    print(f"黄金坑批量扫描（{scope}）")
     print("=" * 72)
 
     if sync:
         _sync_local_db()
 
-    pool = _build_pool()
-    if not pool:
-        print("❌ 未获取到指数成分候选池（akshare 未装 / 网络异常）")
-        return 1
-    print(f"  候选池: {len(pool)} 只白马/蓝筹成分股")
+    if query:
+        pool = _build_pool_from_query(query)
+        if not pool:
+            print(f"❌ 无法解析「{query}」的候选池（白名单/CSV/板块/行业名未匹配或数据源不可达）")
+            print("   支持: 白马蓝筹 / .csv 路径 / 指数(沪深300/上证50/中证红利...) / 行业(半导体/化工...)")
+            return 1
+    else:
+        pool = _build_pool()
+        if not pool:
+            print("❌ 未获取到指数成分候选池（akshare 未装 / 网络异常）")
+            return 1
+    print(f"  候选池: {len(pool)} 只{'（白名单/板块/行业输入）' if query else '白马/蓝筹成分股'}")
 
     if not full:
         pool, prescreen_note = _prescreen(pool, ["down", "vol-down"])
@@ -536,7 +583,7 @@ def main():
     print(f"黄金坑候选（按信号分降序，共 {len(results)} 只，显示前 {min(top, len(results))}）")
     print("=" * 72)
     if results:
-        header = (f"  {'代码':<8}{'名称':<10}{'指数':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
+        header = (f"  {'代码':<8}{'名称':<10}{'板块':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
                   f"{'缩量比':>7}{'换手%':>6}{'站MA20':>7}{'MACD':>6}{'KDJ':>6}{'止跌':>5}{'分':>4}  分级")
         print(header)
         print("  " + "-" * 106)
@@ -555,7 +602,7 @@ def main():
     if suppressed:
         print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（牛市禁左侧埋伏——广度高时超跌是真弱）")
     print("  说明:")
-    print("    - 指数=候选所属指数（上证50/沪深300/中证红利）；市值=总市值（行情源未覆盖的新纳入成分显示 —）；回撤%=现价距近120日高点跌幅")
+    print("    - 板块=候选所属指数（上证50/沪深300/中证红利）或白名单层级（白马/蓝筹）；市值=总市值（行情源未覆盖的显示 —）；回撤%=现价距近120日高点跌幅")
     print("    - 缩量比=坑段均量/高点前20日均量（<0.6 健康）；站MA20/MACD金叉/KDJ金叉/止跌形态=企稳信号")
     print("    - 换手%=今日换手率（<1% 地量见底确认真缩量 / ≥5% 高换手则缩量存疑）")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
@@ -571,7 +618,7 @@ def main():
         print("  这些股跌得过深，大概率已非「短期错杀」而是趋势性下跌/基本面暴雷；")
         print("  但个别可能属「深度错杀」，需对单只跑 analyze_golden_pit.py 确认基本面是否未恶化。")
         print()
-        dheader = (f"  {'代码':<8}{'名称':<10}{'指数':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
+        dheader = (f"  {'代码':<8}{'名称':<10}{'板块':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
                    f"{'缩量比':>7}{'换手%':>6}{'站半年线':>8}{'MACD':>6}{'KDJ':>6}{'止跌':>5}")
         print(dheader)
         print("  " + "-" * 106)
