@@ -53,3 +53,4 @@ py .claude/skills/close-drift/scan_close_drift.py 半导体 20      # 指定板�
 - **默认目标池**：`holdings.csv` + `watchlist.csv`（去重，持仓优先）；也可传板块/行业名（走 `board_pool` 解析成分）或逗号分隔代码列表。
 - **近似而非竞价撮合**：看不到收盘竞价的未匹配量/竞价换手，仅「14:56→15:00 价格漂移 + 竞价量」两个维度。
 - **不臆造**：脚本没查到的（具体尾盘催化消息、龙虎榜资金）不要编造，需要时叠加 `/news-search` 查题材催化、`/market-heat` 看热点方向。
+- **落盘供次日 auction 拼接**：结果写入 `state/close_drift_latest.json`（trade_date + 每标 drift/收盘价/竞价量/当日涨跌），次日早盘 `auction` 自动读取做「昨尾盘→今竞价」组合。

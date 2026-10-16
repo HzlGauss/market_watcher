@@ -21,8 +21,11 @@
 注意: 竞价快照只支持 .SH/.SZ/.BJ 的 A 股，指数/基金/ETF 不支持；非竞价时段返回未就绪/停牌。
 """
 import csv
+import json
 import os
 import sys
+from collections import Counter
+from datetime import date, timedelta
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
@@ -154,7 +157,7 @@ def _print_snapshot(targets: list[tuple[str, str]], limit: int):
     codes = [c for c, _ in targets][:100]  # 竞价快照上限 100 只
     if not codes:
         print("  ⚠️ 无有效 A 股目标（自选/持仓里没有 A 股，或板块无成分）")
-        return
+        return []
     try:
         from app import hithink
         meta = hithink.fetch_auction_snapshot_meta(codes, "final")
@@ -167,7 +170,7 @@ def _print_snapshot(targets: list[tuple[str, str]], limit: int):
         print(f"  数据状态: {status}" + (f" / 竞价阶段: {phase}" if phase else ""))
     if not items:
         print("  ⚠️ 无竞价快照数据（非竞价时段 / 停牌 / 未就绪；status 见上）")
-        return
+        return []
 
     # name 兜底：用目标列表里的名称补
     name_map = {c: n for c, n in targets}
@@ -205,6 +208,122 @@ def _print_snapshot(targets: list[tuple[str, str]], limit: int):
     high = sum(1 for r in rows if r["pct"] is not None and r["pct"] > 3)
     low = sum(1 for r in rows if r["pct"] is not None and r["pct"] < -3)
     print(f"  汇总: 竞价 >+3% 强势高开 {high} 只 / <-3% 弱势低开 {low} 只 / 共 {len(rows)} 只")
+    return rows
+
+
+def _load_close_drift() -> tuple[str, dict[str, dict]]:
+    """读收盘后落盘的 state/close_drift_latest.json → (trade_date, {code: row})。"""
+    path = _ROOT / "state" / "close_drift_latest.json"
+    if not path.exists():
+        return "", {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data.get("rows") or {}
+        return str(data.get("trade_date") or ""), {str(k): v for k, v in rows.items()}
+    except Exception:
+        return "", {}
+
+
+def _prev_trade_day() -> str:
+    """上一交易日 YYYY-MM-DD（同花顺交易日历优先，退回上一工作日近似）。"""
+    try:
+        from app import hithink
+        days = hithink.fetch_trade_days()
+        if days:
+            today = date.today().strftime("%Y%m%d")
+            past = [d for d in days if d < today]
+            if past:
+                d = past[-1]
+                return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    except Exception:
+        pass
+    d = date.today() - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def _print_combo(rows: list[dict], cd_map: dict[str, dict], cd_trade_date: str,
+                 prev_day: str, limit: int) -> None:
+    """【3. 昨尾盘 → 今竞价 组合】跨日连续性：昨尾盘资金方向 vs 今竞价高/低开。
+
+    昨尾盘取 close-drift 的 drift（±0.3% 抢/砸），今竞价取 auction 的 pct（±0.5% 高/低开）。
+    仅 A 股个股两者兼具（ETF 无竞价数据，被排除）。
+    """
+    print()
+    print("=" * 76)
+    print("【3. 昨尾盘 → 今竞价 组合（跨日连续性 · 需先收盘后跑 close-drift 落盘）】")
+    print("=" * 76)
+    if not cd_map:
+        print("  ⚠️ 无昨尾盘缓存（state/close_drift_latest.json）。先收盘后跑 close-drift，次日竞价才有本段。")
+        return
+    if prev_day and cd_trade_date and cd_trade_date != prev_day:
+        print(f"  ⚠️ 尾盘缓存交易日 {cd_trade_date}，非上一交易日（预期 {prev_day}）——可能停牌/假期/未更新，口径需注意")
+    elif cd_trade_date:
+        print(f"  昨尾盘交易日: {cd_trade_date}")
+
+    combos = []
+    for r in rows:
+        code = r["code"]
+        cd = cd_map.get(code)
+        if not cd or cd.get("drift") is None or r.get("pct") is None:
+            continue
+        drift = cd["drift"]
+        pct = r["pct"]
+        if drift > 0.3:
+            d = "抢筹"
+        elif drift < -0.3:
+            d = "砸盘"
+        else:
+            d = "平盘"
+        if pct > 0.5:
+            o = "高开"
+        elif pct < -0.5:
+            o = "低开"
+        else:
+            o = "平开"
+        if d == "抢筹" and o == "高开":
+            label = "情绪接力 顺势关注"
+        elif d == "抢筹" and o == "低开":
+            label = "抢筹被闷杀 警惕诱多"
+        elif d == "砸盘" and o == "高开":
+            label = "利空出尽 或修复"
+        elif d == "砸盘" and o == "低开":
+            label = "恐慌延续 继续承压"
+        else:
+            label = "方向不明 观望"
+        combos.append({
+            "code": code,
+            "name": r.get("name") or cd.get("name") or "",
+            "yday_drift": drift,
+            "yday_day_pct": cd.get("day_pct"),
+            "pct": pct,
+            "label": label,
+        })
+
+    if not combos:
+        print("  ⚠️ 竞价与昨尾盘无共同标的（仅个股两者兼具；ETF 无竞价数据被排除）")
+        return
+
+    combos.sort(key=lambda x: -(x["pct"] if x["pct"] is not None else -1e9))
+
+    header = (f"  {'代码':<8}{'名称':<10}{'昨尾盘漂移':>10}{'昨当日涨跌':>10}"
+              f"{'今竞价涨跌':>10}{'组合解读':<20}")
+    print(header)
+    print("  " + "-" * 72)
+    for c in combos[:limit]:
+        drift_s = _pct(c["yday_drift"])
+        day_s = _pct(c["yday_day_pct"])
+        pct_s = _pct(c["pct"])
+        print(f"  {c['code']:<8}{_short(c['name']):<10}{drift_s:>10}{day_s:>10}"
+              f"{pct_s:>10}{c['label']:<20}")
+
+    if len(combos) > limit:
+        print(f"  ... 省略 {len(combos) - limit} 只 ...")
+
+    cnt = Counter(c["label"] for c in combos)
+    summary = " / ".join(f"{k} {v} 只" for k, v in cnt.items())
+    print(f"  汇总: {summary} / 共 {len(combos)} 只")
 
 
 def main():
@@ -230,7 +349,9 @@ def main():
         return 1
 
     _print_benchmark()
-    _print_snapshot(targets, limit)
+    rows = _print_snapshot(targets, limit)
+    cd_trade_date, cd_map = _load_close_drift()
+    _print_combo(rows, cd_map, cd_trade_date, _prev_trade_day(), limit)
 
     print()
     print("  说明:")
@@ -239,6 +360,7 @@ def main():
     print("    - 未匹配量 = 竞价未成交委托量；大额未匹配 + 高开 = 抢筹，低开 = 抛压")
     print("    - 短线风向标 tags 为服务端原标签，未自行推导；非竞价时段数据未就绪/停牌属正常")
     print("    - 本脚本只做取数排名，『竞价强弱 / 情绪周期』结论由 AI 依据 SKILL.md 框架生成")
+    print("    - 【3】昨尾盘→今竞价组合 = 收盘后 close-drift 落盘 + 今竞价拼接；仅 A 股个股两者兼具，ETF 无竞价")
     return 0
 
 

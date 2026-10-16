@@ -19,8 +19,10 @@
 注意: 需收盘后（15:00）跑才有尾盘竞价定盘数据；盘中跑 15:00 那根尚未生成，会提示未收盘。
 """
 import csv
+import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
@@ -223,6 +225,40 @@ def _print_rows(rows: list[dict], limit: int, name_map: dict[str, str]):
     print(f"  汇总: 尾盘抢筹(>+0.3%) {up} 只 / 平盘 {flat} 只 / 尾盘砸盘(<-0.3%) {down} 只 / 共 {len(rows)} 只")
 
 
+def _persist(rows: list[dict], name_map: dict[str, str]) -> None:
+    """收盘后把尾盘漂移结果落盘 state/close_drift_latest.json，供次日 auction 拼接昨尾盘。
+
+    best-effort：写失败静默，不影响主流程；仅在有已收盘数据时写入，避免盘中空跑覆盖旧缓存。
+    """
+    if not rows:
+        return
+    try:
+        state_dir = _ROOT / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "run_at": datetime.now().isoformat(timespec="seconds"),
+            "trade_date": rows[0].get("date") or "",
+            "rows": {
+                r["code"]: {
+                    "name": name_map.get(r["code"], "") or r.get("name", ""),
+                    "kind": r.get("kind"),
+                    "date": r.get("date"),
+                    "drift": r.get("drift"),
+                    "c1456": r.get("c1456"),
+                    "c1500": r.get("c1500"),
+                    "vol1500": r.get("vol1500"),
+                    "day_pct": r.get("day_pct"),
+                }
+                for r in rows
+            },
+        }
+        (state_dir / "close_drift_latest.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
 def main():
     argv = sys.argv[1:]
     target = ""
@@ -260,6 +296,8 @@ def main():
 
     rows.sort(key=lambda x: -(x["drift"] if x["drift"] is not None else -1e9))
 
+    _persist(rows, name_map)
+
     _print_rows(rows, limit, name_map)
 
     if skipped:
@@ -275,6 +313,7 @@ def main():
     print("    - ETF 有做市商平滑，漂移天然更小，±0.3% 阈值仅供参考，ETF 可放宽到 ±0.15%")
     print("    - 当日涨跌 = 收盘价 vs 昨收（昨收取前一日 15:00 收盘，缺则用当日开盘近似）")
     print("    - 本脚本只做取数排名，『尾盘资金方向 / 次日开盘铺垫』结论由 AI 依据 SKILL.md 框架生成")
+    print("    - 尾盘结果已落盘 state/close_drift_latest.json，供次日早盘竞价(auction)拼接『昨尾盘→今竞价』")
     return 0
 
 
