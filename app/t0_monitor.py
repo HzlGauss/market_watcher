@@ -9,12 +9,15 @@ import time
 import logging
 import os
 import re
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Dict
 
 from .data_pool import SharedDataPool, KLine
 from .models import Quote, WatchItem, KlineData
 from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary, detect_stage
+from .technical import calc_ma_alignment
 from .technical import fetch_historical_kline
 from .http_client import serverchan_client
 from .regime import gate_position
@@ -495,6 +498,8 @@ class T0MonitorThread(threading.Thread):
     KLINE_CACHE_TTL = 300
     # 日K缓存刷新间隔（秒）——加减仓用，日K慢变、无需频繁刷新
     DAILY_CACHE_TTL = 300
+    # 15分钟K线缓存刷新间隔（秒）——趋势过滤用，15min一天仅16根、慢变，无需频繁刷新
+    TREND_CACHE_TTL = 900
 
     def __init__(self,
                  watch_items: List[WatchItem],
@@ -535,6 +540,8 @@ class T0MonitorThread(threading.Thread):
         self._last_signal_time: Dict[str, float] = {}   # 信号冷却计时
         # 5分钟K线缓存：{code: (klines, fetch_time)}
         self._klines_cache: Dict[str, tuple[List[KlineData], float]] = {}
+        # 15分钟K线缓存：{code: (klines, fetch_time)}——跨日趋势过滤用
+        self._trend_cache: Dict[str, tuple[List[KlineData], float]] = {}
         # 加减仓：日K缓存 + 信号缓存 + 节流计时
         self._position_enabled = position_enabled
         self._position_push = position_push
@@ -602,6 +609,32 @@ class T0MonitorThread(threading.Thread):
             return cached[0]
         return None
 
+    def _get_trend_klines(self, item: WatchItem) -> Optional[List[KlineData]]:
+        """获取做T用的15分钟K线（带缓存），供跨日趋势过滤。
+
+        15min 一天仅 16 根，数据慢变，缓存 TTL 比 5min 更长；返回 120 根覆盖约
+        7.5 个交易日，足够算 MA20/MA60 确认跨日方向。
+        """
+        now = time.time()
+        cached = self._trend_cache.get(item.code)
+        if cached and (now - cached[1]) < self.TREND_CACHE_TTL:
+            return cached[0]
+
+        try:
+            time.sleep(0.3)  # 降低请求频率，避免 Sina 456 限频
+            klines = fetch_historical_kline(item.code, item.market, days=5, scale=15)
+            if klines:
+                self._trend_cache[item.code] = (klines, now)
+                log.debug(f"T0 15min趋势K线刷新: {item.code} ({len(klines)}根)")
+                return klines
+        except Exception as e:
+            log.warning(f"T0 15min趋势K线获取失败 {item.code}: {e}")
+
+        # 返回旧缓存（即使过期也比没有好）
+        if cached:
+            return cached[0]
+        return None
+
     def _scan(self):
         """扫描所有标的，识别做T信号，一轮只发一次通知"""
         # 交易时段检查：收盘后停止扫描，避免用停更数据重复发信号
@@ -646,6 +679,37 @@ class T0MonitorThread(threading.Thread):
             pos_signals = self._scan_position_signals()
             if pos_signals:
                 self._handle_position_signals(pos_signals)
+
+        # 每轮扫描后写信号快照，供盘中随时查询最新挂单价/支撑压力
+        self._write_snapshot()
+
+    def _write_snapshot(self):
+        """把当前最新做T信号快照写到 state/t0_signals.json（覆盖写，供盘中查询）"""
+        try:
+            state_dir = Path(__file__).resolve().parent.parent / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            snap = {
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "signals": {},
+            }
+            for code, sig in self._last_signals.items():
+                snap["signals"][code] = {
+                    "name": sig.name,
+                    "signal_type": sig.signal_type,
+                    "price": round(sig.price, 3),
+                    "buy_price": round(sig.buy_price, 3),
+                    "sell_price": round(sig.sell_price, 3),
+                    "support": round(sig.support, 3),
+                    "resistance": round(sig.resistance, 3),
+                    "risk_reward": sig.risk_reward,
+                    "reason": sig.reason,
+                    "time": datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S"),
+                    "age_sec": int(time.time() - sig.timestamp),
+                }
+            with open(state_dir / "t0_signals.json", "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.warning(f"写做T信号快照失败: {e}")
 
     def _evaluate_signal(self, item: WatchItem, quote: Quote,
                          t0_klines: List[KlineData]) -> Optional[T0Signal]:
@@ -694,6 +758,16 @@ class T0MonitorThread(threading.Thread):
         # 窄幅/无空间的过滤已由上面的 range_width 与 intrabar 振幅门槛覆盖。
         ma_align = tech.ma_alignment
 
+        # 15分钟跨日趋势（日内波段持几小时，用 15min 确认跨日方向，过滤 5min 逆势噪音）
+        trend_direction = 0  # +1 多头 / -1 空头 / 0 缠绕或数据不足
+        trend_klines = self._get_trend_klines(item)
+        if trend_klines:
+            trend_ma = calc_ma_alignment(trend_klines)
+            if trend_ma.alignment in ("多头排列", "多头回调"):
+                trend_direction = 1
+            elif trend_ma.alignment in ("空头排列", "空头反弹"):
+                trend_direction = -1
+
         # 计算建议挂单价格
         suggested = _compute_suggested_prices(sr, price, quote)
 
@@ -724,6 +798,14 @@ class T0MonitorThread(threading.Thread):
             MIN_RR_SELL = min(0.40, MIN_RR_SELL + 0.10)  # 逆势卖出门槛更高
         elif ma_align == "空头排列":
             MIN_RR_BUY = min(0.40, MIN_RR_BUY + 0.10)
+            MIN_RR_SELL = max(0.10, MIN_RR_SELL - 0.05)
+
+        # 15分钟跨日趋势门控：顺势放松、逆势收紧（与 5min 逻辑对称）
+        if trend_direction == 1:  # 15min 多头
+            MIN_RR_BUY = max(0.10, MIN_RR_BUY - 0.05)  # 顺势做波段买入门槛更低
+            MIN_RR_SELL = min(0.40, MIN_RR_SELL + 0.10)  # 逆大级别做空收紧
+        elif trend_direction == -1:  # 15min 空头
+            MIN_RR_BUY = min(0.40, MIN_RR_BUY + 0.10)  # 逆大级别抄底收紧
             MIN_RR_SELL = max(0.10, MIN_RR_SELL - 0.05)
 
         # 信号冷却：同一标的至少间隔 300 秒才允许翻转方向

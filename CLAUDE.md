@@ -116,6 +116,9 @@ py .claude/skills/auction/scan_auction.py [板块/行业|代码列表] [数量]
 # Close-drift scan (尾盘资金方向：14:56连续竞价价 vs 15:00收盘竞价价 → 尾盘抢筹/砸盘)
 py .claude/skills/close-drift/scan_close_drift.py [板块/行业|代码列表] [数量]
 
+# Query current T+0 signal snapshot (做T信号快照查询：某标的最新买/卖挂单价 + 支撑压力)
+py .claude/skills/t0-query/query_t0.py [代码]
+
 # Sector-beta scan (行业景气雷达：牛股密度+板块动量+主力资金流 三信号给行业打分排名，落库长期观测)
 py .claude/skills/sector-beta/scan_sector_beta.py [数量] [--history]
 
@@ -159,6 +162,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`limit-analysis`** — 涨跌停深度分析：拉最近交易日涨停池/炸板池/跌停池，算涨停梯队（连板高度分层）、炸板率、封单额 TOP、题材归类、跌停池，判断短线情绪周期与主线题材。涨跌停用同花顺/东财精确口径（10%/20%/ST 5%），非 9.9% 近似。用户问「今天多少涨停/跌停」「涨停梯队/连板高度」「炸板率」「谁在涨停、什么题材」「短线情绪怎么样」「空间板是谁」时使用。同花顺主源 + akshare 兜底（无 key 需 `pip install akshare`）。详见 `.claude/skills/limit-analysis/SKILL.md`。
 - **`auction`** — 早盘竞价雷达：拉全市场短线风向标竞价基准 + 自选/持仓/指定板块个股集合竞价快照，算竞价涨跌幅/量比/竞价换手/昨量比/未匹配量，输出「高开强势/低开弱势」分层。用户问「今天竞价怎么样」「早盘竞价强弱」「XX 竞价高开/低开」「竞价能不能追/要不要竞价卖」「竞价情绪怎么样」时使用。仅支持 A 股（自动过滤 ETF/基金），需 `HITHINK_FINANCE_API_KEY`，不依赖 `MX_APIKEY`。详见 `.claude/skills/auction/SKILL.md`。
 - **`close-drift`** — 尾盘资金方向：用腾讯 1 分钟 K 线对比 14:56 连续竞价末价与 15:00 收盘竞价定盘价，算尾盘漂移 + 收盘竞价量，输出「尾盘抢筹拉升/砸盘出逃/平盘」排名，供收盘后复盘与次日开盘铺垫。用户问「尾盘有没有异动」「尾盘资金在抢还是逃」「XX 尾盘拉升/砸盘」「收盘竞价资金动向」「次日会不会高开低走」时使用。覆盖 A 股个股 + 场内 ETF，免费（腾讯分钟 K），不依赖 `MX_APIKEY` / `HITHINK_FINANCE_API_KEY`，需收盘后跑。详见 `.claude/skills/close-drift/SKILL.md`。
+- **`t0-query`** — 做T信号快照查询：读取做T监控线程写入的 `state/t0_signals.json`，输出某标的当前的买/卖挂单价、支撑位、压力位、盈亏比与触发时间，或列出当前所有做T信号。用户问「XX 现在做T该挂多少钱买/卖」「XX 的支撑压力在哪」「当前有哪些做T信号」时使用。纯读 JSON、零依赖零网络，需先启动做T监控（快照由 `T0MonitorThread` 每轮扫描覆盖写）。详见 `.claude/skills/t0-query/SKILL.md`。
 - **`sector-beta`** — 行业景气雷达：用「牛股密度（行业近 250 日翻倍股占比）+ 板块动量（10 日涨跌）+ 主力资金流（10 日净流入）」三信号给全市场行业打分排名，输出主线行业；每次结果落库 `data/sector_beta.duckdb`，`--history` 看持续性/轮动/新晋。用户问「现在主线行业是什么」「哪些行业有大机会/持续性」「行业轮动到哪了」「哪个行业牛股多」时使用。自上而下选行业（行业 beta 是牛股主因）。不依赖 `MX_APIKEY`，需本地 duckdb（miniconda python）。详见 `.claude/skills/sector-beta/SKILL.md`。
 - **`holdings-news`** — 持仓个股消息面扫描（利好/利空）：读 holdings.csv 里的普通 A 股个股（排除 ETF/基金），逐只用妙想拉新闻/公告/研报，再由 DeepSeek 判定净方向（利好/利空/中性）+ 强度 + 关键事件，按「利空→利好→中性、强→弱」排序输出。用户问「我的持仓有没有消息/公告」「持仓哪些有利好/利空」「持仓股最近有什么大事」时使用。详见 `.claude/skills/holdings-news/SKILL.md`。
 
