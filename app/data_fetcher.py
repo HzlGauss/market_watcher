@@ -5,8 +5,10 @@
 from __future__ import annotations
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional
 
 from datetime import datetime
@@ -1550,11 +1552,76 @@ def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80,
     return []
 
 
-def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
-    """批量获取个股所属行业（带日级缓存）
+# 行业映射缓存后台刷新（跨天机会性）：节流 + 单线程，push2 被封时静默失败、不阻塞调用方
+_INDUSTRY_REFRESH_COOLDOWN = 1800  # 秒
+_industry_refresh_lock = threading.Lock()
+_industry_refresh_state = {"ts": 0.0, "running": False}
 
-    首次调用时拉取全市场行业映射并缓存到 state/industry_cache.json，
-    同日后续调用直接读缓存，避免重复拉取 5000+ 条全市场数据。
+
+def _fetch_industry_map_online() -> dict[str, str]:
+    """拉全市场 f100 行业映射（东财 clist），失败/空返回 {}。"""
+    try:
+        items = _fetch_em_clist(
+            fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
+            fields="f12,f14,f100",
+            fid="f12",
+        )
+    except Exception:
+        return {}
+    full_map: dict[str, str] = {}
+    for it in items:
+        code = str(it.get("f12", ""))
+        industry = str(it.get("f100", "") or "")
+        if code and industry:
+            full_map[code] = industry
+    return full_map
+
+
+def _write_industry_cache(cache_path: Path, full_map: dict[str, str]) -> None:
+    """原子写缓存（tmp + rename），避免后台刷新写到一半被读线程读到半截 JSON。"""
+    import json
+
+    cache_data = {"_date": datetime.now().strftime("%Y%m%d"), **full_map}
+    tmp = cache_path.with_name(cache_path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+    tmp.replace(cache_path)
+
+
+def _refresh_industry_cache_worker(cache_path: Path) -> None:
+    """后台刷新线程：拉全市场行业映射并落缓存，失败静默（push2 被封）。"""
+    global _industry_refresh_state
+    try:
+        full_map = _fetch_industry_map_online()
+        if full_map:
+            _write_industry_cache(cache_path, full_map)
+            log.info(f"行业分类缓存已后台刷新: {len(full_map)} 只个股")
+    except Exception as e:
+        log.warning(f"行业分类后台刷新失败: {type(e).__name__}")
+    finally:
+        with _industry_refresh_lock:
+            _industry_refresh_state["running"] = False
+
+
+def _schedule_industry_cache_refresh(cache_path: Path) -> None:
+    """缓存跨天时后台机会性刷新（节流 + 单线程），不阻塞调用方。"""
+    global _industry_refresh_state
+    now = time.time()
+    with _industry_refresh_lock:
+        st = _industry_refresh_state
+        if st["running"] or now - st["ts"] < _INDUSTRY_REFRESH_COOLDOWN:
+            return
+        st["ts"] = now
+        st["running"] = True
+    threading.Thread(target=_refresh_industry_cache_worker, args=(cache_path,), daemon=True).start()
+
+
+def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
+    """批量获取个股所属行业（本地缓存 + 跨天后台机会性刷新）
+
+    行业分类（f100）稳定，读缓存即用、不做日期校验——push2 被封时（见 memory
+    project-em-push2-blocked）也能正常返回旧缓存。缓存跨天时后台机会性尝试刷新，
+    刷新成功则下次调用拿到更全的数据，失败静默用旧缓存。
 
     Args:
         codes: 股票代码列表
@@ -1563,7 +1630,6 @@ def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
         {code: industry} 映射字典
     """
     import json
-    from pathlib import Path
 
     today = datetime.now().strftime("%Y%m%d")
     cache_dir = Path(__file__).resolve().parent.parent / "state"
@@ -1571,37 +1637,28 @@ def fetch_stock_industry_map(codes: list[str]) -> dict[str, str]:
     cache_path = cache_dir / "industry_cache.json"
 
     full_map: dict[str, str] = {}
+    cached_date = ""
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached.get("_date") == today:
-                full_map = {k: v for k, v in cached.items() if not k.startswith("_")}
+            cached_date = str(cached.get("_date") or "")
+            full_map = {k: v for k, v in cached.items() if not k.startswith("_")}
         except Exception:
-            pass
+            full_map = {}
 
     if not full_map:
-        try:
-            # f100=所属行业。原 akshare stock_zh_a_spot_em 已不含行业列且打被断连的 push2，改直连 push2delay
-            items = _fetch_em_clist(
-                fs="m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23",
-                fields="f12,f14,f100",
-                fid="f12",
-            )
-            for it in items:
-                code = str(it.get("f12", ""))
-                industry = str(it.get("f100", "") or "")
-                if code and industry:
-                    full_map[code] = industry
-            if full_map:
-                cache_data = {"_date": today, **full_map}
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(cache_data, f, ensure_ascii=False)
+        # 缓存缺失 → 同步拉取建库（首次），失败返回空
+        full_map = _fetch_industry_map_online()
+        if full_map:
+            try:
+                _write_industry_cache(cache_path, full_map)
                 log.info(f"行业分类已缓存: {len(full_map)} 只个股 → {cache_path}")
-        except Exception as e:
-            # 东财全市场快照易断连/限频，安静失败即可，避免重试风暴
-            log.warning(f"东财全市场行业分类不可达，跳过: {type(e).__name__}")
-            return {}
+            except Exception:
+                pass
+    elif cached_date != today:
+        # 缓存跨天 → 后台机会性刷新（不阻塞），先返回旧缓存
+        _schedule_industry_cache_refresh(cache_path)
 
     return {code: full_map[code] for code in codes if code in full_map}
 

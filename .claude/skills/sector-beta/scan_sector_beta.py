@@ -63,7 +63,6 @@ except ImportError:
         _DUCKDB = None
 
 from app.data_fetcher import (
-    fetch_sector_boards,
     fetch_sector_fund_flow_rank,
     fetch_stock_industry_map,
 )
@@ -73,7 +72,7 @@ W_DENSITY = 0.5
 W_MOMENTUM = 0.3
 W_FLOW = 0.2
 
-# 东财板块接口不可达时的两腿降级权重：0.5·密度 + 0.3·动量 按原比例归一化
+# 资金流腿缺失时的两腿权重：0.5·密度 + 0.3·动量 按原比例归一化
 W_DENSITY_2L = W_DENSITY / (W_DENSITY + W_MOMENTUM)   # 0.625
 W_MOMENTUM_2L = W_MOMENTUM / (W_DENSITY + W_MOMENTUM)  # 0.375
 
@@ -353,73 +352,12 @@ def _th_industry_momentum(industry_names: list[str]) -> dict[str, float | None]:
     return out
 
 
-def _collect_ths_fallback(
-    bull_tickers: list[str], max_date: str
-) -> tuple[list[dict], str, dict[str, dict]]:
-    """东财板块接口不可达时的降级：牛股密度用本地 f100 行业映射缓存，动量用同花顺板块K线，资金流缺失。
-
-    行业口径沿用 f100 行业名（与牛股聚合同一口径，分子分母自洽），动量经行业名映射到同花顺行业指数。
-    综合分降为两腿（0.5·密度 + 0.3·动量 归一化）。
-    """
-    full_map = _read_full_industry_map()
-    if not full_map:
-        # 缓存缺失 → 触发一次全市场行业映射拉取并落缓存（东财 f100，独立于板块接口）
-        fetch_stock_industry_map(bull_tickers)
-        full_map = _read_full_industry_map()
-    if not full_map:
-        print("  ⚠️ 无行业映射缓存且东财 f100 不可达，无法降级。请稍后重试或先 /marketdb-sync。")
-        return [], max_date, {}
-
-    bull_set = set(bull_tickers)
-    bull_by_industry: Counter = Counter()
-    for code in bull_set:
-        ind = full_map.get(code)
-        if ind and ind != "-":
-            bull_by_industry[ind] += 1
-    stock_count = Counter(v for v in full_map.values() if v != "-")
-
-    industries = sorted({name for name, cnt in stock_count.items() if cnt >= MIN_STOCKS})
-    if not industries:
-        return [], max_date, {}
-
-    print(f"  ↳ 降级中：{len(industries)} 个行业（成分≥{MIN_STOCKS}），正在拉同花顺板块动量…")
-    momentum = _th_industry_momentum(industries)
-
-    rows: list[dict] = []
-    for name in industries:
-        cnt = stock_count[name]
-        rows.append({
-            "sector_code": "",
-            "sector_name": name,
-            "stock_count": cnt,
-            "bull_count": bull_by_industry.get(name, 0),
-            "bull_density": round(bull_by_industry.get(name, 0) / cnt, 4),
-            "change_pct_10d": momentum.get(name),
-            "main_net_10d": None,
-            "main_pct_10d": None,
-            "top_stock": "",
-        })
-
-    comm_sig = _fetch_commodity_signal()
-    _attach_commodity(rows, comm_sig)
-
-    import pandas as pd
-
-    df = pd.DataFrame(rows)
-    score = (
-        W_DENSITY_2L * df["bull_density"].rank(pct=True)
-        + W_MOMENTUM_2L * df["change_pct_10d"].fillna(0).rank(pct=True)
-    ).round(4)
-    for i, r in enumerate(rows):
-        r["score"] = float(score.iloc[i])
-    rows.sort(key=lambda r: r["score"], reverse=True)
-    for i, r in enumerate(rows, start=1):
-        r["rank"] = i
-    return rows, max_date, comm_sig
-
-
 def _collect() -> tuple[list[dict], str, dict[str, dict]]:
-    """汇总三信号 → 每行业一行 {name, code, stock_count, bull_count, ...}，返回 (rows, trade_date, comm_sig)。"""
+    """汇总信号 → 每行业一行 {name, code, stock_count, bull_count, ...}，返回 (rows, trade_date, comm_sig)。
+
+    牛股密度与行业口径统一走本地 f100 行业映射缓存（分子分母自洽，不依赖东财板块接口），
+    动量走同花顺板块K线（可靠源），资金流走东财 push2（机会性腿：被封时静默降为两腿）。
+    """
     bull_tickers, max_date = _fetch_bull_tickers()
 
     if not bull_tickers:
@@ -427,41 +365,43 @@ def _collect() -> tuple[list[dict], str, dict[str, dict]]:
         print("     → 请先跑 /marketdb-sync 或 py tools/marketdb_local.py bootstrap 建库。")
         return [], max_date, {}
 
-    # 牛股 → 行业（东财 f100，带日级缓存）
-    industry_map = fetch_stock_industry_map(bull_tickers) or {}
+    # 行业映射（f100，本地缓存；分类稳定，不校验日期）
+    full_map = _read_full_industry_map()
+    if not full_map:
+        fetch_stock_industry_map(bull_tickers)
+        full_map = _read_full_industry_map()
+    if not full_map:
+        print("  ⚠️ 无行业映射缓存且东财 f100 不可达，无法扫描。请稍后重试。")
+        return [], max_date, {}
 
-    # 板块列表 + 成分数（分母）；剔除成分过少的微型板块（噪声）
-    boards = [b for b in (fetch_sector_boards() or []) if (b.stock_count or 0) >= MIN_STOCKS]
-    if not boards:
-        print("  ⚠️ 东财行业板块接口不可达（push2delay/push2 被限流或断连）。")
-        print("     → 降级：牛股密度用本地行业映射缓存，动量用同花顺板块K线，资金流腿缺失。")
-        return _collect_ths_fallback(bull_tickers, max_date)
-    # 10 日动量 + 主力资金流
+    # 牛股按行业聚合（分子分母同源自 f100 映射，自洽）
+    bull_set = set(bull_tickers)
+    bull_by_industry: Counter = Counter()
+    for code in bull_set:
+        ind = full_map.get(code)
+        if ind and ind != "-":
+            bull_by_industry[ind] += 1
+    stock_count = Counter(v for v in full_map.values() if v != "-")
+    industries = sorted({name for name, cnt in stock_count.items() if cnt >= MIN_STOCKS})
+
+    # 动量：同花顺行业指数近 MOM_WIN 日涨跌
+    momentum = _th_industry_momentum(industries)
+
+    # 资金流：东财 push2（机会性腿，被封/限流时返回空）
     flows = fetch_sector_fund_flow_rank("10日", "行业资金流") or []
-
     flow_by_name = {f.name: f for f in flows if f.name}
-    flow_by_code = {f.code: f for f in flows if f.code}
-
-    # 牛股按行业聚合
-    bull_by_industry: dict[str, int] = {}
-    for code in bull_tickers:
-        ind = industry_map.get(code)
-        if ind:
-            bull_by_industry[ind] = bull_by_industry.get(ind, 0) + 1
 
     rows: list[dict] = []
-    for b in boards:
-        name = b.name
-        flow = flow_by_name.get(name) or flow_by_code.get(b.code)
-        bull_count = bull_by_industry.get(name, 0)
-        stock_count = max(int(b.stock_count or 0), 1)
+    for name in industries:
+        cnt = stock_count[name]
+        flow = flow_by_name.get(name)
         rows.append({
-            "sector_code": b.code or (flow.code if flow else ""),
+            "sector_code": flow.code if flow else "",
             "sector_name": name,
-            "stock_count": stock_count,
-            "bull_count": bull_count,
-            "bull_density": round(bull_count / stock_count, 4),
-            "change_pct_10d": flow.change_pct if flow else None,
+            "stock_count": cnt,
+            "bull_count": bull_by_industry.get(name, 0),
+            "bull_density": round(bull_by_industry.get(name, 0) / cnt, 4),
+            "change_pct_10d": momentum.get(name),
             "main_net_10d": flow.main_net if flow else None,
             "main_pct_10d": flow.main_pct if flow else None,
             "top_stock": flow.top_stock if flow else "",
@@ -471,14 +411,22 @@ def _collect() -> tuple[list[dict], str, dict[str, dict]]:
     comm_sig = _fetch_commodity_signal()
     _attach_commodity(rows, comm_sig)
 
-    # 综合分 = 加权分位（pandas rank(pct=True)：None 当 0，并列取平均）
+    # 综合分 = 加权分位（pandas rank(pct=True)：None 当 0，并列取平均）。资金流腿可用 → 三腿，否则两腿。
     import pandas as pd
+
     df = pd.DataFrame(rows)
-    score = (
-        W_DENSITY * df["bull_density"].rank(pct=True)
-        + W_MOMENTUM * df["change_pct_10d"].fillna(0).rank(pct=True)
-        + W_FLOW * df["main_net_10d"].fillna(0).rank(pct=True)
-    ).round(4)
+    has_flow = any(r["main_net_10d"] is not None for r in rows)
+    if has_flow:
+        score = (
+            W_DENSITY * df["bull_density"].rank(pct=True)
+            + W_MOMENTUM * df["change_pct_10d"].fillna(0).rank(pct=True)
+            + W_FLOW * df["main_net_10d"].fillna(0).rank(pct=True)
+        ).round(4)
+    else:
+        score = (
+            W_DENSITY_2L * df["bull_density"].rank(pct=True)
+            + W_MOMENTUM_2L * df["change_pct_10d"].fillna(0).rank(pct=True)
+        ).round(4)
     for i, r in enumerate(rows):
         r["score"] = float(score.iloc[i])
 
@@ -586,7 +534,7 @@ def _fmt_yi(v) -> str:
 
 
 def _is_fallback(rows: list[dict]) -> bool:
-    """降级结果判定：资金流腿全缺失（东财板块接口不可达时的两腿降级）。"""
+    """资金流腿是否缺失（东财 push2 不可达时的两腿打分）。"""
     return bool(rows) and all(r.get("main_net_10d") is None for r in rows)
 
 
@@ -597,8 +545,7 @@ def _print_scan(rows: list[dict], trade_date: str, limit: int, comm_sig: dict[st
     print("=" * 78)
     print(f"翻倍基准：近 {BULL_WINDOW} 交易日 前复权 MAX(high)/MIN(low) ≥ {BULL_RATIO}")
     if fallback:
-        print(f"综合分 = {W_DENSITY_2L:.3f}·牛股密度分位 + {W_MOMENTUM_2L:.3f}·动量分位（资金流腿缺失，两腿降级）")
-        print("     ⚠️ 东财板块接口限流：动量改用同花顺板块K线，资金流腿缺失。")
+        print(f"综合分 = {W_DENSITY_2L:.3f}·牛股密度分位 + {W_MOMENTUM_2L:.3f}·动量分位（资金流腿暂缺）")
     else:
         print(f"综合分 = {W_DENSITY}·牛股密度分位 + {W_MOMENTUM}·动量分位 + {W_FLOW}·资金流分位")
     print()
@@ -757,11 +704,8 @@ def main() -> int:
 
     rows, trade_date, comm_sig = _collect()
     if rows:
+        _write_db(rows, trade_date, comm_sig)
         _print_scan(rows, trade_date, limit, comm_sig)
-        if _is_fallback(rows):
-            print("  ⚠️ 降级结果不落库（资金流腿缺失、行业口径较粗），东财恢复后重跑可落库。")
-        else:
-            _write_db(rows, trade_date, comm_sig)
     return 0
 
 
