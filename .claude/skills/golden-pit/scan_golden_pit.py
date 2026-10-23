@@ -41,6 +41,14 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT))
 
+# 加载 .env（HITHINK_FINANCE_API_KEY / MX_APIKEY）：同花顺板块解析兜底依赖此 key，
+# 必须在 resolve_board_pool 之前加载，否则「封测/先进封装」等同花顺专属板块无法解析。
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
+
 # 抑制 app 模块的 WARNING 噪音（如个别 K 线获取失败刷屏）
 logging.disable(logging.WARNING)
 
