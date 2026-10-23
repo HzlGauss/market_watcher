@@ -2058,6 +2058,190 @@ def fetch_sector_fund_flow_rank(
     return flows
 
 
+# ============================================================
+# 板块资金流排名兜底：东财 push2 被 IP 封锁时的本地缓存快照 + 妙想逐板块
+# ============================================================
+
+# 妙想逐板块兜底候选：东财行业名（Miaoxiang 能识别的常见行业子集）
+_MX_SECTOR_FALLBACK_LIST = [
+    "银行", "证券", "保险", "白酒", "医药生物", "医疗器械", "化学制药", "生物制品",
+    "新能源", "光伏设备", "电池", "汽车整车", "汽车零部件", "半导体", "消费电子",
+    "通信设备", "软件开发", "计算机设备", "军工", "电力", "房地产", "钢铁",
+    "有色", "煤炭行业", "石油石化", "基础化工", "食品饮料", "家电",
+]
+# indicator -> 妙想逐日资金流累加天数（10日只有 6 天窗口，做 best-effort）
+_MX_SECTOR_FLOW_DAYS = {"今日": 1, "5日": 5, "10日": 10}
+
+
+def _sector_flow_cache_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "state" / "sector_flow_cache.json"
+
+
+def _write_sector_flow_cache(flows: list[SectorFundFlow], indicator: str, sector_type: str) -> None:
+    """东财实时板块资金流结果原子落盘，供 push2 被封时做缓存快照兜底（best-effort）。"""
+    import json
+    try:
+        p = _sector_flow_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_ts": time.time(),
+            "_time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "_date": datetime.now().strftime("%Y%m%d"),
+            "indicator": indicator,
+            "sector_type": sector_type,
+            "items": [
+                {
+                    "code": f.code, "name": f.name,
+                    "change_pct": f.change_pct, "main_net": f.main_net,
+                    "main_pct": f.main_pct, "top_stock": f.top_stock,
+                }
+                for f in flows
+            ],
+        }
+        tmp = p.with_name(p.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        tmp.replace(p)
+    except Exception as e:
+        log.debug(f"板块资金流缓存写失败: {e}")
+
+
+def _read_sector_flow_cache(indicator: str, sector_type: str) -> tuple[list[SectorFundFlow], str]:
+    """读缓存快照；匹配 indicator/sector_type 且未过期时返回 (flows, 时间串)，否则 ([], "")。"""
+    import json
+    try:
+        p = _sector_flow_cache_path()
+        if not p.exists():
+            return [], ""
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("indicator") != indicator or data.get("sector_type") != sector_type:
+            return [], ""
+        ts = float(data.get("_ts") or 0)
+        if ts <= 0:
+            return [], ""
+        if indicator == "今日":
+            # 盘中快照仅当日有效
+            if data.get("_date") != datetime.now().strftime("%Y%m%d"):
+                return [], ""
+        else:
+            # 5日/10日多日聚合跨日仍可用，24h 内视为新鲜
+            if time.time() - ts > 24 * 3600:
+                return [], ""
+        flows = [
+            SectorFundFlow(
+                code=str(it.get("code") or ""),
+                name=str(it.get("name") or ""),
+                change_pct=_safe_float(it.get("change_pct")),
+                main_net=_safe_float(it.get("main_net")),
+                main_pct=_safe_float(it.get("main_pct")),
+                top_stock=str(it.get("top_stock") or ""),
+            )
+            for it in (data.get("items") or [])
+        ]
+        return flows, str(data.get("_time_str") or "")
+    except Exception as e:
+        log.debug(f"板块资金流缓存读失败: {e}")
+        return [], ""
+
+
+def _fetch_sector_flow_miaoxiang(indicator: str = "5日") -> list[SectorFundFlow]:
+    """妙想逐板块兜底：逐个查主流行业主力净流入，按净流入降序返回子集排名。
+
+    东财 push2 被 IP 封锁时，妙想走服务端转发（不受封锁）。单个板块查「X板块资金流向」
+    返回近 6 个交易日逐日主力净流入（returnSourceCode=INFLOWQ），按 indicator 累加
+    （今日=1 日，5日=5 日，10日=best-effort 6 日）。涨跌幅/净占比/最大股不在此接口内，
+    对应字段留空。需 .env 配置 MX_APIKEY，无 key 返回 []。
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from app.miaoxiang import MXClient
+
+    keys = [k for k in (os.environ.get("MX_APIKEY"), os.environ.get("MX_APIKEY_2")) if k]
+    if not keys:
+        return []
+    client = MXClient(keys)
+    days = _MX_SECTOR_FLOW_DAYS.get(indicator, 5)
+
+    def _query_one(sector: str) -> Optional[SectorFundFlow]:
+        try:
+            time.sleep(0.35)  # 降频，避免妙想限流
+            result = client.query(f"{sector}板块资金流向")
+            if not result or result.get("status") != 0:
+                return None
+            dto_list = (
+                (result.get("data") or {}).get("data", {})
+                .get("searchDataResultDTO", {}).get("dataTableDTOList") or []
+            )
+            if not dto_list:
+                return None
+            dto = dto_list[0]
+            # 定位「主力净流入资金」字段（returnSourceCode=INFLOWQ），拿对应 returnCode
+            inflow_code = None
+            for f in (dto.get("fieldSet") or []):
+                if f.get("returnSourceCode") == "INFLOWQ" or "主力净流入" in str(f.get("returnName") or ""):
+                    inflow_code = str(f.get("returnCode") or "")
+                    break
+            if not inflow_code:
+                return None
+            vals = (dto.get("rawTable") or {}).get(inflow_code)
+            if not isinstance(vals, list) or not vals:
+                return None
+            total = 0.0
+            got = 0
+            for v in vals[:days]:
+                n = _safe_float(v)
+                if n is None:
+                    continue
+                total += n
+                got += 1
+            if not got:
+                return None
+            return SectorFundFlow(code="", name=sector, main_net=total)
+        except Exception as e:
+            log.debug(f"妙想板块资金流查询失败 {sector}: {e}")
+            return None
+
+    flows: list[SectorFundFlow] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_query_one, s) for s in _MX_SECTOR_FALLBACK_LIST]
+        for fut in futures:
+            try:
+                r = fut.result(timeout=30)
+                if r is not None:
+                    flows.append(r)
+            except Exception:
+                pass
+
+    flows.sort(key=lambda s: (s.main_net or 0.0), reverse=True)
+    return flows
+
+
+def fetch_sector_fund_flow_rank_with_fallback(
+    indicator: str = "5日", sector_type: str = "行业资金流"
+) -> tuple[list[SectorFundFlow], str]:
+    """板块资金流排名 + 三级兜底，返回 (flows, source)。
+
+    顺序：① 东财 push2 实时 → ② 本地缓存快照 → ③ 妙想逐板块（仅行业板块支持）。
+    source 取值：'东财实时' / '缓存快照(时间)' / '妙想逐板块' / ''（全部失败）。
+    """
+    flows = fetch_sector_fund_flow_rank(indicator, sector_type)
+    if flows:
+        _write_sector_flow_cache(flows, indicator, sector_type)
+        return flows, "东财实时"
+
+    cached, ts = _read_sector_flow_cache(indicator, sector_type)
+    if cached:
+        return cached, f"缓存快照({ts})"
+
+    # 妙想逐板块仅覆盖行业板块（概念/地域无对应子集清单）
+    if sector_type == "行业资金流":
+        mflows = _fetch_sector_flow_miaoxiang(indicator)
+        if mflows:
+            return mflows, "妙想逐板块"
+    return [], ""
+
+
 # 个股主力净流入字段（东财 clist）：今日 f62 / 5日 f164 / 10日 f174
 _STOCK_FLOW_NET = {"今日": "f62", "5日": "f164", "10日": "f174"}
 # 个股 clist 字段：代码/名称/现价/涨跌幅/成交额/换手率/量比/PE动/PB/总市值/流通市值

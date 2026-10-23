@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-from app.data_fetcher import fetch_sector_fund_flow_rank
+from app.data_fetcher import fetch_sector_fund_flow_rank_with_fallback
 
 _INDICATORS = {
     "今日": "今日", "今天": "今日", "1": "今日",
@@ -110,19 +110,26 @@ def main():
         return 0
 
     indicator, sector_type, top = _parse_args(argv)
-    flows = fetch_sector_fund_flow_rank(
+    flows, source = fetch_sector_fund_flow_rank_with_fallback(
         indicator=indicator, sector_type=_SECTOR_TYPES[sector_type]
     )
 
     if not flows:
         print(
-            f"❌ 未获取到 {sector_type}板块 {indicator} 资金流数据"
-            "（东财接口不可达或非交易时段）"
+            f"❌ 未获取到 {sector_type}板块 {indicator} 资金流数据："
+            "东财 push2 接口被 IP 封锁，且无可用缓存/妙想兜底（需 .env 配置 MX_APIKEY）"
         )
         return 1
 
+    src_note = {
+        "东财实时": "东财实时",
+        "妙想逐板块": "妙想逐板块（仅主流行业子集，涨跌幅/占比/最大股为空）",
+    }
+    # 缓存快照带时间戳，保留原文；其余取映射或原样
+    src_label = src_note.get(source, source if source.startswith("缓存快照") else source)
     print(
         f"A股 {sector_type}板块资金流排名 · {indicator}（单位：亿元，+净流入 / -净流出）"
+        f"  [来源: {src_label}]"
     )
     print("排名 板块        涨跌幅    主力净流入  净占比   主力净流入最大股")
     print("-" * 68)

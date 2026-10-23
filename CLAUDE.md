@@ -140,7 +140,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`fund-flow`** — 查询单标的当日主力资金流入（主力/超大单/大单/中单/小单净流入，妙想 Miaoxiang）。用户问「某股票/ETF 今日资金流入」时使用，也可 `/fund-flow <代码>` 调用。需 `.env` 配置 `MX_APIKEY`。详见 `.claude/skills/fund-flow/SKILL.md`。
 - **`stock-analysis`** — 个股诊股：用妙想拉取个股基本信息、近N日K线、近5日资金流、近7日资讯，算技术位（MA/高低点），再由 AI 生成走势预测与买卖参考。用户问「分析/诊断某只股票」「预测走势」「值不值得买」「给个买入价」时使用。详见 `.claude/skills/stock-analysis/SKILL.md`。
 - **`etf-grid`** — ETF 网格交易分析：拉取 ETF 实时行情 + 日K线，诊断是否箱体震荡、是否适合自动网格，并给出网格区间/间距/格数/底仓/止损。用户问「某 ETF 值不值得买」「能不能网格」「网格怎么设」「是否箱体震荡」时使用。详见 `.claude/skills/etf-grid/SKILL.md`。
-- **`sector-flow`** — 查询 A 股行业/概念/地域板块资金流排名（今日/5日/10日主力净流入，东方财富数据中心直连，无需妙想/`.env`）。用户问「各行业板块资金流向」「哪些板块主力流入最多」「板块资金排名」时使用。详见 `.claude/skills/sector-flow/SKILL.md`。
+- **`sector-flow`** — 查询 A 股行业/概念/地域板块资金流排名（今日/5日/10日主力净流入，东方财富数据中心直连）。push2 被 IP 封锁时自动降级：本地缓存快照 → 妙想逐板块（需 `MX_APIKEY`，仅行业、约 28 个主流行业子集）。用户问「各行业板块资金流向」「哪些板块主力流入最多」「板块资金排名」时使用。详见 `.claude/skills/sector-flow/SKILL.md`。
 - **`intraday-signal`** — 盘中决策：输入单个标的（个股/ETF），拉实时快照 + 当日资金流 + 近N日K线趋势 + 近5日资金流 + 5分钟K线支撑压力，再由 AI 判断今天建仓/加仓/减仓/清仓/不动，以及是否适合做T、买卖挂单价。另有批量版 `scan_t0.py`（扫 holdings.csv 列适合做T的 + 挂单价）与 `scan_position.py`（扫持仓日K阶段→加/减仓 + 挂单价）。用户问「今天该买还是卖」「要不要加仓/减仓」「能不能做T」「做T挂多少钱」「持仓里哪些适合做T/该加/该减」时使用。核心功能不依赖 `MX_APIKEY`。详见 `.claude/skills/intraday-signal/SKILL.md`。
 - **`news-search`** — 财经资讯/新闻/公告/研报搜索：输入自然语言关键词，按类型分组返回（研报/公告/新闻，含评级/机构/关联证券）。用户问「XX 有什么新闻」「搜一下 XX 的消息」「XX 板块有什么利好/利空」「XX 最新研报/公告/减持增持」时使用。详见 `.claude/skills/news-search/SKILL.md`。
 - **`akshare-news`** — AKShare 实时快讯 + 个股新闻（免费、实时，东财/新浪源，无需 `MX_APIKEY`）。`flash_news.py` 拉全球实时快讯（可按关键词过滤），`stock_news.py` 查某只股票的东财新闻。用户问「今晚美股为什么跌」「最近有什么实时财经快讯」「XX 股票有什么新闻」且需要免费/盘中实时源时使用。与 `news-search`（妙想，含研报/评级/公告）互补。详见 `.claude/skills/akshare-news/SKILL.md`。
