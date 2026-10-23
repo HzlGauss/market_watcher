@@ -305,12 +305,17 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
             # （fields[6] 是成交量，外盘+内盘=成交量，已交叉验证）
             # 委比在 fields[74]（百分比，五档盘口委买-委卖占比）
             # 委差在 fields[50]（委买-委卖，单位手）
+            # 现价在 fields[3]，昨收在 fields[4]，涨跌幅% 在 fields[32]，成交额(万元) 在 fields[37]
             turnover = _parse_float(fields[38]) if len(fields) > 38 else None
             volume_ratio = _parse_float(fields[49]) if len(fields) > 49 else None
             bid_volume = _parse_float(fields[7]) if len(fields) > 7 else None
             ask_volume = _parse_float(fields[8]) if len(fields) > 8 else None
             bid_ask_ratio = _parse_float(fields[74]) if len(fields) > 74 and fields[74] else None
             bid_ask_diff = _parse_float(fields[50]) if len(fields) > 50 and fields[50] else None
+            price = _parse_float(fields[3]) if len(fields) > 3 else None
+            pre_close = _parse_float(fields[4]) if len(fields) > 4 else None
+            change_pct = _parse_float(fields[32]) if len(fields) > 32 else None
+            amount = _parse_float(fields[37]) if len(fields) > 37 else None  # 成交额（万元）
 
             result[code] = {
                 "volume_ratio": volume_ratio,
@@ -319,6 +324,10 @@ def fetch_tencent_data(items: list[WatchItem]) -> dict[str, dict[str, Optional[f
                 "ask_volume": ask_volume,
                 "bid_ask_ratio": bid_ask_ratio,
                 "bid_ask_diff": bid_ask_diff,
+                "price": price,
+                "pre_close": pre_close,
+                "change_pct": change_pct,
+                "amount": amount,
             }
 
         return result
@@ -467,7 +476,8 @@ def _fetch_fund_flow_minute(code: str, market: str = "SH") -> Optional[FundFlowD
             if not klines or len(klines) == 0:
                 continue
 
-            # 最新一分钟 K 线：时间,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单)
+            # 最新一分钟 K 线：时间,f52(主力),f53(小单),f54(中单),f55(大单),f56(超大单),
+            # f57(主力占比),f58(小单占比),f59(中单占比),f60(大单占比),f61(超大单占比)
             parts = klines[-1].split(",")
             if len(parts) < 6:
                 continue
@@ -478,12 +488,22 @@ def _fetch_fund_flow_minute(code: str, market: str = "SH") -> Optional[FundFlowD
             super_large_net = _parse_float(parts[5]) if len(parts) > 5 else None
             if main_net is None and super_large_net is None:
                 return None
+
+            def _pct(i: int) -> Optional[float]:
+                """取第 i 列的净占比（%），越界或非法返回 None"""
+                return _parse_float(parts[i]) if len(parts) > i else None
+
             return FundFlowDetail(
                 main_net=main_net,                                             # f52 主力净流入
                 small_net=_parse_float(parts[2]) if len(parts) > 2 else None,  # f53 小单（散户）
                 medium_net=_parse_float(parts[3]) if len(parts) > 3 else None, # f54 中单
                 large_net=_parse_float(parts[4]) if len(parts) > 4 else None,  # f55 大单
                 super_large_net=super_large_net,                               # f56 超大单
+                main_pct=_pct(6),                                              # f57 主力净占比
+                small_pct=_pct(7),                                             # f58 小单净占比
+                medium_pct=_pct(8),                                            # f59 中单净占比
+                large_pct=_pct(9),                                             # f60 大单净占比
+                super_large_pct=_pct(10),                                      # f61 超大单净占比
             )
         except Exception:
             continue  # 该 host 失败，尝试下一个
@@ -1432,7 +1452,7 @@ class BackgroundDataCache:
         with self._lock:
             for code, data in tencent_data.items():
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "fund_flow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "price": None, "pre_close": None, "change_pct": None, "amount": None, "fund_flow": None}
                 if data.get("volume_ratio") is not None:
                     self._cache[code]["volume_ratio"] = data["volume_ratio"]
                 if data.get("turnover_rate") is not None:
@@ -1445,6 +1465,14 @@ class BackgroundDataCache:
                     self._cache[code]["bid_ask_ratio"] = data["bid_ask_ratio"]
                 if data.get("bid_ask_diff") is not None:
                     self._cache[code]["bid_ask_diff"] = data["bid_ask_diff"]
+                if data.get("price") is not None:
+                    self._cache[code]["price"] = data["price"]
+                if data.get("pre_close") is not None:
+                    self._cache[code]["pre_close"] = data["pre_close"]
+                if data.get("change_pct") is not None:
+                    self._cache[code]["change_pct"] = data["change_pct"]
+                if data.get("amount") is not None:
+                    self._cache[code]["amount"] = data["amount"]
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
@@ -1462,17 +1490,20 @@ class BackgroundDataCache:
                 detail = fetch_fund_flow_miaoxiang(code, item.market, item.name)
             with self._lock:
                 if code not in self._cache:
-                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "fund_flow": None}
+                    self._cache[code] = {"volume_ratio": None, "turnover_rate": None, "main_net_inflow": None, "bid_volume": None, "ask_volume": None, "bid_ask_ratio": None, "bid_ask_diff": None, "price": None, "pre_close": None, "change_pct": None, "amount": None, "fund_flow": None}
                 if detail is not None:
                     self._cache[code]["fund_flow"] = detail
                     # 向后兼容：同时存 main_net_inflow
                     if detail.main_net is not None:
                         self._cache[code]["main_net_inflow"] = detail.main_net
+            # 读取腾讯行情缓存（量价字段），与 flow 快照 join 落库（≤60s 陈旧，10min 粒度无所谓）
+            with self._lock:
+                cached = self._cache.get(code) or {}
             # 落库日内时序（含来源标注），供 skill 复用当日盘中历史
             if detail is not None:
                 try:
                     from app.intraday_store import write_snapshot
-                    write_snapshot(code, item.name, detail)
+                    write_snapshot(code, item.name, detail, cached)
                 except Exception:
                     pass  # 落库失败不影响盯盘主流程
             time.sleep(1.0 + random.random() * 0.4)  # 请求间隔 1.0~1.4s 随机抖动，避免规律性触发限频

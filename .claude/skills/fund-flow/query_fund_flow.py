@@ -130,6 +130,11 @@ def _f(x, nd=2) -> str:
     return f"{x:.{nd}f}" if x is not None else "  --"
 
 
+def _f_pct(x, nd=2) -> str:
+    """带符号百分比/净占比 -> 定宽字符串（None 显示 --）。"""
+    return f"{x:+.{nd}f}" if x is not None else "   --"
+
+
 # --- 五档净流入 迷你条形（diverging bar：│ 为零轴，右=流入 / 左=流出，柱长=规模） ---
 
 _BLOCKS = "▏▎▍▌▋▊▉█"  # 1/8 .. 8/8 填充块
@@ -289,7 +294,10 @@ def _read_intraday_series(code: str) -> list[dict]:
         con = duckdb.connect(str(db_path), read_only=True)
         try:
             rows = con.execute(
-                "SELECT ts, main_net, super_large_net, large_net, medium_net, small_net, source "
+                "SELECT ts, main_net, super_large_net, large_net, medium_net, small_net, source, "
+                "price, pre_close, change_pct, amount, turnover_rate, volume_ratio, "
+                "main_pct, super_large_pct, large_pct, medium_pct, small_pct, "
+                "bid_volume, ask_volume, bid_ask_ratio, bid_ask_diff "
                 "FROM fund_flow_intraday WHERE code = ? ORDER BY ts ASC",
                 [code],
             ).fetchall()
@@ -310,6 +318,21 @@ def _read_intraday_series(code: str) -> list[dict]:
             "medium_net": r[4],
             "small_net": r[5],
             "source": r[6],
+            "price": r[7],
+            "pre_close": r[8],
+            "change_pct": r[9],
+            "amount": r[10],
+            "turnover_rate": r[11],
+            "volume_ratio": r[12],
+            "main_pct": r[13],
+            "super_large_pct": r[14],
+            "large_pct": r[15],
+            "medium_pct": r[16],
+            "small_pct": r[17],
+            "bid_volume": r[18],
+            "ask_volume": r[19],
+            "bid_ask_ratio": r[20],
+            "bid_ask_diff": r[21],
         })
     return out
 
@@ -344,10 +367,13 @@ def _interp_value(pts, t):
     return pts[-1][1]
 
 
-def _render_braille_curve(rows, field="main_net", height=_CURVE_DOT_HEIGHT, width=_CURVE_WIDTH):
+def _render_braille_curve(rows, field="main_net", height=_CURVE_DOT_HEIGHT, width=_CURVE_WIDTH,
+                          force_zero=True):
     """把单一时序渲染成 braille 折线。
 
     rows: 含 ts(时间) 与 field(元) 的 dict 列表；按时间连续、对横轴逐点线性插值连线。
+    force_zero: True 时纵轴强制覆盖 0（净流入/净流出分界可见）；False 时按实际 min/max
+        留 5% 余量（价格等恒正序列用，避免被 0 压成一条近乎水平的线）。
     返回 (lines, hi, lo, t0, t1)：lines 为字符串列表（每条一行）、hi/lo 为 y 上下界(元)，
     t0/t1 为起止 epoch 秒；数据不足 2 点返回 None。
     """
@@ -363,9 +389,10 @@ def _render_braille_curve(rows, field="main_net", height=_CURVE_DOT_HEIGHT, widt
     pts.sort()
     t0, t1 = pts[0][0], pts[-1][0]
     lo, hi = min(v for _, v in pts), max(v for _, v in pts)
-    # 范围强制覆盖 0（净流入/净流出分界可见），并上下各留 5% 余量
-    lo = min(lo, 0.0)
-    hi = max(hi, 0.0)
+    # 净流入/净流出分界（0）可见；价格等恒正序列不强制覆盖 0，保留纵向分辨率
+    if force_zero:
+        lo = min(lo, 0.0)
+        hi = max(hi, 0.0)
     if hi - lo < 1e-9:
         hi = lo + 1.0
     span = hi - lo
@@ -421,6 +448,32 @@ def _print_intraday_curve(rows) -> None:
     print()
 
 
+def _print_price_curve(rows) -> None:
+    """打印当日价格 braille 折线（与主力净流入同轴对齐，便于看量价同向/背离）。
+
+    价格来自腾讯行情、单一来源，故不按 flow source 切分，直接用全部快照。
+    数据不足 2 点（老快照无价格列）时静默跳过。
+    """
+    res = _render_braille_curve(rows, field="price", force_zero=False)
+    if res is None:
+        return
+    lines, hi, lo, t0, t1 = res
+    top = f"{hi:.3f}"
+    bot = f"{lo:.3f}"
+    lw = max(len(top), len(bot))
+    t0s = datetime.fromtimestamp(t0).strftime("%H:%M")
+    t1s = datetime.fromtimestamp(t1).strftime("%H:%M")
+
+    print("  价格 当日日内走势  单位:元")
+    print(f"  {top:>{lw}} ┤{lines[0]}")
+    for ln in lines[1:-1]:
+        print(f"  {'':>{lw}} │{ln}")
+    print(f"  {bot:>{lw}} ┤{lines[-1]}")
+    axis = f"{t0s}" + "─" * max(1, len(lines[0]) - len(t0s) - len(t1s)) + f"{t1s}"
+    print(f"  {'':>{lw}}  {axis}")
+    print()
+
+
 def _print_intraday_series(code: str) -> None:
     """打印盯盘落库的当日日内时序（无数据则静默跳过）。"""
     rows = _read_intraday_series(code)
@@ -433,17 +486,23 @@ def _print_intraday_series(code: str) -> None:
     if len(sources) > 1:
         print("  ⚠️ 本日快照混用「东财/妙想」两个渠道，主力口径可能不一致，趋势仅参考")
     _print_intraday_curve(rows)
-    print("  时间      主力      超大单   大单     中单     小单     来源")
+    _print_price_curve(rows)
+    print("  时间      价格     涨跌幅%  主力     超大单   大单     中单     小单     主力占比%  量比    换手%   来源")
     for r in rows:
         ts = r["ts"]
         hhmm = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)[11:16]
         src = "妙想" if r["source"] == "miaoxiang" else "东财"
         cells = [
+            _f(r["price"], 3),
+            _f_pct(r["change_pct"]),
             _fmt_amount(r["main_net"]),
             _fmt_amount(r["super_large_net"]),
             _fmt_amount(r["large_net"]),
             _fmt_amount(r["medium_net"]),
             _fmt_amount(r["small_net"]),
+            _f_pct(r["main_pct"]),
+            _f(r["volume_ratio"], 2),
+            _f(r["turnover_rate"], 2),
         ]
         print(f"  {hhmm:<8}  " + "  ".join(cells) + f"   {src}")
     print()

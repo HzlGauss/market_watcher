@@ -42,10 +42,57 @@ def _ensure_schema(con) -> None:
             large_net DOUBLE,
             medium_net DOUBLE,
             small_net DOUBLE,
-            source VARCHAR
+            source VARCHAR,
+            price DOUBLE,
+            pre_close DOUBLE,
+            change_pct DOUBLE,
+            amount DOUBLE,
+            turnover_rate DOUBLE,
+            volume_ratio DOUBLE,
+            main_pct DOUBLE,
+            super_large_pct DOUBLE,
+            large_pct DOUBLE,
+            medium_pct DOUBLE,
+            small_pct DOUBLE,
+            bid_volume DOUBLE,
+            ask_volume DOUBLE,
+            bid_ask_ratio DOUBLE,
+            bid_ask_diff DOUBLE
         )
         """
     )
+    _migrate(con)
+
+
+# 老库新增列（CREATE TABLE IF NOT EXISTS 不会补列，这里按需 ALTER 补齐）
+_COL_TYPES = {
+    "price": "DOUBLE",
+    "pre_close": "DOUBLE",
+    "change_pct": "DOUBLE",
+    "amount": "DOUBLE",
+    "turnover_rate": "DOUBLE",
+    "volume_ratio": "DOUBLE",
+    "main_pct": "DOUBLE",
+    "super_large_pct": "DOUBLE",
+    "large_pct": "DOUBLE",
+    "medium_pct": "DOUBLE",
+    "small_pct": "DOUBLE",
+    "bid_volume": "DOUBLE",
+    "ask_volume": "DOUBLE",
+    "bid_ask_ratio": "DOUBLE",
+    "bid_ask_diff": "DOUBLE",
+}
+
+
+def _migrate(con) -> None:
+    """为已存在的旧表补齐缺失列（幂等）。"""
+    try:
+        existing = {r[0] for r in con.execute("DESCRIBE fund_flow_intraday").fetchall()}
+    except Exception:
+        return
+    for col, typ in _COL_TYPES.items():
+        if col not in existing:
+            con.execute(f"ALTER TABLE fund_flow_intraday ADD COLUMN {col} {typ}")
 
 
 def snapshot_from_detail(detail) -> dict:
@@ -111,10 +158,16 @@ def latest_snapshot(code: str, source: Optional[str] = None,
         return None
 
 
-def write_snapshot(code: str, name: str, detail) -> None:
-    """落一条资金流快照（detail: FundFlowDetail）。duckdb 缺失时静默跳过。"""
+def write_snapshot(code: str, name: str, detail, quote: Optional[dict] = None) -> None:
+    """落一条资金流快照。
+
+    detail: FundFlowDetail（五档净流入 + 各档净占比 + 来源）。
+    quote:  腾讯行情缓存 dict（现价/昨收/涨跌幅/成交额/量比/换手率/内外盘/委比委差），
+            可为 None 或缺失键（对应列为 NULL）。duckdb 缺失时静默跳过。
+    """
     if detail is None:
         return
+    q = quote or {}
     try:
         with _lock:
             con = _connect()
@@ -124,8 +177,11 @@ def write_snapshot(code: str, name: str, detail) -> None:
                     """
                     INSERT INTO fund_flow_intraday
                         (code, name, ts, main_net, super_large_net,
-                         large_net, medium_net, small_net, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         large_net, medium_net, small_net, source,
+                         price, pre_close, change_pct, amount, turnover_rate, volume_ratio,
+                         main_pct, super_large_pct, large_pct, medium_pct, small_pct,
+                         bid_volume, ask_volume, bid_ask_ratio, bid_ask_diff)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         code,
@@ -137,6 +193,21 @@ def write_snapshot(code: str, name: str, detail) -> None:
                         detail.medium_net,
                         detail.small_net,
                         detail.source or "eastmoney",
+                        q.get("price"),
+                        q.get("pre_close"),
+                        q.get("change_pct"),
+                        q.get("amount"),
+                        q.get("turnover_rate"),
+                        q.get("volume_ratio"),
+                        detail.main_pct,
+                        detail.super_large_pct,
+                        detail.large_pct,
+                        detail.medium_pct,
+                        detail.small_pct,
+                        q.get("bid_volume"),
+                        q.get("ask_volume"),
+                        q.get("bid_ask_ratio"),
+                        q.get("bid_ask_diff"),
                     ],
                 )
             finally:
