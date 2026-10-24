@@ -18,6 +18,7 @@ from .data_pool import SharedDataPool, KLine
 from .models import Quote, WatchItem, KlineData
 from .technical import calc_support_resistance, TechnicalSummary, get_technical_summary, detect_stage
 from .technical import calc_ma_alignment
+from .technical import calc_bollinger_squeeze
 from .technical import fetch_historical_kline
 from .http_client import serverchan_client
 from .regime import gate_position
@@ -37,7 +38,11 @@ class T0Signal:
     def __init__(self, code: str, name: str, signal_type: str, reason: str,
                  price: float, support: float, resistance: float,
                  risk_reward: float = 0.0,
-                 buy_price: float = 0.0, sell_price: float = 0.0):
+                 buy_price: float = 0.0, sell_price: float = 0.0,
+                 bb_upper: float = 0.0, bb_middle: float = 0.0,
+                 bb_lower: float = 0.0, bb_width: Optional[float] = None,
+                 bb_signal: str = "", bb_squeeze: bool = False,
+                 bb_squeeze_note: str = ""):
         self.code = code
         self.name = name
         self.signal_type = signal_type
@@ -48,6 +53,14 @@ class T0Signal:
         self.risk_reward = risk_reward  # 盈亏比
         self.buy_price = buy_price      # 建议买入挂单价
         self.sell_price = sell_price    # 建议卖出挂单价
+        # 布林带（基于 5 分钟 K 线，period=20）
+        self.bb_upper = bb_upper
+        self.bb_middle = bb_middle
+        self.bb_lower = bb_lower
+        self.bb_width = bb_width        # 带宽 %
+        self.bb_signal = bb_signal      # 触及上轨/下轨/偏强/偏弱/中性
+        self.bb_squeeze = bb_squeeze    # 是否挤压（相对历史分位）
+        self.bb_squeeze_note = bb_squeeze_note
         self.timestamp = time.time()
 
     @property
@@ -703,6 +716,13 @@ class T0MonitorThread(threading.Thread):
                     "resistance": round(sig.resistance, 3),
                     "risk_reward": sig.risk_reward,
                     "reason": sig.reason,
+                    "bb_upper": round(sig.bb_upper, 3),
+                    "bb_middle": round(sig.bb_middle, 3),
+                    "bb_lower": round(sig.bb_lower, 3),
+                    "bb_width": sig.bb_width,
+                    "bb_signal": sig.bb_signal,
+                    "bb_squeeze": sig.bb_squeeze,
+                    "bb_squeeze_note": sig.bb_squeeze_note,
                     "time": datetime.fromtimestamp(sig.timestamp).strftime("%H:%M:%S"),
                     "age_sec": int(time.time() - sig.timestamp),
                 }
@@ -727,6 +747,15 @@ class T0MonitorThread(threading.Thread):
 
         # 计算技术指标（基于5分钟K线）
         tech = get_technical_summary(quote, t0_klines)
+
+        # 日内 BB 挤压（相对历史分位；短周期下绝对带宽 <5% 恒真，不能用绝对阈值）
+        squeeze_info = calc_bollinger_squeeze(
+            [k.close for k in t0_klines if k.close is not None]
+        )
+        bb_squeeze = bool(squeeze_info and squeeze_info["squeeze"])
+        bb_squeeze_note = ""
+        if squeeze_info:
+            bb_squeeze_note = f"带宽{squeeze_info['width']:.1f}%/分位{squeeze_info['percentile']:.0f}%"
 
         # 计算盈亏比：买入侧 reward=上方空间/risk=下方空间，卖出侧反过来。
         upside = sr.resistance - price   # 到压力的空间
@@ -772,10 +801,12 @@ class T0MonitorThread(threading.Thread):
         suggested = _compute_suggested_prices(sr, price, quote)
 
         # 判断买入信号
-        buy_reasons = self._check_buy_conditions(quote, tech, sr, price, risk_reward, intrabar)
+        buy_reasons = self._check_buy_conditions(quote, tech, sr, price, risk_reward, intrabar,
+                                                 bb_squeeze=bb_squeeze, bb_squeeze_note=bb_squeeze_note)
 
         # 判断卖出信号
-        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, sell_risk_reward, intrabar)
+        sell_reasons = self._check_sell_conditions(quote, tech, sr, price, sell_risk_reward, intrabar,
+                                                   bb_squeeze=bb_squeeze, bb_squeeze_note=bb_squeeze_note)
 
         # 判断信号：选条件数更多的一方，附带概率和空间评估
         buy_count = len(buy_reasons)
@@ -842,6 +873,18 @@ class T0MonitorThread(threading.Thread):
         last_ts = self._last_signal_time.get(item.code, 0)
         in_cooldown = last_sig is not None and (now_ts - last_ts) < COOLDOWN_SEC
 
+        def _mk_signal(sig_type: str, reason: str, rr: float) -> T0Signal:
+            """构造做T信号，附加布林带信息（基于5分钟K线，period=20）"""
+            return T0Signal(
+                code=item.code, name=item.name, signal_type=sig_type,
+                reason=reason, price=price, support=sr.support, resistance=sr.resistance,
+                risk_reward=rr, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"],
+                bb_upper=tech.bb_upper or 0.0, bb_middle=tech.bb_middle or 0.0,
+                bb_lower=tech.bb_lower or 0.0, bb_width=tech.bb_width,
+                bb_signal=tech.bb_signal or "", bb_squeeze=bb_squeeze,
+                bb_squeeze_note=bb_squeeze_note,
+            )
+
         if buy_count > sell_count and buy_reasons:
             # RR 过滤（动态门槛）
             if risk_reward < MIN_RR_BUY:
@@ -856,9 +899,7 @@ class T0MonitorThread(threading.Thread):
             if sell_count >= buy_count - 1 and sell_count >= 4:
                 conflict_note = "⚠️多空分歧(买卖条件接近) "
             reason = conflict_note + _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
-            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
-                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            sig = _mk_signal(T0Signal.SIGNAL_BUY, reason, risk_reward)
             self._last_signal_time[item.code] = now_ts
             return sig
 
@@ -873,9 +914,7 @@ class T0MonitorThread(threading.Thread):
             if buy_count >= sell_count - 1 and buy_count >= 4:
                 conflict_note = "⚠️多空分歧(买卖条件接近) "
             reason = conflict_note + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
-            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
-                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            sig = _mk_signal(T0Signal.SIGNAL_SELL, reason, sell_risk_reward)
             self._last_signal_time[item.code] = now_ts
             return sig
 
@@ -885,33 +924,25 @@ class T0MonitorThread(threading.Thread):
             sell_has_divergence = any("背离" in r for r in sell_reasons)
             if buy_has_divergence and not sell_has_divergence and risk_reward >= MIN_RR_BUY and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
                 reason = "⚠️多空分歧(背离偏多) " + _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
-                sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
-                               reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                               risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                sig = _mk_signal(T0Signal.SIGNAL_BUY, reason, risk_reward)
                 self._last_signal_time[item.code] = now_ts
                 return sig
             if sell_has_divergence and not buy_has_divergence and sell_risk_reward >= MIN_RR_SELL and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
                 reason = "⚠️多空分歧(背离偏空) " + _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
-                sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
-                               reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                               risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+                sig = _mk_signal(T0Signal.SIGNAL_SELL, reason, sell_risk_reward)
                 self._last_signal_time[item.code] = now_ts
                 return sig
 
         # 仅一侧有信号（也需要 RR 过滤）
         if buy_reasons and risk_reward >= MIN_RR_BUY and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_SELL):
             reason = _build_signal(buy_reasons, T0Signal.SIGNAL_BUY, buy_prob, upside_pct, "上涨", risk_reward)
-            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_BUY,
-                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            sig = _mk_signal(T0Signal.SIGNAL_BUY, reason, risk_reward)
             self._last_signal_time[item.code] = now_ts
             return sig
 
         if sell_reasons and sell_risk_reward >= MIN_RR_SELL and not (in_cooldown and last_sig.signal_type == T0Signal.SIGNAL_BUY):
             reason = _build_signal(sell_reasons, T0Signal.SIGNAL_SELL, sell_prob, downside_pct, "下跌", sell_risk_reward)
-            sig = T0Signal(code=item.code, name=item.name, signal_type=T0Signal.SIGNAL_SELL,
-                           reason=reason, price=price, support=sr.support, resistance=sr.resistance,
-                           risk_reward=sell_risk_reward, buy_price=suggested["buy_price"], sell_price=suggested["sell_price"])
+            sig = _mk_signal(T0Signal.SIGNAL_SELL, reason, sell_risk_reward)
             self._last_signal_time[item.code] = now_ts
             return sig
 
@@ -1180,7 +1211,8 @@ class T0MonitorThread(threading.Thread):
 
     def _check_buy_conditions(self, quote: Quote, tech: TechnicalSummary,
                               sr, price: float, risk_reward: float,
-                              intrabar: dict) -> List[str]:
+                              intrabar: dict, bb_squeeze: bool = False,
+                              bb_squeeze_note: str = "") -> List[str]:
         """检查买入条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
@@ -1296,12 +1328,12 @@ class T0MonitorThread(threading.Thread):
                 reasons.append(f"MA60乖离{dev:.0f}%(中期底部)")
             elif dev >= 20:  # 卖出侧：中期顶部
                 reasons.append(f"MA60乖离+{dev:.0f}%(中期顶部)")
-        # 条件15/16：BB挤压变盘
-        if tech.bb_width and tech.bb_width < 5.0:
+        # 条件15/16：BB挤压变盘（相对历史分位，短周期下绝对带宽 <5% 恒真）
+        if bb_squeeze:
             if "下轨" in tech.bb_signal:
-                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,下轨)")
+                reasons.append(f"BB挤压({bb_squeeze_note},下轨)")
             elif "上轨" in tech.bb_signal:
-                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
+                reasons.append(f"BB挤压({bb_squeeze_note},上轨)")
 
         # RR过滤（RR越高越需更多信号，避免高RR假象）
         if risk_reward >= 2.0:
@@ -1316,7 +1348,8 @@ class T0MonitorThread(threading.Thread):
 
     def _check_sell_conditions(self, quote: Quote, tech: TechnicalSummary,
                                sr, price: float, risk_reward: float,
-                               intrabar: dict) -> List[str]:
+                               intrabar: dict, bb_squeeze: bool = False,
+                               bb_squeeze_note: str = "") -> List[str]:
         """检查卖出条件（5分钟级别指标 + 内外盘/委比资金信号 + 日内振幅）"""
         reasons = []
 
@@ -1431,12 +1464,12 @@ class T0MonitorThread(threading.Thread):
                 reasons.append(f"MA60乖离{dev:.0f}%(中期底部)")
             elif dev >= 20:  # 卖出侧：中期顶部
                 reasons.append(f"MA60乖离+{dev:.0f}%(中期顶部)")
-        # 条件15/16：BB挤压变盘
-        if tech.bb_width and tech.bb_width < 5.0:
+        # 条件15/16：BB挤压变盘（相对历史分位，短周期下绝对带宽 <5% 恒真）
+        if bb_squeeze:
             if "下轨" in tech.bb_signal:
-                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,下轨)")
+                reasons.append(f"BB挤压({bb_squeeze_note},下轨)")
             elif "上轨" in tech.bb_signal:
-                reasons.append(f"BB挤压(带宽{tech.bb_width:.1f}%,上轨)")
+                reasons.append(f"BB挤压({bb_squeeze_note},上轨)")
 
         # RR过滤（RR越高越需更多信号，避免高RR假象）
         if risk_reward >= 2.0:

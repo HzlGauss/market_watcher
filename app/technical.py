@@ -1078,6 +1078,49 @@ def calc_bollinger(closes: list[float], period: int = 20, multiplier: float = 2.
     )
 
 
+def calc_bollinger_squeeze(closes: list[float], period: int = 20,
+                           quantile: float = 0.2) -> Optional[dict]:
+    """日内布林带挤压检测（相对历史分位，非绝对带宽阈值）。
+
+    布林带挤压 = 当前带宽处于近期滚动带宽分布的低分位，预示波动率收敛、临近变盘。
+    用相对分位而非绝对阈值（如 <5%），因为短周期（5 分钟）K 线的带宽天然远小于日 K，
+    绝对阈值会在短周期上几乎恒真，把「挤压变盘」降级成永久触发的噪声加分项。
+
+    Args:
+        closes: 收盘价序列（升序，最后 period 根算当前带宽，其余算滚动历史分布）
+        period: 布林带窗口（默认 20，与 calc_bollinger 一致）
+        quantile: 挤压分位阈值（默认 0.2，即当前带宽处于历史最低 20% 判定为挤压）
+
+    Returns:
+        {"squeeze": bool, "width": float, "percentile": float} 或 None（数据不足）
+    """
+    if not closes or len(closes) < period + 5:
+        return None
+
+    widths = []
+    for i in range(len(closes) - period + 1):
+        window = closes[i:i + period]
+        middle = sum(window) / period
+        if middle <= 0:
+            continue
+        std = _stddev(window)
+        width = (4 * std) / middle * 100  # 上轨-下轨 = 4*std（multiplier=2.0）
+        widths.append(width)
+
+    if not widths:
+        return None
+
+    current = widths[-1]
+    below = sum(1 for w in widths if w <= current)
+    percentile = below / len(widths) * 100
+
+    return {
+        "squeeze": percentile <= quantile * 100,
+        "width": round(current, 2),
+        "percentile": round(percentile, 0),
+    }
+
+
 # ============================================================
 # OBV —— 能量潮指标
 # ============================================================

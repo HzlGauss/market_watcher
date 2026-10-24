@@ -233,4 +233,4 @@ Monitor mode scans every N minutes (configurable, default 15). LLM is called eve
 - **Data source**: Sina Finance (quotes) + East Money (north flow, stock flow, dragon-tiger) with Tencent fallback for turnover/volume ratio
 - **AKShare** is an optional dependency (`pip install akshare`) used for dragon-tiger board and K-line fallback
 - **LLM_BASE_URL** env var allows swapping DeepSeek for any OpenAI-compatible endpoint (local models, proxies)
-- **`_run_once()`** (legacy, direct fetch) vs **`_run_once_new()`** (shared pool, currently used) — the old path still exists for backward compatibility
+- **`_run_once_new()`** (shared pool) is the single scan loop used by monitor mode — reads quotes/K-lines from `SharedDataPool` (daily K via `fetch_daily_hybrid`), builds `tech_summaries` on daily K
