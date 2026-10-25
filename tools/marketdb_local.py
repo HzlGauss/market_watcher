@@ -18,6 +18,7 @@
     sync-valuation      估值快照逐日累积（PE/PB/PS/PCF，同花顺 REST，历史分位需每日积累）
     sync-valuation-history  估值历史回填（东财 akshare，PE/PB/PS/PCF 自上市起全历史，补历史分位）
     streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
+    screen-golden-pit   全市场黄金坑技术初筛（回撤20~45% + 站半年线 + 缩量，单条 SQL）
 
 用法:
     py tools/marketdb_local.py bootstrap
@@ -1600,6 +1601,195 @@ def cmd_screen_bluechip(args) -> int:
     return screen_bluechip(db=args.db)
 
 
+# ---------------------------------------------------------------- 全市场黄金坑 SQL 初筛
+
+# B1 全市场黄金坑第一步：纯 SQL 扫全市场（60/68/00/30 前缀），按技术硬门槛初筛。
+# 常规坑（回撤 20~45%）门槛与 scan_golden_pit._score_candidate 的「常规硬门槛」对齐
+# （距高点≥5 日、站上半年线 MA120、非放量下跌 vol_ratio<1.2）；MACD/KDJ/止跌形态
+# 与基本面门槛由 scan_golden_pit 在短名单上逐股细算（B1 的「基本面兜底」）。
+# 深度坑（回撤 >45%）技术面几乎筛不动（站半年线+缩量的只有 0 只），故只保留
+# 「距高点≥5 日 + 缩量<1.2」两道弱门槛，把「深度错杀 vs 暴雷」交给基本面门槛裁决。
+_GOLDEN_PIT_CORE = """
+WITH px AS (
+  SELECT thscode, date, close, high, volume,
+         ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY date) AS rn
+  FROM v_daily_qfq
+  WHERE substr(thscode, 1, 2) IN ('60', '68', '00', '30')
+),
+lasts AS (
+  SELECT thscode, close AS price, rn AS last_rn,
+         MAX(high) OVER w AS peak,
+         arg_max(rn, high) OVER w AS peak_rn,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS ma120,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) AS ma250,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20
+  FROM px
+  WINDOW w AS (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 119 PRECEDING AND 1 PRECEDING)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY rn DESC) = 1
+),
+vols AS (
+  SELECT l.thscode,
+         AVG(x.volume) FILTER (WHERE x.rn >= l.peak_rn) AS pit_vol,
+         AVG(x.volume) FILTER (WHERE x.rn >= l.peak_rn - 20 AND x.rn < l.peak_rn) AS pre_vol
+  FROM lasts l JOIN px x ON x.thscode = l.thscode
+  GROUP BY l.thscode
+),
+scored AS (
+  SELECT l.thscode, s.ticker, s.name,
+         l.price, l.peak,
+         (l.peak - l.price) / l.peak * 100.0 AS dd,
+         (l.last_rn - l.peak_rn) AS gap,
+         l.ma120, l.ma250,
+         l.ma5, l.ma10, l.ma20,
+         v.pit_vol / NULLIF(v.pre_vol, 0) AS vol_ratio,
+         l.last_rn
+  FROM lasts l
+  JOIN dim_symbol s ON s.thscode = l.thscode
+  LEFT JOIN vols v ON v.thscode = l.thscode
+  WHERE l.peak IS NOT NULL AND l.peak > 0 AND l.last_rn >= 60
+)
+SELECT * FROM scored
+WHERE {where}
+ORDER BY {order}
+LIMIT {limit}
+"""
+
+_GOLDEN_PIT_NORMAL_WHERE = (
+    "dd BETWEEN 20.0 AND 45.0 "
+    "AND gap >= 5 "
+    "AND (ma120 IS NULL OR price >= ma120) "
+    "AND (vol_ratio IS NULL OR vol_ratio < 1.2)"
+)
+
+_GOLDEN_PIT_DEEP_WHERE = (
+    "dd > 45.0 "
+    "AND gap >= 5 "
+    "AND (vol_ratio IS NULL OR vol_ratio < 1.2)"
+)
+
+# 牛市浅回调（右侧）：回撤 5~20% + 均线多头(MA5>MA10>MA20) + 站上 MA20。
+# 回测：牛市里深坑抄底无 edge，换「浅回调上车」才有正 edge（全市值层牛市 +0.84~1.33%）。
+# 仅牛市 regime 使用（熊市该信号反向 −0.98~−3.82%），市值门槛在 Python 层（微盘排除）。
+_GOLDEN_PIT_BULL_WHERE = (
+    "dd BETWEEN 5.0 AND 20.0 "
+    "AND ma5 > ma10 AND ma10 > ma20 "
+    "AND price >= ma20"
+)
+
+
+def _golden_pit_query(where: str, order: str, limit: int) -> str:
+    """把 WHERE/ORDER/LIMIT 组装进公共 CTE，生成常规坑/深度坑两条查询。"""
+    return _GOLDEN_PIT_CORE.format(where=where, order=order, limit=int(limit))
+
+
+def _golden_pit_query_run(sql: str, db=None):
+    """执行黄金坑初筛 SQL，返回 pandas DataFrame；无库/无 duckdb/失败返回 None。"""
+    db_path = _db_path(db)
+    if not db_path.exists():
+        return None
+    try:
+        import duckdb
+    except ImportError:
+        return None
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            try:
+                con.execute("SET enable_progress_bar = false")
+            except Exception:
+                pass
+            return con.execute(sql).fetchdf()
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def query_golden_pit_prescreen(db=None, limit: int = 500):
+    """全市场黄金坑「常规坑」技术初筛（纯本地 DuckDB，单条 SQL）。
+
+    返回 pandas DataFrame（列: thscode/ticker/name/price/peak/dd/gap/ma120/ma250/vol_ratio/last_rn），
+    已按「回撤 20~45% + 距高点≥5日 + 站上半年线 + 缩量(非放量下跌)」硬门槛过滤。
+    无库/无 duckdb/查询失败返回 None；无匹配返回空 DataFrame。
+    """
+    sql = _golden_pit_query(_GOLDEN_PIT_NORMAL_WHERE, "dd DESC, vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def query_golden_pit_deep(db=None, limit: int = 1000):
+    """全市场黄金坑「深度坑」技术初筛（回撤 >45%，纯本地 DuckDB）。
+
+    深度坑技术面筛不动（站半年线+缩量≈0 只），故只保留「距高点≥5日 + 缩量<1.2」弱门槛，
+    把「深度错杀 vs 暴雷」交给 scan_golden_pit 的基本面门槛裁决。列同 query_golden_pit_prescreen。
+    limit 默认 1000 覆盖全部深度坑（当前约 965 只），避免只截到最深跌的一批、漏掉 45~55%
+    的「浅深度坑」（那里深度错杀最可能）。
+    """
+    sql = _golden_pit_query(_GOLDEN_PIT_DEEP_WHERE, "dd DESC, vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def query_golden_pit_bull(db=None, limit: int = 2000):
+    """全市场黄金坑「牛市浅回调」技术初筛（回撤 5~20% + 均线多头 + 站上 MA20）。
+
+    回测结论：牛市里深坑抄底无 edge（超跌是真弱），该换「浅回调上车」右侧顺势接回调。
+    故牛市 regime 下用本查询替代（或补充）深坑 SQL 初筛，捞 5~20% 浅回调多头候选。
+    列同 query_golden_pit_prescreen（多了 ma5/ma10/ma20）。limit 默认 2000 覆盖全部浅回调
+    候选（全市值层约几百只），市值门槛（微盘排除）由 scan_golden_pit 在 Python 层用
+    size_tier 做。
+    """
+    sql = _golden_pit_query(_GOLDEN_PIT_BULL_WHERE, "dd ASC, ma20 ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def cmd_screen_golden_pit(args) -> int:
+    """全市场黄金坑技术初筛（CLI 入口，复用 query_golden_pit_prescreen）。"""
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    df = query_golden_pit_prescreen(db=db, limit=args.limit)
+    if df is None:
+        print("❌ 本地库不可用或缺少 duckdb")
+        return 1
+    if df is None or df.empty:
+        print("⚠️ 全市场无符合黄金坑硬门槛（回撤20~45% + 站半年线 + 缩量）的候选")
+        return 0
+
+    show = df[["ticker", "name", "price", "dd", "gap", "vol_ratio", "ma120", "ma250"]].copy()
+    show["price"] = show["price"].map(lambda v: f"{v:.2f}")
+    show["dd"] = show["dd"].map(lambda v: f"{v:.1f}%")
+    show["gap"] = show["gap"].map(lambda v: f"{int(v)}日")
+    show["vol_ratio"] = show["vol_ratio"].map(lambda v: f"{v:.2f}" if v == v else "--")
+    show["ma120"] = show["ma120"].map(lambda v: f"{v:.2f}" if v == v else "--")
+    show["ma250"] = show["ma250"].map(lambda v: f"{v:.2f}" if v == v else "--")
+    show = show.rename(columns={"ticker": "代码", "name": "名称", "price": "现价", "dd": "回撤%",
+                                "gap": "距高点", "vol_ratio": "缩量比", "ma120": "MA120", "ma250": "MA250"})
+
+    print(f"== 全市场黄金坑技术初筛（共 {len(df)} 只，按回撤降序）==")
+    print(show.to_string(index=False))
+    print()
+    print("  说明: 这是 B1 第一步（技术硬门槛）。缩量比=坑段均量/高点前20日均量(<1.2 非放量)；")
+    print("        MACD/KDJ/止跌形态 + 基本面门槛(净利同比/ROE/PB分位) 需跑 scan_golden_pit.py 全市场。")
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"\n✅ 已落盘 {len(df)} 只: {out}")
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:
@@ -1702,6 +1892,11 @@ def main() -> int:
     sc = sub.add_parser("screen-bluechip", help="全市场白马/蓝筹基本面筛选（本地 DuckDB，落库+CSV）")
     sc.add_argument("--db")
 
+    sgp = sub.add_parser("screen-golden-pit", help="全市场黄金坑技术初筛（本地 DuckDB，回撤+站半年线+缩量）")
+    sgp.add_argument("--db")
+    sgp.add_argument("--limit", type=int, default=500, help="输出前 N 只（默认 500）")
+    sgp.add_argument("--out", help="落盘 CSV 路径（可选）")
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -1720,6 +1915,7 @@ def main() -> int:
         "streaks": cmd_streaks,
         "streaks-backtest": cmd_streaks_backtest,
         "screen-bluechip": cmd_screen_bluechip,
+        "screen-golden-pit": cmd_screen_golden_pit,
     }[args.cmd](args)
 
 

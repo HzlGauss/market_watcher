@@ -441,8 +441,8 @@ def _print_verdict(klines, price: float | None, ma20, ma60, ma120, ma250, tech, 
     checks.append(("深坑幅度 20%~45%", dd is not None and 20 <= dd <= 45, f"现价回撤 {dd:.0f}%" if dd else "--"))
     checks.append(("坑底缩量(比<1.0)", vol_ratio is not None and vol_ratio < 1.0,
                    f"缩量比 {vol_ratio:.2f}" if vol_ratio else "--"))
-    checks.append(("未破半年线 MA120", ma120 is None or price >= ma120,
-                   "站上" if ma120 is None or price >= ma120 else "跌破"))
+    checks.append(("站上半年线 MA120", ma120 is None or price >= ma120,
+                   "站上" if ma120 is None or price >= ma120 else "跌破(软项，不否决)"))
     checks.append(("站上 MA20", above_ma20, "现价 ≥ MA20"))
     checks.append(("企稳信号(MACD/KDJ/止跌)", macd_ok or kdj_ok or pattern,
                    "MACD金叉/KDJ金叉/止跌形态 任一"))
@@ -477,18 +477,15 @@ def _print_verdict(klines, price: float | None, ma20, ma60, ma120, ma250, tech, 
     # ---- 聚合分级 ----
     dd_ok = checks[0][1]
     vol_ok = checks[1][1]
-    trend_ok = checks[2][1]
     above_ma20_ok = checks[3][1]
     stab_ok = checks[4][1]
     no_fangliang = checks[5][1]
-    tech_pass = (dd_ok and trend_ok and no_fangliang and vol_ok and stab_ok)
+    tech_pass = (dd_ok and no_fangliang and vol_ok and stab_ok)
 
     if dd is not None and dd < 20:
         verdict = "❌ 尚未构成黄金坑（回撤 <20%，只是普通回调，未到错杀级别）"
     elif dd is not None and dd > 45:
         verdict = "❌ 深度超阈值（回撤 >45%，超出黄金坑常规范畴）——默认按趋势性下跌/暴雷对待；须结合【4】确认基本面是「深度错杀」还是「暴雷」"
-    elif not trend_ok:
-        verdict = "❌ 不构成黄金坑（跌破半年线，长期趋势走坏，属趋势性下跌而非错杀挖坑）"
     elif not no_fangliang:
         verdict = "❌ 不构成黄金坑（坑段放量下跌，疑似出货/暴雷，非缩量挖坑）"
     elif not vol_ok:
@@ -511,6 +508,8 @@ def _print_verdict(klines, price: float | None, ma20, ma60, ma120, ma250, tech, 
             verdict = "✅ 构成黄金坑（技术形态 + 基本面/估值 双过，错杀概率高）"
 
     print(f"  → 信号分级: {verdict}")
+    if ma120 is not None and price < ma120:
+        print("  ⚠️ 已跌破半年线 MA120（长期趋势走坏）——回测显示破位股反弹不弱、不再一票否决，但需设严格止损（收盘跌破坑底低点即离场）")
 
     # ---- 买点 / 止损参考 ----
     print()

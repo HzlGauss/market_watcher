@@ -61,7 +61,7 @@ from app.technical import (
     calc_kdj,
 )
 from app.kline_local import fetch_daily_local_first
-from app.regime import gate_side
+from app.regime import get_board_regime
 
 
 # 候选池指数（代码 -> 白马成色分）：上证50(超大盘) > 沪深300(大盘蓝筹) > 中证红利(高股息白马)
@@ -70,6 +70,32 @@ INDICES = [
     ("000300", "沪深300", 8),
     ("000922", "中证红利", 6),
 ]
+
+# 全市场模式关键字（B1：纯技术全扫 + 基本面兜底）。候选池由 tools.marketdb_local
+# query_golden_pit_prescreen 的单条 SQL 从全市场 5225 只初筛而来，不再限定指数成分。
+_WHOLE_MARKET_KEYS = {"全市场", "全部", "全部a股", "全a", "all"}
+
+# 市值分层 → 白马成色分（回测：深坑抄底仅在沪深300/中证500 有净 edge，中证1000 边缘、
+# 微盘无 edge）。黄金坑的灵魂是「白马/蓝筹被错杀」，小盘深跌多半是「跌」不是「坑」。
+_SIZE_QUALITY = {"沪深300": 8, "中证500": 6, "中证1000": 3, "微盘": 0}
+
+# 市值缓存（get_size_tier 每次重读 JSON，全市场 1000+ 只逐只读太慢，这里模块级缓存一次）
+_size_map_cache: dict | None = None
+
+
+def _size_tier_of(code: str) -> str:
+    global _size_map_cache
+    if _size_map_cache is None:
+        _size_map_cache = _load_size_map()
+    return _size_map_cache.get(str(code)[:6], "微盘")
+
+
+def _load_size_map() -> dict:
+    try:
+        from app.regime import _size_tier_map
+        return _size_tier_map()
+    except Exception:
+        return {}
 
 
 def _f(x, nd=2) -> str:
@@ -143,15 +169,65 @@ def _build_pool_from_query(query: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for code, stock in pool.items():
         src = str(stock.get("source", "")).strip()
-        quality = 10 if src == "白马" else (8 if src == "蓝筹" else 6)
+        tier = _size_tier_of(code)
+        if src == "白马":
+            quality = 10
+        elif src == "蓝筹":
+            quality = 8
+        else:
+            # 板块/行业输入无「白马成色」信息 → 市值分层兜底（回测：小盘深跌不是黄金坑）
+            quality = _SIZE_QUALITY.get(tier, 0)
         out[code] = {
             "name": stock.get("name", ""),
             "indices": {src} if src else {"白名单"},
             "quality": quality,
             "mktcap": mkt.get(code),
             "fund_csv": stock.get("fund_csv"),
+            "size_tier": tier,
         }
     return out
+
+
+def _pool_from_prescreen() -> dict[str, dict]:
+    """全市场 SQL 初筛短名单 → 候选池（{code: {name, indices, quality, mktcap}}）。
+
+    B1 全市场模式：用 tools.marketdb_local 的单条 SQL 扫全市场，常规坑（回撤20~45% +
+    站半年线 + 缩量）、深度坑（回撤>45% + 缩量）、浅回调（回撤5~20% + 均线多头 + 站上MA20）
+    合并成候选池；「白马成色」不靠指数成分，先由市值分层给个技术侧代理（沪深300/中证500
+    大盘才配当黄金坑，小盘深跌多半是「跌」不是「坑」），再由后续基本面门槛
+    （净利同比/ROE/PB分位）兜底判定。深度坑在 _score_candidate 里按 dd>45 路由到
+    deep_results，再由基本面门槛拆「深度错杀 vs 暴雷」；浅回调仅在牛市 regime 由
+    _score_bull_pullback 取用（熊市/震荡丢弃）。
+    """
+    try:
+        from tools.marketdb_local import (
+            query_golden_pit_bull,
+            query_golden_pit_deep,
+            query_golden_pit_prescreen,
+        )
+    except Exception:
+        return {}
+    pool: dict[str, dict] = {}
+    for fn in (query_golden_pit_prescreen, query_golden_pit_deep, query_golden_pit_bull):
+        try:
+            df = fn()
+        except Exception:
+            continue
+        if df is None or getattr(df, "empty", True):
+            continue
+        for _, r in df.iterrows():
+            code = str(r.get("ticker", "")).zfill(6)
+            if not code or code == "000000":
+                continue
+            tier = _size_tier_of(code)
+            pool.setdefault(code, {
+                "name": str(r.get("name", "") or ""),
+                "indices": {"全市场"},
+                "quality": _SIZE_QUALITY.get(tier, 0),
+                "mktcap": None,
+                "size_tier": tier,
+            })
+    return pool
 
 
 # ---------------------------------------------------------------- 黄金坑检测
@@ -184,12 +260,22 @@ def _detect_reversal_pattern(klines) -> bool:
     return False
 
 
-def _score_candidate(code: str, stock: dict, klines, turnover: float | None = None) -> dict | None:
+def _score_candidate(code: str, stock: dict, klines, turnover: float | None = None,
+                     size_tier: str | None = None, bull_mode: bool = False) -> dict | None:
     """对单只候选股做黄金坑检测 + 打分。太浅(<20%)直接排除；过深(>45%)不排除，
-    标记 overdeep=True 单独列出（供人工判断基本面是「深度错杀」还是「暴雷」）。"""
+    标记 overdeep=True 单独列出（供人工判断基本面是「深度错杀」还是「暴雷」）。
+
+    常规坑(20~45%)两道门槛（回测结论）：
+    - 市值门槛：微盘深坑 20日净edge≈0，深坑抄底仅大盘(沪深300/中证500)有意义，微盘排除。
+    - 站半年线软化：跌破半年线不再一票否决（回测破位股反弹不弱），降级保留、靠基本面兜底。
+
+    bull_mode=True（牛市路由）：常规坑(20~45%)直接返回 None（牛市深坑无 edge，超跌是真
+    弱），仅保留深度坑(>45%)——回测深度坑全 regime 有效，仍交基本面兜底拆错杀 vs 暴雷。
+    """
     n = len(klines)
     if n < 60:
         return None
+    size_tier = size_tier or _size_tier_of(code)
     closes = [k.close for k in klines]
     if any(c is None for c in closes[-60:]):
         return None
@@ -241,6 +327,10 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
     overdeep = dd > 45
     above_ma120 = ma120 is None or price >= ma120
 
+    # 牛市路由：常规坑(20~45%)在牛市无 edge（超跌是真弱），仅保留深度坑(>45%)交基本面兜底
+    if bull_mode and not overdeep:
+        return None
+
     base = {
         "code": code,
         "name": stock["name"],
@@ -263,6 +353,7 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         "kdj_ok": kdj_ok,
         "pattern": pattern,
         "overdeep": overdeep,
+        "size_tier": size_tier,
     }
 
     # ---- 深度超阈值（>45%）：不跑半年线/放量硬门槛，标记后单独列出 ----
@@ -271,7 +362,7 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         return base
 
     # ---- 常规硬门槛（仅 20%~45% 区间）----
-    if ma120 is not None and price < ma120:   # 跌破半年线 = 长期趋势走坏（趋势性下跌，非黄金坑）
+    if size_tier == "微盘":   # 回测：微盘深坑 20日净edge≈0，深坑抄底仅大盘有意义
         return None
     if vol_ratio is None:
         return None
@@ -323,6 +414,145 @@ def _score_candidate(code: str, stock: dict, klines, turnover: float | None = No
         score += 15
     else:
         score += 8
+
+    # 站半年线软化（回测：跌破半年线不否决，破位股反弹不弱；站上给小幅加分）
+    if ma120 is not None and price >= ma120:
+        score += 5
+
+    base["score"] = score
+    return base
+
+
+def _score_bull_pullback(code: str, stock: dict, klines, turnover: float | None = None,
+                         size_tier: str | None = None) -> dict | None:
+    """牛市黄金坑变体：浅回调上车（右侧）。回测结论：牛市里深坑抄底无 edge（超跌是真弱），
+    换成「浅回调 5~20% + 站上 MA20 + 均线多头」才有正 edge；熊市该信号反向（接飞刀）。
+
+    与 _score_candidate（深坑抄底，熊市信号）互补：牛市路由本函数，熊市/震荡路由深坑。
+    """
+    n = len(klines)
+    if n < 60:
+        return None
+    size_tier = size_tier or _size_tier_of(code)
+    if size_tier == "微盘":   # 黄金坑灵魂是白马/蓝筹；微盘浅回调熊市 −3.82% 波动大，排除
+        return None
+    closes = [k.close for k in klines]
+    if any(c is None for c in closes[-60:]):
+        return None
+    price = closes[-1]
+    if price is None or price <= 0:
+        return None
+
+    # 近期高点（回看 120 根）
+    start = max(0, n - 120)
+    hi = max(range(start, n), key=lambda i: klines[i].high if klines[i].high is not None else -1e9)
+    peak = klines[hi].high
+    if peak is None or peak <= 0:
+        return None
+    gap = n - 1 - hi
+    dd = (peak - price) / peak * 100
+
+    if dd < 5:               # 回调太浅，没上车点
+        return None
+    if dd >= 20:             # 回调过深 → 已落入深坑范畴，牛市里是真弱，不接
+        return None
+    if gap < 3:              # 距高点不足 3 日，回调尚未成形
+        return None
+
+    # 均线多头 + 站上 MA20（右侧核心）
+    ma5 = calc_sma(closes, 5)[-1] if len(closes) >= 5 else None
+    ma10 = calc_sma(closes, 10)[-1] if len(closes) >= 10 else None
+    ma20 = calc_sma(closes, 20)[-1] if len(closes) >= 20 else None
+    ma120 = calc_sma(closes, 120)[-1] if len(closes) >= 120 else None
+    ma250 = calc_sma(closes, 250)[-1] if len(closes) >= 250 else None
+    bull = (ma5 is not None and ma10 is not None and ma20 is not None
+            and ma5 > ma10 > ma20)
+    above_ma20 = ma20 is not None and price >= ma20
+    if not bull or not above_ma20:
+        return None
+
+    # 缩量回调（坑段均量 vs 高点前 20 日均量）
+    pit_vol = _mean_vol(klines[hi:])
+    pre_vol = _mean_vol(klines[max(0, hi - 20):hi])
+    vol_ratio = (pit_vol / pre_vol) if (pit_vol and pre_vol) else None
+
+    macd_sig, macd_ok = "", False
+    try:
+        macd = calc_macd(closes)
+        macd_sig = macd.signal if macd else ""
+        macd_ok = bool(macd) and macd.signal in ("金叉", "多头") and (macd.histogram or 0) >= 0
+    except Exception:
+        pass
+    pattern = _detect_reversal_pattern(klines)
+
+    base = {
+        "code": code,
+        "name": stock["name"],
+        "indices": stock["indices"],
+        "source": stock.get("source", ""),
+        "fund_csv": stock.get("fund_csv"),
+        "mktcap": stock.get("mktcap"),
+        "dd": dd,
+        "gap": gap,
+        "vol_ratio": vol_ratio,
+        "turnover": turnover,
+        "price": price,
+        "peak": peak,
+        "ma20": ma20,
+        "ma120": ma120,
+        "ma250": ma250,
+        "above_ma20": above_ma20,
+        "above_ma120": ma120 is None or price >= ma120,
+        "macd_sig": macd_sig,
+        "kdj_ok": False,
+        "pattern": pattern,
+        "overdeep": False,
+        "size_tier": size_tier,
+    }
+
+    score = stock["quality"]
+
+    # 回调幅度 30（10~15% 是牛市最理想的浅回调：有肉又不走坏）
+    if 10 <= dd <= 15:
+        score += 30
+    elif 8 <= dd < 10 or 15 < dd <= 18:
+        score += 22
+    else:
+        score += 14
+
+    # 缩量回调 20
+    if vol_ratio is not None:
+        if vol_ratio < 0.7:
+            score += 20
+        elif vol_ratio < 1.0:
+            score += 14
+        elif vol_ratio < 1.2:
+            score += 6
+
+    # 换手率确认（±5）
+    if turnover is not None:
+        if turnover < 1.0:
+            score += 5
+        elif turnover < 2.0:
+            score += 3
+        elif turnover >= 5.0:
+            score -= 3
+
+    # 企稳反转 20（封顶）
+    stab = 0
+    if macd_ok:
+        stab += 10
+    if pattern:
+        stab += 10
+    score += min(stab, 20)
+
+    # 长期趋势 15（站上年线最健康，其次半年线）
+    if ma250 is not None and price >= ma250:
+        score += 15
+    elif ma120 is not None and price >= ma120:
+        score += 10
+    else:
+        score += 5
 
     base["score"] = score
     return base
@@ -432,27 +662,32 @@ def _fund_gate(f: dict) -> tuple[str, str]:
     return "✅ 通过", "估值+基本面 双过"
 
 
+def _init_mx():
+    """初始化妙想客户端（无 MX_APIKEY 返回 None）。"""
+    try:
+        from app.config import Config
+        from app.utils import load_env
+        from app.miaoxiang import MXClient
+    except Exception:
+        return None
+    try:
+        load_env(_ROOT)
+        config = Config(_ROOT / "watchlist_config.json")
+        keys = config.mx_apikeys
+        if keys:
+            return MXClient(keys)
+    except Exception:
+        pass
+    return None
+
+
 def _fundamental_check(results, top: int) -> None:
     """对 top 候选跑估值分位 + 净利同比 + ROE 确定性门槛，否决/降级不达标者。
 
     本地 market.duckdb（估值分位 + 三张报表）优先，妙想兜底；两者都无时字段为 None，
     由 _fund_gate 判「-- 待查」。不再因缺 MX_APIKEY 跳过（本地数据可独立填字段）。
     """
-    try:
-        from app.config import Config
-        from app.utils import load_env
-        from app.miaoxiang import MXClient
-    except Exception:
-        return
-    mx = None
-    try:
-        load_env(_ROOT)
-        config = Config(_ROOT / "watchlist_config.json")
-        keys = config.mx_apikeys
-        if keys:
-            mx = MXClient(keys)
-    except Exception:
-        mx = None
+    mx = _init_mx()
 
     n_fund = min(top, len(results), 8)
     print()
@@ -478,6 +713,90 @@ def _fundamental_check(results, top: int) -> None:
     print()
     print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
     print("  仅 ✅通过 才对单只跑 analyze_golden_pit.py 细看买点/止损；❌/⚠️/待查 建议排除或人工补查后观望。")
+
+
+# 基本面兜底判定分级（❌真跌最重 → --待查最轻），用于 B1 暴雷组排序。
+_FUND_SEVERITY = {"❌ 真跌": 0, "⚠️ 估值高": 1, "⚠️ 成色弱": 2, "-- 待查": 3}
+
+
+def _gate_list(rows: list, mx) -> tuple[list, list]:
+    """对一组技术候选逐只跑基本面门槛，返回 (passed, failed)。ST/退市直接判 ❌ 不查基本面。"""
+    passed: list = []
+    failed: list = []
+    for r in rows:
+        if "ST" in r["name"].upper() or "退" in r["name"]:
+            r["fund"] = {"pb_pct": None, "roe": None, "profit_growth": None}
+            r["fund_verdict"] = ("❌ 真跌", "ST/退市风险")
+            failed.append(r)
+            continue
+        f = _fetch_fundamental(mx, r["name"], r["code"])
+        r["fund"] = f
+        r["fund_verdict"] = _fund_gate(f)
+        label, _ = r["fund_verdict"]
+        (passed if label == "✅ 通过" else failed).append(r)
+    return passed, failed
+
+
+def _fundamental_gate_b1(results: list, deep_results: list, top: int) -> None:
+    """B1 全市场基本面兜底：对技术短名单逐只跑估值分位+ROE+净利同比门槛，
+    拆「错杀候选(✅通过)」与「疑似暴雷/价值陷阱(❌/⚠️)」两组。
+
+    全市场技术初筛会捞进大量基本面走坏的票，黄金坑的灵魂是「错杀 vs 暴雷」——
+    这里用本地 duckdb 估值分位+三张报表（净利同比<0→❌真跌、ROE<8→⚠️成色弱、
+    PB分位>70→⚠️估值高）把暴雷的剔掉，剩下的才是「错杀」黄金坑。全短名单(上限 cap)
+    都查，本地优先 + 妙想兜底；缺数据标 --待查（不放行 ✅）。
+
+    常规坑(20~45%)按技术分 -score 排序；深度坑(>45%)技术分恒 0，按回撤 -dd 排序
+    （最深跌的最可能暴雷，但也可能有深度错杀）。深度坑技术面筛不动，全靠这里的基本面
+    门槛把「深度错杀」与「深度暴雷」分开。
+    """
+    mx = _init_mx()
+    cap = 60  # 技术短名单通常几十~几百，上限保护
+
+    checked = results[:cap]
+    passed, failed = _gate_list(checked, mx)
+    passed.sort(key=lambda x: -x["score"])
+    failed.sort(key=lambda x: (_FUND_SEVERITY.get(x["fund_verdict"][0], 9), -x["score"]))
+
+    deep_checked = deep_results[:cap]
+    deep_passed, deep_failed = _gate_list(deep_checked, mx)
+    deep_passed.sort(key=lambda x: -x["dd"])
+    deep_failed.sort(key=lambda x: (_FUND_SEVERITY.get(x["fund_verdict"][0], 9), -x["dd"]))
+
+    def _rows(lst):
+        for r in lst:
+            f = r["fund"]
+            label, note = r["fund_verdict"]
+            pb_txt = f"{f['pb_pct']:.1f}%" if f["pb_pct"] is not None else "  --"
+            roe_txt = f"{f['roe']:.1f}%" if f["roe"] is not None else "  --"
+            pg_txt = f"{f['profit_growth']:.1f}%" if f["profit_growth"] is not None else "  --"
+            yield (r["code"], r["name"], r["dd"], r["score"], pb_txt, roe_txt, pg_txt, label, note)
+
+    def _dump(title, lst, n_show):
+        print()
+        print(f"{title}（共 {len(lst)} 只，显示前 {n_show}）")
+        if lst:
+            print(f"  {'代码':<8}{'名称':<10}{'回撤%':>7}{'技术分':>7}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  判定")
+            print("  " + "-" * 74)
+            for code, name, dd, score, pb_txt, roe_txt, pg_txt, label, note in list(_rows(lst))[:n_show]:
+                print(f"  {code:<8}{name:<10}{dd:>7.1f}{score:>7}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label}"
+                      + (f"  {note}" if note and note != "估值+基本面 双过" else ""))
+        else:
+            print("  （无）")
+
+    print()
+    print("=" * 72)
+    print(f"基本面兜底（B1 全市场，常规坑 {len(checked)} 只 + 深度坑 {len(deep_checked)} 只：本地库 + 妙想）")
+    print("=" * 72)
+
+    _dump("✅ 错杀候选（常规坑基本面通过）—— 这才是「黄金坑」", passed, min(top, len(passed)))
+    _dump("❌/⚠️ 疑似暴雷/价值陷阱（常规坑基本面不达标）—— 勿把「跌」当「坑」", failed, min(20, len(failed)))
+    _dump("✅ 深度错杀候选（回撤>45% 但基本面通过）—— 深跌里难得的错杀", deep_passed, min(top, len(deep_passed)))
+    _dump("❌/⚠️ 深度暴雷（回撤>45% 且基本面不达标）—— 深跌≠深坑", deep_failed, min(20, len(deep_failed)))
+
+    print()
+    print("  门槛: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
+    print("  仅 ✅错杀候选 / ✅深度错杀候选 才对单只跑 analyze_golden_pit.py 细看买点/止损；❌/⚠️ 是基本面坏了，抄底是接飞刀。")
 
 
 # ---------------------------------------------------------------- 本地库 streaks 初筛
@@ -516,8 +835,53 @@ def _parse_args(argv):
     return query, top, sync, full
 
 
+def _scan_pool(pool: dict) -> tuple[list, list, list]:
+    """逐股跑黄金坑检测（本地日K优先），返回 (results, deep_results, bull_results)。
+
+    按该股板块广度 regime 路由（回测结论）：
+    - 牛市 → 浅回调上车（_score_bull_pullback，右侧）+ 深度坑仍查（全 regime 有效）
+    - 熊市/震荡 → 深坑抄底（_score_candidate，左侧）
+    regime 不可用（过期/缺失）回退深坑抄底（默认黄金坑语义）。
+    """
+    print()
+    print(f"  逐股检测中（{len(pool)} 只）...")
+    turnover_map = fetch_turnover_map(list(pool.keys()))
+    results: list = []
+    deep_results: list = []
+    bull_results: list = []
+    done = 0
+    for code, stock in pool.items():
+        try:
+            market = _detect_market(code)
+            klines = fetch_daily_local_first(code, market, days=250)
+            if not klines or len(klines) < 60:
+                continue
+            reg = get_board_regime(code)
+            regime = reg["regime"] if reg else "震荡"
+            if regime == "牛市":
+                r = _score_bull_pullback(code, stock, klines, turnover_map.get(code))
+                if r is not None:
+                    bull_results.append(r)
+                # 深度坑(>45%)全 regime 有效，牛市照查（bull_mode 下只留 overdeep）
+                r2 = _score_candidate(code, stock, klines, turnover_map.get(code),
+                                      bull_mode=True)
+                if r2 is not None:
+                    deep_results.append(r2)
+            else:
+                r = _score_candidate(code, stock, klines, turnover_map.get(code))
+                if r is not None:
+                    (deep_results if r.get("overdeep") else results).append(r)
+        except Exception:
+            pass
+        done += 1
+        if done % 50 == 0:
+            print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
+    return results, deep_results, bull_results
+
+
 def main():
     query, top, sync, full = _parse_args(sys.argv)
+    whole_market = bool(query) and query.strip().lower() in _WHOLE_MARKET_KEYS
 
     scope = query if query else "沪深300 ∪ 上证50 ∪ 中证红利"
     print("=" * 72)
@@ -527,58 +891,39 @@ def main():
     if sync:
         _sync_local_db()
 
-    if query:
+    if whole_market:
+        pool = _pool_from_prescreen()
+        if not pool:
+            print("❌ 全市场 SQL 初筛无候选或本地库不可用（需 data/market.duckdb + duckdb）")
+            return 1
+    elif query:
         pool = _build_pool_from_query(query)
         if not pool:
             print(f"❌ 无法解析「{query}」的候选池（白名单/CSV/板块/行业名未匹配或数据源不可达）")
-            print("   支持: 白马蓝筹 / .csv 路径 / 指数(沪深300/上证50/中证红利...) / 行业(半导体/化工...)")
+            print("   支持: 全市场 / 白马蓝筹 / .csv 路径 / 指数(沪深300/上证50/中证红利...) / 行业(半导体/化工...)")
             return 1
     else:
         pool = _build_pool()
         if not pool:
             print("❌ 未获取到指数成分候选池（akshare 未装 / 网络异常）")
             return 1
-    print(f"  候选池: {len(pool)} 只{'（白名单/板块/行业输入）' if query else '白马/蓝筹成分股'}")
+    print(f"  候选池: {len(pool)} 只"
+          f"{'（全市场 SQL 初筛）' if whole_market else ('（白名单/板块/行业输入）' if query else '白马/蓝筹成分股')}")
 
-    if not full:
+    if not full and not whole_market:
         pool, prescreen_note = _prescreen(pool, ["down", "vol-down"])
         if prescreen_note:
             print(prescreen_note)
 
-    print()
-    print(f"  逐股检测中（{len(pool)} 只，约需 2~4 分钟）...")
-    turnover_map = fetch_turnover_map(list(pool.keys()))
-    results = []
-    deep_results = []
-    suppressed = 0
-    done = 0
-    for code, stock in pool.items():
-        try:
-            market = _detect_market(code)
-            klines = fetch_daily_local_first(code, market, days=250)
-            if not klines or len(klines) < 60:
-                continue
-            ok, note = gate_side(code, "left")
-            if not ok:
-                suppressed += 1
-                continue
-            r = _score_candidate(code, stock, klines, turnover_map.get(code))
-            if r is not None:
-                (deep_results if r.get("overdeep") else results).append(r)
-        except Exception:
-            pass
-        done += 1
-        if done % 50 == 0:
-            print(f"    已检测 {done}/{len(pool)} ...", file=sys.stderr)
+    results, deep_results, bull_results = _scan_pool(pool)
 
-    if not results and not deep_results:
+    if not results and not deep_results and not bull_results:
         msg = "当前无符合条件的黄金坑候选（成分股多处于「未明显回调」或「已破位走坏」状态）"
-        if suppressed:
-            msg += f"；另有 {suppressed} 只因板块广度 regime 不符（牛市禁左侧埋伏）被抑制"
         print(f"\n❌ {msg}")
         return 0
 
     results.sort(key=lambda x: -x["score"])
+    bull_results.sort(key=lambda x: -x["score"])
     # 深坑股按「错杀嫌疑」排序：站半年线 → 缩量 → 回撤更深 优先
     deep_results.sort(key=lambda x: (
         not x.get("above_ma120"),
@@ -607,14 +952,36 @@ def main():
         print("  （无 20%~45% 区间的常规黄金坑候选）")
 
     print()
-    if suppressed:
-        print(f"  ⚠️ 已按板块广度 regime 抑制 {suppressed} 只（牛市禁左侧埋伏——广度高时超跌是真弱）")
     print("  说明:")
     print("    - 板块=候选所属指数（上证50/沪深300/中证红利）或白名单层级（白马/蓝筹）；市值=总市值（行情源未覆盖的显示 —）；回撤%=现价距近120日高点跌幅")
     print("    - 缩量比=坑段均量/高点前20日均量（<0.6 健康）；站MA20/MACD金叉/KDJ金叉/止跌形态=企稳信号")
     print("    - 换手%=今日换手率（<1% 地量见底确认真缩量 / ≥5% 高换手则缩量存疑）")
     print("    - 分级：✅强(≥75) / ⚠️中(55~74) / 🔸弱(<55)，仅供初筛")
     print("    - 确认估值/基本面/买点止损请对单只运行: py .claude/skills/golden-pit/analyze_golden_pit.py <代码>")
+
+    # ---- 牛市浅回调上车（右侧，回测：牛市深坑无 edge，换浅回调多头）----
+    if bull_results:
+        n_bull = min(len(bull_results), 20)
+        print()
+        print("=" * 72)
+        print(f"🟢 牛市浅回调上车（回撤 5~20% + 均线多头，共 {len(bull_results)} 只，显示前 {n_bull}）")
+        print("=" * 72)
+        print("  当前属板块广度牛市：深坑抄底无 edge（超跌是真弱），换成「浅回调上车」顺势接回调。")
+        print()
+        bheader = (f"  {'代码':<8}{'名称':<10}{'板块':<16}{'市值':>8}{'现价':>8}{'回撤%':>7}"
+                   f"{'缩量比':>7}{'换手%':>6}{'站MA20':>7}{'MACD':>6}{'止跌':>5}{'分':>4}  分级")
+        print(bheader)
+        print("  " + "-" * 100)
+        for r in bull_results[:n_bull]:
+            idx_txt = "/".join(sorted(r["indices"]))
+            vol_txt = f"{r['vol_ratio']:.2f}" if r["vol_ratio"] is not None else "  --"
+            tr_txt = f"{r['turnover']:.1f}" if r["turnover"] is not None else "  --"
+            print(f"  {r['code']:<8}{r['name']:<10}{idx_txt:<16}{_fmt_mktcap(r['mktcap']):>8}{r['price']:>8.2f}{r['dd']:>7.1f}"
+                  f"{vol_txt:>7}{tr_txt:>6}{('✅' if r['above_ma20'] else '❌'):>7}{r['macd_sig']:>6}"
+                  f"{('✅' if r['pattern'] else '❌'):>5}"
+                  f"{r['score']:>4}  {_verdict(r['score'])}")
+        print()
+        print("  说明: 浅回调=现价距近120日高点回撤 5~20%；均线多头(MA5>MA10>MA20)+站上MA20=上升趋势未破坏。")
 
     # ---- 深度超阈值（>45%）单独列出，供人工判断基本面 ----
     if deep_results:
@@ -640,7 +1007,10 @@ def main():
         print()
         print("  说明: 站半年线(MA120)=长期趋势未完全破坏；缩量比<1.0=抛压衰竭。「站半年线✅且缩量」者更可能是深度错杀，值得进一步查基本面。")
 
-    _fundamental_check(results, top)
+    if whole_market:
+        _fundamental_gate_b1(results, deep_results, top)
+    else:
+        _fundamental_check(results, top)
     return 0
 
 
