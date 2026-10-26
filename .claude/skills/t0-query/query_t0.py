@@ -96,17 +96,19 @@ def _show_all(snap):
         return
     print(f"\n做T信号快照（更新于 {snap.get('updated_at', '')}，共 {len(signals)} 个）\n")
     print(f"  {'代码':<8}{'名称':<10}{'方向':<6}{'现价':>9}{'买挂单':>9}"
-          f"{'卖挂单':>9}{'支撑':>9}{'压力':>9}{'布林':>6}{'RR':>6}{'龄(秒)':>7}")
-    print("  " + "─" * 84)
+          f"{'卖挂单':>9}{'支撑':>9}{'压力':>9}{'上/下轨':>16}{'布林':>6}{'RR':>6}{'龄(秒)':>7}")
+    print("  " + "─" * 106)
     for code, s in sorted(signals.items(), key=lambda kv: -kv[1].get("age_sec", 0)):
         t = _TYPE_LABEL.get(s.get("signal_type"), s.get("signal_type"))
         rr = s.get("risk_reward", 0)
         rr_s = f"{rr:.1f}" if rr else "--"
         bb = _BB_SHORT.get(s.get("bb_signal"), "—")
+        bb_up, bb_lo = s.get("bb_upper"), s.get("bb_lower")
+        band = "--" if bb_up is None and bb_lo is None else f"{_fmt(bb_up)}/{_fmt(bb_lo)}"
         print(f"  {code:<8}{str(s.get('name', ''))[:8]:<10}{t:<6}"
               f"{_fmt(s.get('price')):>9}{_fmt(s.get('buy_price')):>9}"
               f"{_fmt(s.get('sell_price')):>9}{_fmt(s.get('support')):>9}"
-              f"{_fmt(s.get('resistance')):>9}{bb:>6}{rr_s:>6}{s.get('age_sec', 0):>7}")
+              f"{_fmt(s.get('resistance')):>9}{band:>16}{bb:>6}{rr_s:>6}{s.get('age_sec', 0):>7}")
     print()
 
 
