@@ -35,8 +35,16 @@ def _today() -> str:
     return datetime.date.today().isoformat()
 
 
-def _cutoff_date() -> str:
-    """清理分界线：保留当天 + 前 1 自然日，删更早的。"""
+_RETENTION_DAYS = 15  # 保留近 15 自然日（≈10 个交易日），供跨日「同时段量比」积累历史
+
+
+def _retention_cutoff() -> str:
+    """清理分界线：保留近 _RETENTION_DAYS 自然日，删更早的。"""
+    return (datetime.date.today() - datetime.timedelta(days=_RETENTION_DAYS)).isoformat()
+
+
+def _recent_cutoff() -> str:
+    """读缓存的新鲜窗口：当天 + 前 1 自然日（与远端 _fetch_min5_remote 的 ~2 日量对齐）。"""
     return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
 
@@ -85,20 +93,21 @@ def try_read_fresh(code: str, market: str) -> Optional[list[KlineData]]:
 
     global _last_clean_date
     today = _today()
-    cutoff = _cutoff_date()
+    recent = _recent_cutoff()
+    retention = _retention_cutoff()
 
     try:
         with duckdb.connect(str(db)) as con:
             _ensure_schema(con)
-            # 每日节流清理：删早于「前 1 日」的历史（5min 数据只对当天有意义）
+            # 每日节流清理：只保留近 _RETENTION_DAYS 自然日的历史（供跨日「同时段量比」），删更早的
             if _last_clean_date != today:
-                con.execute("DELETE FROM min5_kline WHERE trade_date < ?", [cutoff])
+                con.execute("DELETE FROM min5_kline WHERE trade_date < ?", [retention])
                 _last_clean_date = today
 
             rows = con.execute(
                 "SELECT ts, open, high, low, close, volume FROM min5_kline "
                 "WHERE code = ? AND market = ? AND trade_date >= ? ORDER BY ts",
-                [code, market, cutoff],
+                [code, market, recent],
             ).fetchall()
     except Exception:
         return None
@@ -132,6 +141,43 @@ def try_read_fresh(code: str, market: str) -> Optional[list[KlineData]]:
     if last_dt.date().isoformat() == today:
         return klines
     return None
+
+
+def read_history(code: str, market: str, lookback_days: Optional[int] = None) -> Optional[list[KlineData]]:
+    """读完整保留的历史 5 分钟 K 线（供跨日「同时段量比」等消费）。
+
+    返回保留窗口内的全部 bar（按时间升序）；lookback_days 可进一步限定只取最近 N 自然日，
+    缺省返回全部保留窗口。库 / duckdb 缺失 / 读取失败返回 None（与 try_read_fresh 一致静默降级）。
+    """
+    db = _db_path()
+    if not db.exists():
+        return None
+    try:
+        import duckdb
+    except Exception:
+        return None
+
+    cutoff = (
+        (datetime.date.today() - datetime.timedelta(days=lookback_days)).isoformat()
+        if lookback_days is not None
+        else _retention_cutoff()
+    )
+    try:
+        with duckdb.connect(str(db), read_only=True) as con:
+            rows = con.execute(
+                "SELECT ts, open, high, low, close, volume FROM min5_kline "
+                "WHERE code = ? AND market = ? AND trade_date >= ? ORDER BY ts",
+                [code, market, cutoff],
+            ).fetchall()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return [
+        KlineData(date=str(r[0]), open=_f(r[1]), high=_f(r[2]),
+                  low=_f(r[3]), close=_f(r[4]), volume=_f(r[5]))
+        for r in rows
+    ]
 
 
 def write(code: str, market: str, klines: list[KlineData]) -> None:

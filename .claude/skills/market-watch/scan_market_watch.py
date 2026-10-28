@@ -61,7 +61,7 @@ from app.hithink import (
     fetch_ths_index_list,
     fetch_index_snapshot,
 )
-from app.technical import calc_ma_alignment
+from app.technical import calc_ma_alignment, fetch_historical_kline
 
 # 东财 clist 全 A 股（沪深主板 + 创业板 + 科创板）
 _FS_ALL_A = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23"
@@ -138,6 +138,8 @@ def _fetch_index_rows() -> list[dict]:
                 pos = (price - min(lows)) / (max(highs) - min(lows)) * 100
         ma = calc_ma_alignment(kl) if kl else None
         vol = _volume_metrics(kl) if kl else None
+        market = "SH" if q.code.startswith(("0", "5", "6", "9")) else "SZ"
+        st = _same_time_volume_ratio(q.code, market)
         rows.append({
             "code": q.code,
             "name": q.name,
@@ -149,6 +151,8 @@ def _fetch_index_rows() -> list[dict]:
             "vol_ratio": vol[0] if vol else None,
             "vol_label": vol[1] if vol else "—",
             "vol_trend": vol[2] if vol else "—",
+            "st_ratio": st[0] if st else None,
+            "st_label": st[1] if st else "—",
         })
     return rows
 
@@ -274,17 +278,23 @@ def _print_volume_analysis(rows: list[dict]):
     if not valid:
         print("  ⚠️ 无指数K线量能数据")
         return
-    print(f"  {'指数':<8}{'今日/5日均量':>12}{'量能':>6}{'近5日趋势':>10}")
+    print(f"  {'指数':<8}{'今日/5日均量':>12}{'量能':>6}{'近5日趋势':>10}{'同时段量比':>12}{'同时段':>6}")
     print("  " + "-" * 72)
     for r in rows:
         if r.get("vol_ratio") is None:
             continue
-        print(f"  {r['name']:<8}{r['vol_ratio']:>11.2f}倍{r['vol_label']:>6}{r['vol_trend']:>10}")
+        st_s = f"{r['st_ratio']:.2f}倍" if r.get("st_ratio") is not None else "     --"
+        print(f"  {r['name']:<8}{r['vol_ratio']:>11.2f}倍{r['vol_label']:>6}{r['vol_trend']:>10}"
+              f"{st_s:>12}{r.get('st_label', '—'):>6}")
     up = sum(1 for r in valid if r["vol_label"] == "放量")
     down = sum(1 for r in valid if r["vol_label"] == "缩量")
     mild = len(valid) - up - down
-    print(f"  ── 汇总: 放量 {up} 只 / 温和 {mild} 只 / 缩量 {down} 只")
-    print("  （量能倍数 = 今日/最近交易日成交量 ÷ 近5日均量；盘中为未完整实时量，收盘后为准）")
+    st_up = sum(1 for r in rows if r.get("st_label") == "放量")
+    st_down = sum(1 for r in rows if r.get("st_label") == "缩量")
+    st_mild = sum(1 for r in rows if r.get("st_label") == "温和")
+    print(f"  ── 汇总(日K口径): 放量 {up} 只 / 温和 {mild} 只 / 缩量 {down} 只")
+    print(f"  ── 汇总(同时段口径): 放量 {st_up} 只 / 温和 {st_mild} 只 / 缩量 {st_down} 只")
+    print("  （今日/5日均量 = 日K最后一根÷近5日均量，盘中是半天累计量偏虚低；同时段量比 = 今日此刻累计÷过去N日同时刻累计，盘中更准）")
 
 
 def _print_breadth(b: dict):
@@ -358,13 +368,87 @@ def _print_margin(m):
 
 # ---------------------------------------------------------------- 主流程
 
+# 8 大指数代码（与 app.data_fetcher.fetch_major_indices 一致），用于拉 5 分钟 K 落库
+_INDEX_CODES = ["000001", "399001", "399006", "399673", "000688", "000300", "000905", "000852"]
+
+
+def _persist_index_min5() -> Optional[str]:
+    """拉 8 大指数 5 分钟 K 并写入本地 min5.duckdb（供跨日「同时段量比」积累历史）。
+
+    走 fetch_historical_kline(scale=5)：命中本地缓存直接返回、未命中则远端拉取后自动落库。
+    失败静默降级，不影响大盘报告主流程。返回一句状态说明（None 表示全部失败）。
+    """
+    total = 0
+    for code in _INDEX_CODES:
+        market = "SH" if code.startswith(("0", "5", "6", "9")) else "SZ"
+        try:
+            kls = fetch_historical_kline(code, market, days=2, scale=5)
+            if kls:
+                total += len(kls)
+        except Exception:
+            continue
+    return f"8 指数 5 分钟 K 已刷新落库（共 {total} 根）" if total else None
+
+
+def _same_time_volume_ratio(code: str, market: str, lookback_days: int = 10) -> Optional[tuple]:
+    """同时段量比：今日此刻累计成交量 ÷ 过去 N 交易日「同一时刻」累计成交量均值。
+
+    按分钟 K 的日内时刻对齐（早盘比早盘、尾盘比尾盘），消除日内量能 U 型分布的影响，
+    盘中无需外推；比日K「今日/5日均量」（盘中是半天累计量）更准。
+    返回 (倍数, 标签) 或 None（历史 m5 覆盖到当前时刻的交易日不足 2 天）。
+    """
+    try:
+        from app.min5_local import read_history
+    except Exception:
+        return None
+    kls = read_history(code, market, lookback_days=lookback_days)
+    if not kls:
+        return None
+
+    # 按交易日分组，日内时刻(HH:MM) → 该时刻 bar 的量
+    days: dict[str, list[tuple[str, float]]] = {}
+    for k in kls:
+        d = k.date[:10]
+        hm = k.date[11:16]
+        days.setdefault(d, []).append((hm, float(k.volume or 0.0)))
+
+    dates = sorted(days.keys())
+    if not dates:
+        return None
+    today = dates[-1]
+    today_bars = days[today]
+    if not today_bars:
+        return None
+    t_now = today_bars[-1][0]                  # 今日当前时刻 = 最后一根 bar 的 HH:MM
+    today_cum = sum(v for _, v in today_bars)  # 今日累计量（截至当前时刻）
+
+    past_cums: list[float] = []
+    for d in dates[:-1]:
+        bars = days[d]
+        if not bars or bars[-1][0] < t_now:    # 该日未覆盖到当前时刻 → 数据不全，跳过
+            continue
+        past_cums.append(sum(v for hm, v in bars if hm <= t_now))
+
+    if len(past_cums) < 2:
+        return None
+    avg = sum(past_cums) / len(past_cums)
+    if avg <= 0:
+        return None
+    ratio = today_cum / avg
+    label = "放量" if ratio >= 1.2 else ("缩量" if ratio < 0.8 else "温和")
+    return ratio, label
+
+
 def main():
     print("=" * 72)
     print("大盘盯盘（8 指数 + 市场广度 + 板块资金流 + 两融 → 大盘研判数据包）")
     print("=" * 72)
     print("  （非交易时段显示最近收盘数据）")
 
-    # 1. 核心指数 + 2. 量能分析（共用指数K线）
+    # 先拉 8 指数 5 分钟 K 落库（供「同时段量比」读取今天 m5，失败静默）
+    _persist_index_min5()
+
+    # 1. 核心指数 + 2. 量能分析（共用指数K线，量能段含同时段量比）
     index_rows = _fetch_index_rows()
     _print_index_table(index_rows)
     _print_volume_analysis(index_rows)
