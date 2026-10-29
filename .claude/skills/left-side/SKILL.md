@@ -12,7 +12,7 @@ description: 左侧选股扫描。输入一个板块或行业（创业板/科创
 ## 用法
 
 ```bash
-py .claude/skills/left-side/scan_left_side.py <板块/行业|白名单/CSV> [输出数量]
+py .claude/skills/left-side/scan_left_side.py <板块/行业|白名单/CSV|全市场> [输出数量]
 ```
 
 示例：
@@ -23,15 +23,17 @@ py .claude/skills/left-side/scan_left_side.py 创业板 20
 py .claude/skills/left-side/scan_left_side.py 沪深300 15
 py .claude/skills/left-side/scan_left_side.py 化工
 py .claude/skills/left-side/scan_left_side.py 白马蓝筹
+py .claude/skills/left-side/scan_left_side.py 全市场
 ```
 
 参数说明：
 
-- **板块/行业**（必填）：支持四类输入——
+- **板块/行业**（必填）：支持五类输入——
   - **指数**：沪深300 / 中证500 / 中证1000 / 上证50 / 中证红利 / 科创50 / 创业板指
   - **板**：创业板 / 科创板（全板成分，非指数）
   - **行业/概念**：半导体 / 芯片 / 化工 / 白酒 / 光伏 / 新能源 / 医药 / 军工 ...（板块名模糊匹配，宽泛简称如「化工/有色/医药」会自动合并多个细分板块）
   - **白名单/CSV**：关键词「白马蓝筹/蓝筹白马/白名单」→ `data/bluechip_whitelist.csv`（全市场白马/蓝筹基本面筛选单子，自带 ROE今%/净利同比%/PB分位% 等列，确定性门槛直接复用单子快照、免重复拉取）；或任意本地 `.csv` 文件路径（须含「代码」列，可选「名称/层级」列）
+  - **全市场**：纯技术全市场扫描——本地 duckdb 单条 SQL 初筛全市场 5225 只（回撤≥12% + 距高点≥3日）→ 逐股细算打分，不限定板块/行业成分
 - **输出数量**（可选，默认 20）：输出候选数量上限。
 - **`--sync`**（可选）：先增量同步本地 marketdb 到最新（可能触发下载，遇 429 限流会失败）。
 - **`--full` / `--no-prescreen`**（可选）：跳过本地库 streaks 初筛，全池逐股拉新浪 K 线（更慢但召回最全，适合核对初筛是否漏票）。

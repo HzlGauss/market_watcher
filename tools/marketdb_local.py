@@ -1790,6 +1790,150 @@ def cmd_screen_golden_pit(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 左右侧全市场 SQL 初筛
+
+# 左侧（超跌埋伏）：复用 _GOLDEN_PIT_CORE（同一套 px/lasts/vols CTE，缩量口径一致 ——
+# 坑段均量/高点前20日均量），只换硬门槛：回撤 12~45%（常规）/ >45%（深度）+ 距高点≥3日。
+# RSI/J 超买排除、止跌形态、基本面门槛由 scan_left_side 在短名单上逐股细算
+# （与 golden-pit「SQL 只做 recall 缩减、不做最终判定」同一精神）。
+_LEFT_SIDE_NORMAL_WHERE = (
+    "dd BETWEEN 12.0 AND 45.0 "
+    "AND gap >= 3"
+)
+
+_LEFT_SIDE_DEEP_WHERE = (
+    "dd > 45.0 "
+    "AND gap >= 3"
+)
+
+
+def query_left_side_prescreen(db=None, limit: int = 800):
+    """全市场左侧「常规超跌」技术初筛（回撤 12~45% + 距高点≥3日，纯本地 DuckDB）。
+
+    返回列同 query_golden_pit_prescreen（thscode/ticker/name/price/peak/dd/gap/ma120/
+    ma250/ma5/ma10/ma20/vol_ratio/last_rn），供 scan_left_side 全市场模式逐股细算。
+    """
+    sql = _golden_pit_query(_LEFT_SIDE_NORMAL_WHERE, "dd ASC, vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def query_left_side_deep(db=None, limit: int = 800):
+    """全市场左侧「深度超跌」技术初筛（回撤 >45% + 距高点≥3日）。
+
+    深跌多半是暴雷，但 scan_left_side 把 dd>45 单列（deep_results）供人工判断「深度
+    错杀 vs 暴雷」，故初筛同样召回。列同 query_left_side_prescreen。
+    """
+    sql = _golden_pit_query(_LEFT_SIDE_DEEP_WHERE, "dd DESC, vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+# 右侧（突破追入 + 回踩买点）：量比口径是「今日量/前5日均量」（区别于 golden-pit/left 的
+# 「坑段均量/高点前20日均量」），且需 20/60 日新高、均线多头、MA20 走平、近5日新高、
+# 缩量回踩等列，故单独一套 CTE。最终打分仍由 scan_right_side 逐股用本地/新浪 K 重算。
+_RIGHT_SIDE_CORE = """
+WITH px AS (
+  SELECT thscode, date, close, high, volume,
+         ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY date) AS rn
+  FROM v_daily_qfq
+  WHERE substr(thscode, 1, 2) IN ('60', '68', '00', '30')
+),
+lasts AS (
+  SELECT thscode, close AS price, volume AS today_vol, rn AS last_rn,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
+         AVG(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 24 PRECEDING AND 5 PRECEDING) AS ma20_prev,
+         MAX(high) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS high20,
+         MAX(high) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 60 PRECEDING AND 1 PRECEDING) AS high60,
+         MAX(high) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS recent5_high,
+         AVG(volume) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS prev5_vol
+  FROM px
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY rn DESC) = 1
+),
+scored AS (
+  SELECT l.thscode, s.ticker, s.name,
+         l.price, l.ma5, l.ma10, l.ma20, l.ma60, l.ma20_prev,
+         l.high20, l.high60, l.recent5_high,
+         l.today_vol / NULLIF(l.prev5_vol, 0) AS vol_ratio,
+         l.last_rn
+  FROM lasts l
+  JOIN dim_symbol s ON s.thscode = l.thscode
+  WHERE l.last_rn >= 60
+)
+SELECT * FROM scored
+WHERE {where}
+ORDER BY {order}
+LIMIT {limit}
+"""
+
+_RIGHT_SIDE_BREAKOUT_WHERE = (
+    "price >= ma20 "
+    "AND NOT (name LIKE '%ST%' OR name LIKE '%退%') "
+    "AND ("
+    "  (high20 IS NOT NULL AND price > high20) "
+    "  OR (high60 IS NOT NULL AND price > high60) "
+    "  OR (ma5 > ma10 AND ma10 > ma20) "
+    "  OR (vol_ratio >= 1.2) "
+    ")"
+)
+
+_RIGHT_SIDE_PULLBACK_WHERE = (
+    "price >= ma20 "
+    "AND ma20_prev IS NOT NULL AND ma20 >= ma20_prev "
+    "AND high20 IS NOT NULL AND recent5_high IS NOT NULL "
+    "AND high20 > 0 AND recent5_high > 0 "
+    "AND recent5_high >= high20 * 0.99 "
+    "AND (recent5_high - price) / recent5_high * 100.0 BETWEEN 2.0 AND 10.0 "
+    "AND vol_ratio < 1.2 "
+    "AND NOT (name LIKE '%ST%' OR name LIKE '%退%') "
+)
+
+
+def _right_side_query(where: str, order: str, limit: int) -> str:
+    return _RIGHT_SIDE_CORE.format(where=where, order=order, limit=int(limit))
+
+
+def query_right_side_prescreen(db=None, limit: int = 800):
+    """全市场右侧「突破/走强」技术初筛（站上MA20 + 至少一个走强确认，纯本地 DuckDB）。
+
+    走强确认 = 创20/60日新高 或 均线多头(MA5>MA10>MA20) 或 放量(量比≥1.2)，与
+    scan_right_side._score_candidate 的 has_confirm 硬门槛对齐；MACD 金叉/多头、换手率
+    留给 Python 短名单细算。返回列: thscode/ticker/name/price/ma5/ma10/ma20/ma60/
+    high20/high60/vol_ratio/last_rn。
+    """
+    order = (
+        "COALESCE((price > high20)::INT, 0) + COALESCE((price > high60)::INT, 0) "
+        "+ COALESCE(((ma5 > ma10 AND ma10 > ma20))::INT, 0) "
+        "+ COALESCE((vol_ratio >= 1.2)::INT, 0) DESC, "
+        "COALESCE(vol_ratio, 0) DESC"
+    )
+    sql = _right_side_query(_RIGHT_SIDE_BREAKOUT_WHERE, order, limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def query_right_side_pullback(db=None, limit: int = 800):
+    """全市场右侧「回踩买点」技术初筛（趋势多头 + 近5日创20日新高 + 缩量回踩 2~10%）。
+
+    与 scan_right_side._score_pullback 硬门槛对齐（站上MA20且MA20走平、近5日创20日新高、
+    回撤2~10%、量比<1.2）。列同 query_right_side_prescreen（多了 ma20_prev/recent5_high）。
+    """
+    sql = _right_side_query(_RIGHT_SIDE_PULLBACK_WHERE, "vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:

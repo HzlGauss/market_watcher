@@ -12,12 +12,14 @@
 analyze_golden_pit.py（白马）或 stock-analysis（通用）细看。
 
 用法:
-    py .claude/skills/left-side/scan_left_side.py <板块/行业|白名单/CSV> [输出数量]
+    py .claude/skills/left-side/scan_left_side.py <板块/行业|白名单/CSV|全市场> [输出数量]
 
 参数:
     板块/行业  板块或行业名（如 创业板 / 科创板 / 沪深300 / 中证500 / 半导体 / 化工）
     白名单/CSV 本地白名单关键词（白马蓝筹/蓝筹白马/白名单 → data/bluechip_whitelist.csv）
                或任意 .csv 文件路径（相对项目根目录，须含「代码」列，可选「名称/层级」列）
+    全市场     纯技术全市场扫描：本地 duckdb 单条 SQL 初筛全市场 5225 只（回撤≥12% +
+               距高点≥3日）→ 逐股细算打分，不限定板块/行业成分
     输出数量    输出候选数量上限（可选，默认 20）
 
 数据源: 成分股池（app.board_pool：指数成分 akshare + 东财 clist 板块/行业 + 同花顺概念
@@ -429,6 +431,37 @@ def _prescreen(pool: dict, kinds: list, min_pool: int = 40) -> tuple[dict, str]:
     return prescreen_pool(pool, kinds, min_pool=min_pool, label="连续下跌/缩量")
 
 
+# 全市场模式关键字（候选池由 tools.marketdb_local 的 SQL 初筛从全市场 5225 只而来，
+# 不再限定板块/行业成分）。纯技术维度，与板块/行业输入共用同一套逐股打分。
+_WHOLE_MARKET_KEYS = {"全市场", "全部", "全部a股", "全a", "all"}
+
+
+def _pool_from_prescreen() -> dict:
+    """全市场 SQL 初筛短名单 → 候选池 {code: {name, source}}。
+
+    常规超跌（回撤12~45%）与深度超跌（>45%）合并，逐股细算仍走 _score_candidate；
+    source 记「全市场」。
+    """
+    try:
+        from tools.marketdb_local import query_left_side_deep, query_left_side_prescreen
+    except Exception:
+        return {}
+    pool: dict = {}
+    for fn in (query_left_side_prescreen, query_left_side_deep):
+        try:
+            df = fn()
+        except Exception:
+            continue
+        if df is None or getattr(df, "empty", True):
+            continue
+        for _, r in df.iterrows():
+            code = str(r.get("ticker", "")).zfill(6)
+            if not code or code == "000000":
+                continue
+            pool.setdefault(code, {"name": str(r.get("name", "") or ""), "source": "全市场"})
+    return pool
+
+
 def _sync_local_db() -> None:
     """--sync 时先增量同步本地 marketdb（可能触发下载，遇到 429 限流会失败）。"""
     from tools.marketdb_local import sync_db_echo
@@ -461,21 +494,30 @@ def main():
         print(__doc__)
         return 2
 
+    whole_market = query.strip().lower() in _WHOLE_MARKET_KEYS
+
     print("=" * 72)
-    print(f"左侧选股扫描（板块/行业: {query}）")
+    print(f"左侧选股扫描（{'全市场' if whole_market else f'板块/行业: {query}'}）")
     print("=" * 72)
 
     if sync:
         _sync_local_db()
 
-    pool = resolve_board_pool(query)
-    if not pool:
-        print(f"❌ 无法解析「{query}」的成分股池（板块/行业名未匹配或数据源不可达）")
-        print("   支持: 指数(沪深300/中证500/中证1000/上证50) / 板(创业板/科创板) / 行业(半导体/化工/白酒...)")
-        return 1
-    print(f"  成分股池: {len(pool)} 只（已剔除北交所/B股等无新浪K线的标的）")
+    if whole_market:
+        pool = _pool_from_prescreen()
+        if not pool:
+            print("❌ 全市场 SQL 初筛无候选或本地库不可用（需 data/market.duckdb + duckdb）")
+            return 1
+    else:
+        pool = resolve_board_pool(query)
+        if not pool:
+            print(f"❌ 无法解析「{query}」的成分股池（板块/行业名未匹配或数据源不可达）")
+            print("   支持: 全市场 / 指数(沪深300/中证500/中证1000/上证50) / 板(创业板/科创板) / 行业(半导体/化工/白酒...)")
+            return 1
+    print(f"  成分股池: {len(pool)} 只"
+          f"{'（全市场 SQL 初筛）' if whole_market else '（已剔除北交所/B股等无新浪K线的标的）'}")
 
-    if not full:
+    if not full and not whole_market:
         pool, prescreen_note = _prescreen(pool, ["down", "vol-down"])
         if prescreen_note:
             print(prescreen_note)
