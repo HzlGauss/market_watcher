@@ -89,8 +89,11 @@ py .claude/skills/golden-pit/scan_golden_pit.py 全市场 [输出数量]
 # Golden-pit whole-market SQL pre-screen (全市场黄金坑技术初筛：回撤+站半年线+缩量，本地 DuckDB)
 py tools/marketdb_local.py screen-golden-pit
 
+# Bottoming whole-market SQL pre-screen (全市场磨底技术初筛：止跌+横盘+缩量，本地 DuckDB)
+py tools/marketdb_local.py screen-bottoming
+
 # Bottoming scan (磨底：止跌横盘缩量打底阶段扫描)
-py .claude/skills/bottoming/scan_bottoming.py <板块/行业|白马蓝筹|CSV路径> [输出数量]
+py .claude/skills/bottoming/scan_bottoming.py <板块/行业|白马蓝筹|CSV路径|全市场> [输出数量]
 py .claude/skills/bottoming/backtest_bottoming.py [回测日期数]
 
 # Market-heat scan (市场热度雷达：涨幅榜/跌幅榜/龙虎榜 → 热点与避坑方向)

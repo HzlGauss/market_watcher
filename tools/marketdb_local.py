@@ -19,6 +19,7 @@
     sync-valuation-history  估值历史回填（东财 akshare，PE/PB/PS/PCF 自上市起全历史，补历史分位）
     streaks             全市场「连续上涨/下跌/放量/缩量」区间扫描（窗口函数三步法）
     screen-golden-pit   全市场黄金坑技术初筛（回撤20~45% + 站半年线 + 缩量，单条 SQL）
+    screen-bottoming    全市场磨底技术初筛（距低点≤8% + 磨底≥10日 + 箱宽≤20% + 缩量，单条 SQL）
 
 用法:
     py tools/marketdb_local.py bootstrap
@@ -1934,6 +1935,115 @@ def query_right_side_pullback(db=None, limit: int = 800):
     return df.head(limit)
 
 
+# ---------------------------------------------------------------- 磨底全市场 SQL 初筛
+
+# 磨底（止跌横盘缩量打底）：独立一套 CTE —— 需要「近60日最低收盘（磨底锚点）及其首次
+# 出现位置（磨底时长）、近60日真实高低区间（箱宽）、近20/120日均量（缩量比）」，与
+# left/right/golden-pit 的「距高点回撤」口径不同。最终打分仍由 scan_bottoming 在短名单
+# 上逐股用本地/新浪 K 重算（detect_stage 阶段 / RSI 超买排除留给 Python）。
+_BOTTOMING_CORE = """
+WITH px AS (
+  SELECT thscode, date, close, low, high, volume,
+         ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY date) AS rn
+  FROM v_daily_qfq
+  WHERE substr(thscode, 1, 2) IN ('60', '68', '00', '30')
+),
+lasts AS (
+  SELECT thscode, close AS price, rn AS last_rn,
+         MIN(close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS low60_close,
+         arg_min(rn, close) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS low60_rn,
+         MIN(low) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS lo60,
+         MAX(high) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS hi60,
+         AVG(volume) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS vol20,
+         AVG(volume) OVER (PARTITION BY thscode ORDER BY rn ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS vol120
+  FROM px
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY rn DESC) = 1
+),
+scored AS (
+  SELECT l.thscode, s.ticker, s.name,
+         l.price,
+         (l.price - l.low60_close) / l.low60_close * 100.0 AS dist_low,
+         (l.last_rn - l.low60_rn) AS days_since_low,
+         (l.hi60 - l.lo60) / l.lo60 * 100.0 AS box_w,
+         l.vol20 / NULLIF(l.vol120, 0) AS vol_ratio,
+         l.last_rn
+  FROM lasts l
+  JOIN dim_symbol s ON s.thscode = l.thscode
+  WHERE l.last_rn >= 120
+    AND l.low60_close IS NOT NULL AND l.low60_close > 0
+    AND l.lo60 IS NOT NULL AND l.hi60 IS NOT NULL AND l.hi60 > l.lo60
+)
+SELECT * FROM scored
+WHERE {where}
+ORDER BY {order}
+LIMIT {limit}
+"""
+
+_BOTTOMING_WHERE = (
+    "dist_low <= 8.0 "
+    "AND days_since_low >= 10 "
+    "AND box_w <= 20.0 "
+    "AND vol_ratio < 0.8 "
+    "AND NOT (name LIKE '%ST%' OR name LIKE '%退%')"
+)
+
+
+def _bottoming_query(where: str, order: str, limit: int) -> str:
+    """把 WHERE/ORDER/LIMIT 组装进磨底公共 CTE。"""
+    return _BOTTOMING_CORE.format(where=where, order=order, limit=int(limit))
+
+
+def query_bottoming_prescreen(db=None, limit: int = 800):
+    """全市场磨底「止跌横盘缩量打底」技术初筛（纯本地 DuckDB，单条 SQL）。
+
+    与 scan_bottoming._score_bottoming 的硬门槛对齐：距低点≤8% + 磨底≥10日 + 箱宽≤20%
+    + 缩量<0.8（近20日均量/近120日均量）。detect_stage 阶段 / RSI 超买排除由 scan_bottoming
+    在短名单上逐股细算。返回 pandas DataFrame（列: thscode/ticker/name/price/dist_low/
+    days_since_low/box_w/vol_ratio/last_rn）。无库/无 duckdb/失败返回 None。
+    """
+    sql = _bottoming_query(_BOTTOMING_WHERE, "dist_low ASC, box_w ASC, vol_ratio ASC", limit)
+    df = _golden_pit_query_run(sql, db)
+    if df is None or getattr(df, "empty", True):
+        return df
+    return df.head(limit)
+
+
+def cmd_screen_bottoming(args) -> int:
+    """全市场磨底技术初筛（CLI 入口，复用 query_bottoming_prescreen）。"""
+    db = _db_path(args.db)
+    if not db.exists():
+        print(_bootstrap_guide())
+        return 1
+    df = query_bottoming_prescreen(db=db, limit=args.limit)
+    if df is None:
+        print("❌ 本地库不可用或缺少 duckdb")
+        return 1
+    if df.empty:
+        print("⚠️ 全市场无符合磨底硬门槛（距低点≤8% + 磨底≥10日 + 箱宽≤20% + 缩量<0.8）的候选")
+        return 0
+
+    show = df[["ticker", "name", "price", "dist_low", "days_since_low", "box_w", "vol_ratio"]].copy()
+    show["price"] = show["price"].map(lambda v: f"{v:.2f}")
+    show["dist_low"] = show["dist_low"].map(lambda v: f"{v:.1f}%")
+    show["days_since_low"] = show["days_since_low"].map(lambda v: f"{int(v)}日")
+    show["box_w"] = show["box_w"].map(lambda v: f"{v:.1f}%")
+    show["vol_ratio"] = show["vol_ratio"].map(lambda v: f"{v:.2f}" if v == v else "--")
+    show = show.rename(columns={"ticker": "代码", "name": "名称", "price": "现价", "dist_low": "距低点%",
+                                "days_since_low": "磨底天数", "box_w": "箱宽%", "vol_ratio": "缩量比"})
+
+    print(f"== 全市场磨底技术初筛（共 {len(df)} 只，按距低点升序）==")
+    print(show.to_string(index=False))
+    print()
+    print("  说明: 这是第一步（技术硬门槛）。detect_stage 阶段 / RSI 超买 / 均线企稳打分需跑 scan_bottoming.py 全市场。")
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"\n✅ 已落盘 {len(df)} 只: {out}")
+    return 0
+
+
 # ---------------------------------------------------------------- 入口
 
 def main() -> int:
@@ -2041,6 +2151,11 @@ def main() -> int:
     sgp.add_argument("--limit", type=int, default=500, help="输出前 N 只（默认 500）")
     sgp.add_argument("--out", help="落盘 CSV 路径（可选）")
 
+    sb2 = sub.add_parser("screen-bottoming", help="全市场磨底技术初筛（本地 DuckDB，止跌+横盘+缩量）")
+    sb2.add_argument("--db")
+    sb2.add_argument("--limit", type=int, default=800, help="输出前 N 只（默认 800）")
+    sb2.add_argument("--out", help="落盘 CSV 路径（可选）")
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -2060,6 +2175,7 @@ def main() -> int:
         "streaks-backtest": cmd_streaks_backtest,
         "screen-bluechip": cmd_screen_bluechip,
         "screen-golden-pit": cmd_screen_golden_pit,
+        "screen-bottoming": cmd_screen_bottoming,
     }[args.cmd](args)
 
 
