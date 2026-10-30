@@ -388,7 +388,10 @@ def detect_consecutive_listings(
 def fetch_seat_details(code: str) -> list[SeatDetail]:
     """获取单只股票的龙虎榜席位明细
 
-    使用 AKShare stock_lhb_stock_detail_date_em(symbol) 获取席位级买卖数据。
+    东方财富席位明细需两步：先用 stock_lhb_stock_detail_date_em 取该股最近
+    上榜日期，再用 stock_lhb_stock_detail_em(symbol, date, flag) 拉席位买卖数据。
+    flag="买入"/"卖出" 各自返回按买入额/卖出额排序的前5席位，但每行都同时含
+    「买入金额 / 卖出金额 / 净额」，故需两侧都拉再按席位名去重合并。
 
     Args:
         code: 股票代码（如 "002594"）
@@ -401,41 +404,65 @@ def fetch_seat_details(code: str) -> list[SeatDetail]:
     except ImportError:
         return []
 
+    # 1. 取该股最近上榜日期
     try:
-        df = ak.stock_lhb_stock_detail_date_em(symbol=str(code))
+        date_df = ak.stock_lhb_stock_detail_date_em(symbol=str(code))
     except Exception as e:
-        log.debug(f"席位明细获取失败 {code}: {e}")
+        log.debug(f"席位日期获取失败 {code}: {e}")
         return []
 
-    if df is None or df.empty:
+    if date_df is None or date_df.empty:
         return []
 
-    # 先收集所有席位名用于量化检测（需要跨股票对比，调用方负责）
+    # akshare 该接口日期列名历史上有「交易日」/「日期」等，兜底取最后一列
+    date_col = next(
+        (c for c in ("交易日", "日期", "上榜日期", "交易日期", "上榜日") if c in date_df.columns),
+        date_df.columns[-1],
+    )
+
+    raw_date = str(date_df[date_col].iloc[0]).strip()
+    date_str = raw_date.replace("-", "").replace("/", "").replace(" ", "")[:8]
+
+    # 2. 拉两侧席位明细（买入前5 + 卖出前5），按席位名去重合并
     seats = []
-    quant_names: list[str] = []  # 在同日所有股票间共享
-
-    for _, row in df.iterrows():
-        seat_name = str(row.get('营业部名称', row.get('席位名称', '')))
-        if not seat_name:
+    seen: set[tuple] = set()
+    for flag in ("买入", "卖出"):
+        try:
+            df = ak.stock_lhb_stock_detail_em(symbol=str(code), date=date_str, flag=flag)
+        except Exception as e:
+            log.debug(f"席位明细获取失败 {code}({flag}): {e}")
             continue
 
-        buy = _safe_float(row.get('买入金额', row.get('买入额')))
-        sell = _safe_float(row.get('卖出金额', row.get('卖出额')))
-        buy_rank = _safe_int(row.get('买入排名', 0))
-        sell_rank = _safe_int(row.get('卖出排名', 0))
+        if df is None or df.empty:
+            continue
 
-        seat_type = classify_seat(seat_name)
-        net = (buy or 0) - (sell or 0)
+        for _, row in df.iterrows():
+            seat_name = str(row.get("交易营业部名称") or "").strip()
+            if not seat_name or seat_name in ("nan", "None"):
+                continue
 
-        seats.append(SeatDetail(
-            seat_name=seat_name,
-            seat_type=seat_type,
-            buy_amount=buy or 0,
-            sell_amount=sell or 0,
-            net_amount=net,
-            buy_rank=buy_rank,
-            sell_rank=sell_rank,
-        ))
+            buy = _safe_float(row.get("买入金额")) or 0
+            sell = _safe_float(row.get("卖出金额")) or 0
+            rank = _safe_int(row.get("序号", 0))
+
+            # 同一席位两侧表若数值完全相同（如深股通专用买卖额均第一），只保留一条
+            key = (seat_name, round(buy, 2), round(sell, 2))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            seat_type = classify_seat(seat_name)
+            net = buy - sell
+
+            seats.append(SeatDetail(
+                seat_name=seat_name,
+                seat_type=seat_type,
+                buy_amount=buy,
+                sell_amount=sell,
+                net_amount=net,
+                buy_rank=rank if flag == "买入" else 0,
+                sell_rank=rank if flag == "卖出" else 0,
+            ))
 
     return seats
 

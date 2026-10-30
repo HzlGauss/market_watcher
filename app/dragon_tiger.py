@@ -1320,7 +1320,7 @@ def analyze_dragon_tiger_llm(
         response = llm.chat(
             prompt,
             system_prompt=system_prompt,
-            max_tokens=2000,
+            max_tokens=16000,  # 推理模型需为 reasoning_content 留足预算，否则 content 为空
             temperature=0.4,
             timeout=120,
         )

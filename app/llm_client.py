@@ -184,7 +184,7 @@ class LLMClient:
         stop: Optional[List[str]] = None,
         timeout: int = 60,
     ) -> Optional[str]:
-        """底层 API 调用"""
+        """底层 API 调用（正常响应但 content 为空时自动重试一次）"""
         # 打印请求提示词以便调试
         log.info(f"--- LLM请求 [model={self._model}, max_tokens={max_tokens}, temp={temperature}] ---")
         log.info("--- LLM请求结束 ---")
@@ -199,6 +199,29 @@ class LLMClient:
         if stop:
             payload["stop"] = stop
 
+        for attempt in range(2):
+            content, finish_reason = self._post_once(payload, headers, timeout)
+            if content:
+                return content
+            # 截断(length)或HTTP错误(error)重试无益，直接放弃
+            if finish_reason in ("length", "error"):
+                return None
+            if attempt == 0:
+                log.warning("LLM返回空content，自动重试一次...")
+        return None
+
+    def _post_once(
+        self,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        timeout: int,
+    ) -> tuple[str, str]:
+        """单次 POST 并解析，返回 (content, finish_reason)：
+        - content 非空 = 成功
+        - content 空 + finish_reason="length" = 被 max_tokens 截断
+        - content 空 + finish_reason="error" = HTTP 失败或异常
+        - content 空 + 其他 finish_reason = 正常响应但内容为空
+        """
         try:
             resp = self._http.post(
                 "/chat/completions",
@@ -208,15 +231,24 @@ class LLMClient:
             )
             if resp and resp.status_code == 200:
                 result = resp.json()
-                content = result["choices"][0]["message"]["content"]
-                return content.strip() if content else None
+                choice = result["choices"][0]
+                msg = choice.get("message", {})
+                content = (msg.get("content") or "").strip()
+                finish_reason = choice.get("finish_reason") or ""
+                log.info(
+                    f"LLM响应: finish_reason={finish_reason}, "
+                    f"content_len={len(content)}, "
+                    f"reasoning_len={len(msg.get('reasoning_content') or '')}, "
+                    f"content_head={content[:80]!r}"
+                )
+                return content, finish_reason
             else:
                 status = resp.status_code if resp else "None"
                 log.warning(f"LLM请求失败 (HTTP {status})")
-                return None
+                return "", "error"
         except Exception as e:
             log.warning(f"LLM调用异常: {e}")
-            return None
+            return "", "error"
 
 
 # 全局默认LLM客户端实例

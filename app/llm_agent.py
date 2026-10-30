@@ -92,7 +92,7 @@ class LLMAgent:
     """
 
     MAX_TOOL_CALLS = 3       # 最大工具调用轮次
-    MAX_FINAL_TOKENS = 2000  # 最终结论的 max_tokens
+    MAX_FINAL_TOKENS = 16000  # 最终结论的 max_tokens（推理模型需为 reasoning 留足预算，否则 content 为空）
 
     def __init__(self, config, tools: list[AgentTool]):
         self.llm = get_llm_client(config)
