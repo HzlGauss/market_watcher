@@ -261,6 +261,9 @@ def main():
 
     code, name, days = _parse_args(sys.argv)
 
+    from app.helpers import _detect_market
+    market = _detect_market(code)
+
     load_env(_ROOT)
     config = Config(_ROOT / "watchlist_config.json")
     api_keys = config.mx_apikeys
@@ -298,31 +301,39 @@ def main():
     print("=" * 72)
     print(f"【2. 近 {days} 日 K 线 + 技术面】")
     print("=" * 72)
-    rows = []
-    for t in mx.query_structured(
-        f"{code} {name} 近{days}个交易日 日K线 开盘价 收盘价 最高价 最低价 成交量 换手率".strip()
-    ):
-        for r in t.get("rows") or []:
-            d = _norm_date(r.get("日期"))
-            close = _num(r.get("收盘价"))
-            if not d or close is None:
-                continue
-            rows.append((d, r, close))
-
     last_close = last_open = last_pct = None
     klines = None
     ts = None
-    if rows:
-        rows.sort(key=lambda x: x[0])  # 日期升序
-        closes = [c for _, _, c in rows]
-        last_close = closes[-1]
-        last_open = _num(rows[-1][1].get("开盘价"))
-        last_pct = _num(rows[-1][1].get("涨跌幅"))
-        if last_pct is None and len(closes) > 1 and closes[-2]:
+
+    # 日 K 优先本地 duckdb（前复权日线，口径可靠），缺数据/失败回退妙想
+    try:
+        from app.kline_local import fetch_daily_local_first
+        klines = fetch_daily_local_first(code, market, days) or None
+    except Exception:
+        klines = None
+    if klines is None:
+        rows = []
+        for t in mx.query_structured(
+            f"{code} {name} 近{days}个交易日 日K线 开盘价 收盘价 最高价 最低价 成交量 换手率".strip()
+        ):
+            for r in t.get("rows") or []:
+                d = _norm_date(r.get("日期"))
+                close = _num(r.get("收盘价"))
+                if not d or close is None:
+                    continue
+                rows.append((d, r, close))
+        if rows:
+            rows.sort(key=lambda x: x[0])  # 日期升序
+            klines = _to_klines(rows)
+
+    if klines:
+        closes = [k.close for k in klines if k.close is not None]
+        last_close = closes[-1] if closes else None
+        last_open = klines[-1].open
+        if len(closes) > 1 and closes[-2]:
             last_pct = (closes[-1] - closes[-2]) / closes[-2] * 100
         rng30 = (closes[-1] - closes[0]) / closes[0] * 100 if len(closes) > 1 and closes[0] else None
 
-        klines = _to_klines(rows)
         quote = Quote(code=code, name=name, price=last_close, open=last_open)
 
         # 复用 technical.py 的一站式技术汇总 + 箱体判定
@@ -392,20 +403,18 @@ def main():
         if vp_signal:
             print(f"  {vp_signal}")
 
-        # 涨跌幅：查询结果常缺该字段，改由相邻收盘价计算
-        row_pct = {}
-        prev_c = None
-        for d, r, c in rows:
-            if prev_c:
-                row_pct[d] = (c - prev_c) / prev_c * 100
-            prev_c = c
+        # 涨跌幅：本地/妙想查询常缺该字段，改由相邻收盘价计算
+        show_n = min(days, len(klines))
+        window = klines[-show_n:]
+        prev_c = klines[-show_n - 1].close if len(klines) > show_n else None
 
-        print(f"  区间涨跌幅: {rng30:+.2f}%  |  日期 开 高 低 收 涨跌幅 换手")
-        for d, r, close in rows[-min(days, len(rows)):]:
-            o = _num(r.get("开盘价")); h = _num(r.get("最高价")); l = _num(r.get("最低价"))
-            pct = row_pct.get(d, _num(r.get("涨跌幅"))); tr = _num(r.get("换手率"))
-            print(f"    {d}  {_fmt_price(o)} {_fmt_price(h)} {_fmt_price(l)} {_fmt_price(close)} "
-                  f"{pct if pct is None else f'{pct:+.2f}%'}  {tr if tr is None else f'{tr:.2f}%'}")
+        print(f"  区间涨跌幅: {rng30:+.2f}%  |  日期 开 高 低 收 涨跌幅")
+        for k in window:
+            o, h, l, c = k.open, k.high, k.low, k.close
+            pct = (c - prev_c) / prev_c * 100 if (prev_c and c) else None
+            prev_c = c
+            print(f"    {k.date}  {_fmt_price(o)} {_fmt_price(h)} {_fmt_price(l)} {_fmt_price(c)} "
+                  f"{'—' if pct is None else f'{pct:+.2f}%'}")
     else:
         print("  ⚠️ 未查到 K 线数据")
 
@@ -591,6 +600,24 @@ def main():
     else:
         print("【5. 基本面（最新财报 + 机构预测净利 + 分红）】")
         print("=" * 72)
+        # 本地 duckdb 基本面快照（fin_* 三表本地算，优先）；失败/缺数据则不打印、继续走妙想
+        try:
+            from app.fundamental_local import financial_snapshot
+            fs = financial_snapshot(code, market)
+            if fs:
+                parts = []
+                for key, label, signed in (("roe", "ROE", False), ("gross_margin", "毛利率", False),
+                                           ("debt_ratio", "负债率", False), ("revenue_growth", "营收同比", True),
+                                           ("profit_growth", "净利同比", True)):
+                    v = fs.get(key)
+                    if v is not None:
+                        parts.append(f"{label} {v:+.2f}%" if signed else f"{label} {v:.2f}%")
+                if fs.get("act_cash_flow") is not None:
+                    parts.append(f"经营现金流 {fs['act_cash_flow'] / 1e8:+.2f}亿")
+                if parts:
+                    print("  本地快照: " + " | ".join(parts))
+        except Exception:
+            pass
         _FUND_COLS = ["净利润", "净利润同比增长率", "营业收入", "营业收入同比增长率",
                       "净资产收益率ROE(加权)", "销售毛利率", "资产负债率"]
         for t in mx.query_structured(
@@ -646,19 +673,37 @@ def main():
     if not is_etf:
         print()
         print("=" * 72)
-        print("【6. 估值分位（PE/PB + 3年历史百分位）】")
+        print("【6. 估值分位（PE/PB + 多窗口历史百分位）】")
         print("=" * 72)
-        for t in mx.query_structured(f"{code} {name} 市盈率 市净率 历史分位".strip()):
-            cols = t.get("columns") or []
-            rows_ = t.get("rows") or []
-            if not rows_:
-                continue
-            r = rows_[0]
-            title = t.get("title") or ""
-            label = "3年历史百分位" if ("百分位" in title or any("百分位" in c for c in cols)) else "当前估值"
-            cells = [f"{c}={r.get(c)}" for c in cols if c != "日期" and r.get(c)]
-            if cells:
-                print(f"  {label}: " + " | ".join(cells))
+        # 本地 duckdb 多窗口分位（3年/5年/上市以来，看背离）；失败回退妙想
+        local_val = None
+        try:
+            from app.fundamental_local import valuation_percentile_multi
+            local_val = valuation_percentile_multi(code, market)
+        except Exception:
+            local_val = None
+        if local_val:
+            for metric, key in (("PB", "pb_pct"), ("PE", "pe_pct")):
+                pcts = local_val.get(key) or {}
+                cells = [f"{label} {v:.1f}%" for label, v in pcts.items() if v is not None]
+                if cells:
+                    print(f"  本地 {metric} 分位: " + " | ".join(cells))
+            pb = local_val.get("pb"); pe = local_val.get("pe"); n = local_val.get("n")
+            pb_s = f"{pb:.2f}" if pb is not None else "—"
+            pe_s = f"{pe:.2f}" if pe is not None else "—"
+            print(f"  本地当前: PB {pb_s} / PE {pe_s}  |  历史 {n} 交易日")
+        else:
+            for t in mx.query_structured(f"{code} {name} 市盈率 市净率 历史分位".strip()):
+                cols = t.get("columns") or []
+                rows_ = t.get("rows") or []
+                if not rows_:
+                    continue
+                r = rows_[0]
+                title = t.get("title") or ""
+                label = "3年历史百分位" if ("百分位" in title or any("百分位" in c for c in cols)) else "当前估值"
+                cells = [f"{c}={r.get(c)}" for c in cols if c != "日期" and r.get(c)]
+                if cells:
+                    print(f"  {label}: " + " | ".join(cells))
 
     # ---- 7. 最近研报 + 一致预期（仅个股；ETF 无个股研报评级） ----
     if not is_etf:

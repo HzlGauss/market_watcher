@@ -71,14 +71,14 @@ def _percentile(series: list[Optional[float]], current: Optional[float]) -> Opti
     return below / len(valid) * 100.0
 
 
-def valuation_percentile(code: str, market: str = "") -> Optional[dict]:
-    """本地算 PE/PB 历史分位（读 valuation_daily），累积天数不足返回 None 由调用方回退妙想。
+# 估值分位窗口（交易日数）：3 年 ≈ 750 日，5 年 ≈ 1250 日。
+# 窗口太短会被近期周期绑架、太长会混进业务结构不同的年代；5 年为主力口径，3 年/上市以来作背离对照。
+_WINDOW_3Y = 750
+_WINDOW_5Y = 1250
 
-    返回 {pb_pct, pe_pct, pb, pe, n}：
-    - pb_pct/pe_pct 为 0~100 分位（越低越便宜）；任一算不出（当前为负/无正值历史）为 None。
-    - pb/pe 为最新快照原始值（本地收盘累积，非盘中实时），仅作参考，调用方通常仍用同花顺实时快照。
-    - n 为参与分位的历史交易日数。
-    """
+
+def _valuation_series(code: str, market: str = ""):
+    """读 valuation_daily 逐日 PE/PB 序列（升序）。返回 (rows, cur_pe, cur_pb) 或 None。"""
     db = _db_path()
     if not db.exists():
         return None
@@ -103,14 +103,54 @@ def valuation_percentile(code: str, market: str = "") -> Optional[dict]:
     if len(dates) < _MIN_HISTORY:
         return None
 
-    cur_pe, cur_pb = _f(rows[-1][1]), _f(rows[-1][2])
+    return rows, _f(rows[-1][1]), _f(rows[-1][2])
+
+
+def valuation_percentile(code: str, market: str = "", window_days: Optional[int] = None) -> Optional[dict]:
+    """本地算 PE/PB 历史分位（读 valuation_daily），累积天数不足返回 None 由调用方回退妙想。
+
+    window_days: 分位窗口（交易日数）；None = 上市以来全历史（默认，向后兼容）。
+
+    返回 {pb_pct, pe_pct, pb, pe, n}：
+    - pb_pct/pe_pct 为 0~100 分位（越低越便宜）；任一算不出（当前为负/无正值历史）为 None。
+    - pb/pe 为最新快照原始值（本地收盘累积，非盘中实时），仅作参考，调用方通常仍用同花顺实时快照。
+    - n 为参与分位的历史交易日数（受 window_days 截断）。
+    """
+    s = _valuation_series(code, market)
+    if s is None:
+        return None
+    rows, cur_pe, cur_pb = s
+    if window_days is not None:
+        rows = rows[-window_days:]
     return {
         "pb_pct": _percentile([_f(r[2]) for r in rows], cur_pb),
         "pe_pct": _percentile([_f(r[1]) for r in rows], cur_pe),
         "pb": cur_pb,
         "pe": cur_pe,
-        "n": len(dates),
+        "n": len(rows),
     }
+
+
+def valuation_percentile_multi(code: str, market: str = "") -> Optional[dict]:
+    """多窗口估值分位（3 年 / 5 年 / 上市以来），供诊股报告看「分位背离」。
+
+    返回 {pb, pe, n, pb_pct, pe_pct}：
+    - pb_pct/pe_pct 为 {窗口名: 0~100 分位} dict（越低越便宜）。
+    - 历史不足某窗口时该窗口退化为「上市以来」（即全部可用天数）。
+    - 两/三窗口背离越剧烈，越说明近期被重估，需回查重估原因再下「贵/便宜」结论。
+    """
+    s = _valuation_series(code, market)
+    if s is None:
+        return None
+    rows, cur_pe, cur_pb = s
+    windows = (("3年", _WINDOW_3Y), ("5年", _WINDOW_5Y), ("上市以来", None))
+    pb_pct: dict = {}
+    pe_pct: dict = {}
+    for label, wd in windows:
+        sub = rows[-wd:] if wd is not None else rows
+        pb_pct[label] = _percentile([_f(r[2]) for r in sub], cur_pb)
+        pe_pct[label] = _percentile([_f(r[1]) for r in sub], cur_pe)
+    return {"pb": cur_pb, "pe": cur_pe, "n": len(rows), "pb_pct": pb_pct, "pe_pct": pe_pct}
 
 
 def _prior_year_period(period_end: str) -> str:
