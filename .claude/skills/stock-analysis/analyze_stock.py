@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """个股分析数据包：用妙想（Miaoxiang）拉取个股的基本信息、近 N 日 K 线、
-近 5 日资金流、近 7 日资讯，并复用 technical.py 计算技术面（RSI/MACD/KDJ/BOLL/
-支撑压力/均线排列/箱体），再补筹码（机构持股+股东户数）、基本面（财报+预测+分红）、
+多日资金流（5/10/20/30 窗口）、近 7 日资讯，并复用 technical.py 计算技术面（RSI/MACD/KDJ/BOLL/
+支撑压力/均线排列/箱体），再补筹码（机构持股+机构类型分档+股东户数）、基本面（财报+预测+分红）、
 估值分位（PE/PB 三年百分位）、最近研报（评级+一致预期）。
 
 本脚本只负责「取数 + 算指标 + 信号化」，输出一份结构化数据包；走势预测与买卖
@@ -15,8 +15,8 @@
     名称   股票名称（可选，提升查询精度）
     天数   拉取的日 K 线根数（可选，默认 30，上限 60，建议 60 以覆盖 MA60/箱体）
 
-输出: 分 8 段——基本信息(含板块识别) / K线+技术面 / 资金流(含背离) /
-筹码与机构持股 / 基本面(含分红) / 估值分位 / 最近研报(含一致预期) / 资讯与事件风险。
+输出: 分 8 段——基本信息(含板块识别) / K线+技术面 / 多日资金流(多窗口+回流判断) /
+筹码与机构持股(含机构类型分档) / 基本面(含分红) / 估值分位 / 最近研报(含一致预期) / 资讯与事件风险。
 """
 import re
 import sys
@@ -95,6 +95,24 @@ def _row_main_net(r) -> float | None:
     if sup is None and lrg is None:
         return None
     return (sup or 0.0) + (lrg or 0.0)
+
+
+def _cum_main(flow_rows, n):
+    """flow_rows: [(日期, row_dict)] 按交易日倒序；返回前 n 日主力净流入累计（元）。"""
+    return sum(_parse_amount(r.get("主力净流入资金")) or 0 for _, r in flow_rows[:n])
+
+
+def _parse_shareholder_count(value):
+    """股东户数 -> 万户浮点数。兼容「1.148万户」「11480户」「11480」等格式。"""
+    if value is None:
+        return None
+    s = str(value).strip().replace(",", "")
+    is_wan = "万" in s
+    m = re.search(r"-?\d+\.?\d*", s)
+    if not m:
+        return None
+    v = float(m.group())
+    return v if is_wan else v / 1e4
 
 
 def _volume_price_signal(klines, last_pct) -> str | None:
@@ -418,12 +436,12 @@ def main():
     else:
         print("  ⚠️ 未查到 K 线数据")
 
-    # ---- 3. 近 5 日资金流 + 背离 ----
+    # ---- 3. 多日资金流（5/10/20/30 窗口）+ 背离 ----
     print()
     print("=" * 72)
-    print("【3. 近 5 日资金流（亿元，+净流入 / -净流出）】")
+    print("【3. 多日资金流（亿元，+净流入 / -净流出）】")
     print("=" * 72)
-    window = max(5, int(5 * 1.5) + 3)
+    window = max(30, int(30 * 1.5) + 3)
     q = (f"{code} {name} 近{window}日 资金流向 "
          f"主力净流入 超大单净流入 大单净流入 中单净流入 小单净流入").strip()
     flow_rows, seen = [], set()
@@ -439,13 +457,33 @@ def main():
             flow_rows.append((d, r))
     if flow_rows:
         flow_rows.sort(key=lambda x: x[0], reverse=True)
+        flow_rows = flow_rows[:30]
         print("  日期          主力     超大单   大单     中单     小单")
-        for d, r in flow_rows[:5]:
+        for d, r in flow_rows:
             cells = [_fmt_amount(_parse_amount(r.get(k))) for k in
                      ("主力净流入资金", "超大单净流入资金", "大单净流入资金", "中单净流入资金", "小单净流入资金")]
             print(f"  {d}  " + "  ".join(cells))
-        tot = sum((_parse_amount(r.get("主力净流入资金")) or 0) for _, r in flow_rows[:5])
-        print(f"  → 5 日主力累计净流入: {tot / 1e8:+.2f} 亿")
+        tot5 = _cum_main(flow_rows, 5)
+        tot10 = _cum_main(flow_rows, 10)
+        tot20 = _cum_main(flow_rows, 20)
+        tot30 = _cum_main(flow_rows, 30)
+        print(f"  → 主力累计净流入: 5日 {tot5 / 1e8:+.2f}亿 | 10日 {tot10 / 1e8:+.2f}亿"
+              f" | 20日 {tot20 / 1e8:+.2f}亿 | 30日 {tot30 / 1e8:+.2f}亿")
+
+        # 资金回流/出货判断（近5日 vs 前5日）
+        prev5 = _cum_main(flow_rows[5:10], 5) if len(flow_rows) >= 10 else None
+        if tot5 > 0 and prev5 is not None and tot5 > prev5:
+            print(f"  ✅ 资金回流确认: 近5日 {tot5 / 1e8:+.2f}亿 > 前5日 {prev5 / 1e8:+.2f}亿（资金加速进场）")
+        elif tot5 > 0 and prev5 is not None:
+            print(f"  ⚠️ 近5日净流入 {tot5 / 1e8:+.2f}亿 但弱于前5日 {prev5 / 1e8:+.2f}亿（回流力度放缓）")
+        elif tot5 > 0:
+            print(f"  ✅ 近5日主力净流入 {tot5 / 1e8:+.2f}亿，资金回流中")
+        elif tot5 < 0 and prev5 is not None and tot5 < prev5:
+            print(f"  ❌ 资金流出加剧: 近5日 {tot5 / 1e8:+.2f}亿 < 前5日 {prev5 / 1e8:+.2f}亿")
+        elif tot5 < 0:
+            print(f"  ⚠️ 近5日主力净流出 {tot5 / 1e8:+.2f}亿，资金尚未回流")
+        else:
+            print("  🔸 近5日资金面平淡")
 
         # 连续净流入/净流出天数
         sign, consec = None, 0
@@ -477,7 +515,7 @@ def main():
                 full_stage = T.detect_stage(
                     klines, ts,
                     main_inflow_1d=(latest_main / 1e8) if latest_main is not None else None,
-                    main_inflow_5d=(tot / 1e8) if tot else None,
+                    main_inflow_5d=(tot5 / 1e8) if tot5 else None,
                     price_change_1d=last_pct,
                 )
                 if full_stage.stage != "数据不足":
@@ -564,16 +602,37 @@ def main():
                         prev = v
             elif "股东户数" in title or any("股东户数" in c for c in cols):
                 print("  股东户数（减少=筹码集中）:")
-                nums = [(r.get("日期", ""), _parse_amount(r.get("股东户数"))) for r in rows_]
+                nums = [(r.get("日期", ""), _parse_shareholder_count(r.get("股东户数"))) for r in rows_]
                 nums = [(d, v) for d, v in nums if v is not None]
                 if nums:
                     latest_d, latest_v = nums[0]
-                    print(f"    最新 {latest_d}: {latest_v / 1e4:.2f} 万户")
+                    print(f"    最新 {latest_d}: {latest_v:.2f} 万户")
                     if len(nums) >= 2:
                         older_d, older_v = nums[-1]
                         chg_pct = (latest_v - older_v) / older_v * 100 if older_v else None
                         if chg_pct is not None:
                             print(f"    区间 {older_d}→{latest_d}: {chg_pct:+.1f}%（户数减少=筹码趋于集中）")
+
+        # 机构类型分档（合计/基金/保险/券商/其他 + 持仓家数/持仓股数/持股变化量/占流通股比例）
+        type_shown = 0
+        for t in mx.query_structured(f"{code} {name} 机构持股 机构类型 持仓家数 持仓股数 持股变化 占流通股比例".strip()):
+            cols = t.get("columns") or []
+            rows_ = t.get("rows") or []
+            if len(cols) < 2 or not rows_:
+                continue
+            label_col = cols[0]
+            type_cols = cols[1:]
+            labels = [str(r.get(label_col) or "") for r in rows_]
+            if not any(("持仓" in x) or ("持股" in x) or ("比例" in x) for x in labels):
+                continue
+            if type_shown >= 2:
+                break
+            print("  机构类型分档（合计/基金/保险/券商等）:")
+            for r in rows_:
+                lab = str(r.get(label_col) or "")
+                parts = [f"{c}={r.get(c) or '--'}" for c in type_cols]
+                print(f"    {lab}: " + "  ".join(parts))
+            type_shown += 1
 
     # ---- 5. 基本面 + 分红（个股）| 跟踪指数估值分位（ETF） ----
     print()
