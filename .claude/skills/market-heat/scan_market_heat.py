@@ -101,12 +101,13 @@ def _short(s, n=18) -> str:
 
 # ---------------------------------------------------------------- 数据拉取
 
-def _fetch_spot() -> list[dict]:
-    """拉全市场行情，返回按涨跌幅降序的 [{code,name,price,chg,amount,turnover,mktcap,industry}]。
+def _fetch_spot() -> tuple[list[dict], str]:
+    """拉全市场行情，返回 (按涨跌幅降序的 [{code,name,price,chg,amount,turnover,mktcap,industry}], 来源)。
 
-    东财 clist 断连/不完整（push2 IP 封锁）时回退同花顺全市场快照 + 本地名称/行业映射。
+    东财 clist 断连/截断（push2 IP 封锁）时回退同花顺全市场快照 + 本地名称/行业映射。
+    用 clist 的 total 精确判断是否拉满，而非硬编码阈值（截断在 4500~5500 之间会漏）。
     """
-    raw = _fetch_em_clist(_FS_ALL_A, _FIELDS, fid="f3")
+    raw, total = _fetch_em_clist(_FS_ALL_A, _FIELDS, fid="f3", with_total=True)
     items = []
     for it in raw:
         code = str(it.get("f12", "")).zfill(6)
@@ -124,10 +125,12 @@ def _fetch_spot() -> list[dict]:
             "industry": str(it.get("f100", "") or ""),
         })
     items.sort(key=lambda x: x["chg"], reverse=True)
-    if len(items) >= 4500:  # 全 A 股约 5500+，拉满才可信
-        return items
+    if total is not None and len(items) >= total:
+        return items, "东财clist"
     alt = _fetch_spot_hithink()
-    return alt if alt else items
+    if alt:
+        return alt, "同花顺兜底"
+    return items, "东财clist(不完整)"
 
 
 _name_cache: dict[str, str] | None = None
@@ -398,12 +401,14 @@ def main():
     print("  （非交易时段显示最近收盘数据）")
 
     # ---- 全市场行情 ----
-    items = _fetch_spot()
+    items, spot_source = _fetch_spot()
     if not items:
         print("❌ 全市场行情不可达（东财 clist 断连）")
         return 1
-    print(f"  全市场有效样本: {len(items)} 只")
-    if len(items) < 4500:  # 全 A 股约 5000+，分页被截断时跌幅榜/情绪面不可信
+    print(f"  全市场有效样本: {len(items)} 只  (行情源: {spot_source})")
+    if spot_source == "同花顺兜底":
+        print("  ⚠️ 东财 clist 不可达/截断，已回退同花顺快照：换手率/市值缺失（显示 --），名称/行业来自本地映射")
+    elif len(items) < 4500:  # 全 A 股约 5000+，分页被截断时跌幅榜/情绪面不可信
         print(f"  ⚠️ 全市场数据不完整（仅 {len(items)} 只，疑似分页截断，按涨跌幅降序只取到领涨段）")
         print("      → 涨幅榜可用，但跌幅榜 / 避坑方向 / 涨跌家数 / 涨跌停数可能缺失或失真")
 

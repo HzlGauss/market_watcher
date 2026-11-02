@@ -1565,7 +1565,8 @@ _EM_CLIST_HOSTS = (
 
 
 def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80,
-                    page_retries: int = 3, retry_backoff: float = 1.2) -> list[dict]:
+                    page_retries: int = 3, retry_backoff: float = 1.2,
+                    with_total: bool = False) -> list[dict] | tuple[list[dict], int | None]:
     """分页拉取东方财富 clist 接口，返回原始 item dict 列表
 
     clist 每页最多返回 100 条（pz 上限），按 fid 排序逐页拉取直至 total。
@@ -1575,6 +1576,10 @@ def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80,
     ``page_retries`` 次退避重试，尽量拉满 total，避免静默返回被截断的残缺列表。
     若最终仍不完整（分页截断），返回已拉取的部分并记 warning——全市场快照类
     调用方需按条目数（全 A 股约 5000+）自行判断广度/成交额是否可信。
+
+    with_total=True 时返回 ``(items, total)``，total 为接口声明的全市场总只数
+    （断连时为 None），供调用方用 ``len(items) >= total`` 精确判断是否拉满，
+    而非硬编码阈值。
     """
     params = {
         "pn": "1", "pz": "100", "po": "1", "np": "1",
@@ -1618,8 +1623,8 @@ def _fetch_em_clist(fs: str, fields: str, fid: str = "f12", max_pages: int = 80,
         if items:
             if total is not None and len(items) < total:
                 log.warning(f"clist 拉取不完整 {len(items)}/{total} (fs={fs[:40]})")
-            return items
-    return []
+            return (items, total) if with_total else items
+    return ([], None) if with_total else []
 
 
 # 行业映射缓存后台刷新（跨天机会性）：节流 + 单线程，push2 被封时静默失败、不阻塞调用方
