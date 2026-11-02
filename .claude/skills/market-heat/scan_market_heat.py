@@ -53,7 +53,11 @@ try:
 except Exception:
     pass
 
-from app.data_fetcher import _fetch_em_clist, fetch_sector_fund_flow_rank
+from app.data_fetcher import (
+    _fetch_em_clist,
+    fetch_sector_fund_flow_rank_with_fallback,
+    fetch_stock_industry_map,
+)
 from app.dragon_tiger import fetch_dragon_tiger_list
 
 # 东财 clist 全 A 股（沪深主板 + 创业板 + 科创板）
@@ -98,7 +102,10 @@ def _short(s, n=18) -> str:
 # ---------------------------------------------------------------- 数据拉取
 
 def _fetch_spot() -> list[dict]:
-    """拉全市场行情，返回按涨跌幅降序的 [{code,name,price,chg,amount,turnover,mktcap,industry}]。"""
+    """拉全市场行情，返回按涨跌幅降序的 [{code,name,price,chg,amount,turnover,mktcap,industry}]。
+
+    东财 clist 断连/不完整（push2 IP 封锁）时回退同花顺全市场快照 + 本地名称/行业映射。
+    """
     raw = _fetch_em_clist(_FS_ALL_A, _FIELDS, fid="f3")
     items = []
     for it in raw:
@@ -116,6 +123,75 @@ def _fetch_spot() -> list[dict]:
             "mktcap": _num(it.get("f20")),
             "industry": str(it.get("f100", "") or ""),
         })
+    items.sort(key=lambda x: x["chg"], reverse=True)
+    if len(items) >= 4500:  # 全 A 股约 5500+，拉满才可信
+        return items
+    alt = _fetch_spot_hithink()
+    return alt if alt else items
+
+
+_name_cache: dict[str, str] | None = None
+
+
+def _load_names() -> dict[str, str]:
+    """本地 duckdb dim_symbol 的 ticker→name 映射（同花顺快照不含名称，clist 断连时兜底）。"""
+    global _name_cache
+    if _name_cache is not None:
+        return _name_cache
+    _name_cache = {}
+    try:
+        import duckdb
+        from tools.marketdb_local import market_db_path
+        con = duckdb.connect(str(market_db_path()), read_only=True)
+        try:
+            _name_cache = {
+                str(t): str(n)
+                for t, n in con.execute(
+                    "SELECT ticker, name FROM dim_symbol WHERE asset_type='a-share'"
+                ).fetchall()
+            }
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return _name_cache
+
+
+def _fetch_spot_hithink() -> list[dict]:
+    """东财 clist 断连时的兜底：同花顺全市场快照（ticker/涨跌幅/成交额）+ 本地名称/行业映射。
+
+    同花顺快照无「换手率 / 市值」，这两列置 None（榜单显示 --）。
+    """
+    try:
+        from app import hithink
+        snap = hithink.fetch_all_market_snapshot()
+    except Exception:
+        return []
+    if not snap:
+        return []
+    names = _load_names()
+    items = []
+    for it in snap:
+        ticker = str(it.get("ticker") or "").strip()
+        chg = _num(it.get("price_change_ratio_pct"))
+        if not ticker or chg is None:
+            continue
+        code = ticker.zfill(6)
+        items.append({
+            "code": code,
+            "name": names.get(code, "") or ticker,
+            "price": _num(it.get("last_price")),
+            "chg": chg,
+            "amount": _num(it.get("turnover")),
+            "turnover": None,  # 同花顺快照无换手率
+            "mktcap": None,    # 同花顺快照无市值
+            "industry": "",
+        })
+    if not items:
+        return []
+    ind_map = fetch_stock_industry_map([x["code"] for x in items])
+    for x in items:
+        x["industry"] = ind_map.get(x["code"], "") or ""
     items.sort(key=lambda x: x["chg"], reverse=True)
     return items
 
@@ -150,14 +226,17 @@ def _fetch_lhb(industry_map: dict[str, str]):
 
 
 def _fetch_sector_flow(sector_type: str, top_n: int = 8):
-    """拉板块资金流，返回 (净流入 top, 净流出 top)。"""
+    """拉板块资金流（三级兜底），返回 (净流入 top, 净流出 top, 数据来源)。"""
     try:
-        flows = fetch_sector_fund_flow_rank("今日", sector_type)
+        flows, source = fetch_sector_fund_flow_rank_with_fallback("今日", sector_type)
     except Exception:
-        return [], []
+        return [], [], ""
+    if not flows:
+        return [], [], ""
     inflows = [f for f in flows if (f.main_net or 0) > 0][:top_n]
-    outflows = [f for f in flows if (f.main_net or 0) < 0][-top_n:]
-    return inflows, outflows
+    outflows = [f for f in flows if (f.main_net or 0) < 0]
+    outflows = sorted(outflows, key=lambda f: f.main_net)[:top_n]
+    return inflows, outflows, source
 
 
 # ---------------------------------------------------------------- 聚合
@@ -231,15 +310,17 @@ def _print_industry_agg(title: str, counts: list[tuple[str, int]]):
         print(f"  {ind:<14}{cnt:>3}  {bar}")
 
 
-def _print_sector_flow(title: str, inflows, outflows):
+def _print_sector_flow(title: str, inflows, outflows, source: str = ""):
     """打印板块资金流佐证。"""
     print()
     print("=" * 72)
     print(title)
     print("=" * 72)
     if not inflows and not outflows:
-        print("  ⚠️ 无板块资金流数据（接口不可达）")
+        print("  ⚠️ 无板块资金流数据（接口不可达且无缓存/兜底）")
         return
+    if source:
+        print(f"  数据来源: {source}")
     print("  ── 主力净流入 top ──")
     for f in inflows:
         print(f"    {_short(f.name, 14):<14} 净流入 {_fmt_yi(f.main_net):>8}  涨跌 {_fmt_pct(f.change_pct)}  主力股 {_short(f.top_stock, 10)}")
@@ -347,10 +428,10 @@ def main():
     _print_industry_agg("【5. 避坑方向聚合】（跌幅榜 + 龙虎榜净卖出 的行业聚集）", cold_counts)
 
     # ---- 板块资金流佐证 ----
-    concept_in, concept_out = _fetch_sector_flow("概念资金流")
-    industry_in, industry_out = _fetch_sector_flow("行业资金流")
-    _print_sector_flow("【6. 板块资金流佐证 · 概念板块（今日）】", concept_in, concept_out)
-    _print_sector_flow("【6. 板块资金流佐证 · 行业板块（今日）】", industry_in, industry_out)
+    concept_in, concept_out, concept_src = _fetch_sector_flow("概念资金流")
+    industry_in, industry_out, industry_src = _fetch_sector_flow("行业资金流")
+    _print_sector_flow("【6. 板块资金流佐证 · 概念板块（今日）】", concept_in, concept_out, concept_src)
+    _print_sector_flow("【6. 板块资金流佐证 · 行业板块（今日）】", industry_in, industry_out, industry_src)
 
     # ---- 关注度雷达（同花顺：飙升榜/热股榜/异动原因）----
     _print_attention()
