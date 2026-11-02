@@ -116,12 +116,109 @@ def _fetch_tencent_minute_kline(code: str, market: str, scale: int, days: int) -
     return []
 
 
+def _fetch_hk_daily_kline(code: str, days: int = 30) -> list[KlineData]:
+    """港股日 K 线：腾讯 fqkline（前复权）→ AKShare 东财港股兜底。
+
+    新浪 CN_MarketData 与同花顺均无港股口径，故港股独立走腾讯/东财港股源。
+    bar 顺序为 [日期, 开盘, 收盘, 最高, 最低, 成交量]。
+    """
+    code5 = str(code).zfill(5)
+    sym = f"hk{code5}"
+
+    # 腾讯日K（web.ifzq.gtimg.cn，前复权）
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{days},qfq"
+    try:
+        resp = sina_client._session.get(url, headers=_TENCENT_KLINE_HEADERS, timeout=10)
+        if resp is not None:
+            payload = resp.json()
+            node = ((payload.get("data") or {}).get(sym) or {})
+            bars = node.get("day") or node.get("qfqday") or []
+            if bars:
+                results = []
+                for bar in bars:
+                    if not isinstance(bar, (list, tuple)) or len(bar) < 6:
+                        continue
+                    results.append(KlineData(
+                        date=str(bar[0]),
+                        open=_sf(bar[1]),
+                        close=_sf(bar[2]),
+                        high=_sf(bar[3]),
+                        low=_sf(bar[4]),
+                        volume=_sf(bar[5]),
+                    ))
+                if results:
+                    return results
+    except Exception as e:
+        log.warning(f"腾讯港股日K获取失败 {code}: {e}")
+
+    # AKShare 东财港股日K兜底（前复权）
+    try:
+        import akshare as ak
+        df = ak.stock_hk_hist(symbol=code5, period="daily", adjust="qfq")
+        if df is not None and not df.empty:
+            df = df.tail(days).reset_index(drop=True)
+            results = []
+            for _, row in df.iterrows():
+                results.append(KlineData(
+                    date=str(row.get("日期", "")),
+                    open=_sf(row.get("开盘")),
+                    high=_sf(row.get("最高")),
+                    low=_sf(row.get("最低")),
+                    close=_sf(row.get("收盘")),
+                    volume=_sf(row.get("成交量")),
+                ))
+            if results:
+                return results
+    except ImportError:
+        pass
+    except Exception as e:
+        log.warning(f"AKShare港股日K获取失败 {code}: {e}")
+
+    log.warning(f"港股日K获取失败: {code}")
+    return []
+
+
+def _fetch_hk_minute_kline(code: str, scale: int, days: int = 2) -> list[KlineData]:
+    """港股分钟 K 线：仅 AKShare 东财源支持（新浪/腾讯分钟线均无港股口径）。"""
+    try:
+        import akshare as ak
+    except ImportError:
+        return []
+    period = {5: "5", 15: "15", 30: "30", 60: "60"}.get(scale)
+    if period is None:
+        return []
+    try:
+        df = ak.stock_hk_hist_min_em(symbol=str(code).zfill(5), period=period)
+        if df is None or df.empty:
+            return []
+        bars_per_day = 240 // scale if scale else 48
+        df = df.tail(max(days * bars_per_day, 120)).reset_index(drop=True)
+        results = []
+        for _, row in df.iterrows():
+            results.append(KlineData(
+                date=str(row.get("时间", "")),
+                open=_sf(row.get("开盘")),
+                high=_sf(row.get("最高")),
+                low=_sf(row.get("最低")),
+                close=_sf(row.get("收盘")),
+                volume=_sf(row.get("成交量")),
+            ))
+        if results:
+            return results
+    except Exception as e:
+        log.warning(f"港股分钟K线获取失败 {code}: {e}")
+    return []
+
+
 def _fetch_min5_remote(code: str, market: str) -> list[KlineData]:
     """远端拉 5 分钟 K 线（新浪 → 腾讯 → AKShare），供 min5_local 缓存层兜底。
 
     固定 scale=5 / days=2 / datalen=120，即原 fetch_historical_kline 对 scale<240
     生效的分钟线链路。返回空列表表示多源均失败。
     """
+    if market == "HK":
+        return _fetch_hk_minute_kline(code, 5, days=2)
+
     prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
     sina_code = f"{prefix}{code}"
     url = (
@@ -211,6 +308,12 @@ def fetch_historical_kline(code: str, market: str, days: int = 30, scale: int = 
         if remote:
             min5_local.write(code, market, remote)
         return remote
+
+    # 港股：新浪/同花顺日K、腾讯分钟K均无港股口径，独立走港股源
+    if market == "HK":
+        if scale >= 240:
+            return _fetch_hk_daily_kline(code, days)
+        return _fetch_hk_minute_kline(code, scale, days)
 
     prefix = {"SH": "sh", "SZ": "sz", "HK": "hk"}.get(market, "sh")
     sina_code = f"{prefix}{code}"

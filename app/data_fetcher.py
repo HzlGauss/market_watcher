@@ -60,6 +60,75 @@ def _parse_float(val: str | None) -> Optional[float]:
         return None
 
 
+def _parse_sina_quote(item: WatchItem, fields: list[str]) -> Optional[Quote]:
+    """将新浪实时行情的一行字段解析为 Quote（A 股 / 港股两套字段序）。
+
+    A 股字段序（32 字段）：名称,今开,昨收,现价,最高,最低,...,成交量(fields[8]),成交额(fields[9])
+    港股字段序（19 字段）：英文名,中文名,今开,昨收,最高,最低,现价,涨跌额,涨跌幅,买一,卖一,
+                          成交额(fields[11]),成交量(fields[12])  —— 成交额/成交量与 A 股顺序相反。
+    """
+    is_hk = item.market == "HK"
+
+    if is_hk:
+        # 港股仅 19 字段，长度不足 13 视为无效
+        if len(fields) < 13:
+            return None
+        name = fields[1].strip() or fields[0].strip() or ""
+        open_ = _parse_float(fields[2])
+        pre_close = _parse_float(fields[3])
+        high = _parse_float(fields[4])
+        low = _parse_float(fields[5])
+        price = _parse_float(fields[6])
+        vol_val = _parse_float(fields[12])
+        amt_val = _parse_float(fields[11])
+    else:
+        if len(fields) < 32:
+            return None
+        name = fields[0].strip() if fields[0] else ""
+        open_ = _parse_float(fields[1])
+        pre_close = _parse_float(fields[2])
+        price = _parse_float(fields[3])
+        high = _parse_float(fields[4])
+        low = _parse_float(fields[5])
+        vol_val = _parse_float(fields[8])
+        amt_val = _parse_float(fields[9])
+
+    change_amt: Optional[float] = None
+    change_pct: Optional[float] = None
+    if price is not None and pre_close is not None and pre_close != 0:
+        change_amt = round(price - pre_close, 3)
+        change_pct = round((price - pre_close) / pre_close * 100, 2)
+
+    amplitude: Optional[float] = None
+    if high is not None and low is not None and pre_close is not None and pre_close != 0:
+        amplitude = round((high - low) / pre_close * 100, 2)
+
+    # 分时均价（黄线）= 成交额 / 成交量
+    avg_price: Optional[float] = None
+    if vol_val and amt_val and vol_val > 0:
+        avg_price = round(amt_val / vol_val, 3)
+
+    return Quote(
+        code=item.code,
+        name=name,
+        type=item.type,
+        price=price,
+        change_pct=change_pct,
+        change_amt=change_amt,
+        pre_close=pre_close,
+        open=open_,
+        high=high,
+        low=low,
+        volume=vol_val,
+        amount=amt_val,
+        amplitude=amplitude,
+        avg_price=avg_price,
+        # 量比/换手率由腾讯补充（港股无该口径，保持 None）
+        turnover_rate=None,
+        volume_ratio=None,
+    )
+
+
 def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
     """批量获取实时行情（新浪财经 + 腾讯财经量比/换手率）
 
@@ -100,59 +169,16 @@ def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
                 continue
 
             fields = match.group(1).split(",")
-            if len(fields) < 32:
-                continue
-
             item = items[i]
-            pre_close = _parse_float(fields[2])
-            price = _parse_float(fields[3])
 
-            change_pct: Optional[float] = None
-            change_amt: Optional[float] = None
-            if price is not None and pre_close is not None and pre_close != 0:
-                change_amt = round(price - pre_close, 3)
-                change_pct = round((price - pre_close) / pre_close * 100, 2)
+            quote = _parse_sina_quote(item, fields)
+            if quote is None:
+                continue
+            results.append(quote)
 
-            high = _parse_float(fields[4])
-            low = _parse_float(fields[5])
-
-            amplitude: Optional[float] = None
-            if high is not None and low is not None and pre_close is not None and pre_close != 0:
-                amplitude = round((high - low) / pre_close * 100, 2)
-
-            name = fields[0].strip() if fields[0] else ""
-
-            # 计算分时均价（黄线）= 成交额 / 成交量
-            vol_val = _parse_float(fields[8])
-            amt_val = _parse_float(fields[9])
-            avg_price: Optional[float] = None
-            if vol_val and amt_val and vol_val > 0:
-                avg_price = round(amt_val / vol_val, 3)
-
-            # 量比在 fields[35]，换手率在 fields[37]
-            results.append(Quote(
-                code=item.code,
-                name=name,
-                type=item.type,
-                price=price,
-                change_pct=change_pct,
-                change_amt=change_amt,
-                pre_close=pre_close,
-                open=_parse_float(fields[1]),
-                high=high,
-                low=low,
-                volume=vol_val,
-                amount=amt_val,
-                amplitude=amplitude,
-                avg_price=avg_price,
-                # 新浪API不提供量比和换手率，稍后从腾讯API补充
-                turnover_rate=None,
-                volume_ratio=None,
-            ))
-
-        # 从腾讯财经补充量比和换手率
+        # 从腾讯财经补充量比和换手率（港股无腾讯量比/换手率口径，跳过）
         try:
-            tencent_data = fetch_tencent_data(items)
+            tencent_data = fetch_tencent_data([it for it in items if it.market != "HK"])
             code_map = {q.code: q for q in results}
             for code, data in tencent_data.items():
                 if code in code_map:
@@ -511,6 +537,11 @@ def _fetch_fund_flow_minute(code: str, market: str = "SH") -> Optional[FundFlowD
     return None  # 静默失败，调用方按空处理
 
 
+def _is_hk(code: str, market: str = "") -> bool:
+    """港股判定：market 显式 HK，或 5 位代码（A 股/北交所均为 6 位）。"""
+    return market == "HK" or len(str(code).strip()) == 5
+
+
 def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDetail]:
     """获取个股当日资金流向明细（超大单/大单/中单/小单）
 
@@ -529,6 +560,10 @@ def fetch_fund_flow_detail(code: str, market: str = "SH") -> Optional[FundFlowDe
     Returns:
         FundFlowDetail 或 None（静默失败）
     """
+    if _is_hk(code, market):
+        log.debug(f"港股 {code} 无个股资金流数据源，跳过")
+        return None
+
     # 优先分钟级实时接口（当日累计，交易时段/收盘后均返回当日数据）
     minute_flow = _fetch_fund_flow_minute(code, market)
     if minute_flow is not None:
@@ -666,6 +701,10 @@ def fetch_fund_flow_miaoxiang(code: str, market: str = "SZ", name: str = "") -> 
     Returns:
         FundFlowDetail 或 None（无 key / 查询失败 / 无数据）
     """
+    if _is_hk(code, market):
+        log.debug(f"港股 {code} 无妙想资金流数据源，跳过")
+        return None
+
     import os
     from app.miaoxiang import MXClient
 

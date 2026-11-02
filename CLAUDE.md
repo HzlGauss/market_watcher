@@ -183,6 +183,8 @@ The app reads from three sources (priority order):
 
 `Config.__init__` loads JSON then CSV and validates. Missing a required key produces a `ConfigValidationError`.
 
+港股标的用 5 位代码（前导零保留，如 `00700`），`market` 留空即自动识别为 HK，`type` 填 `其他` 使告警正常触发。
+
 ## Architecture
 
 Data flows through a **producer-consumer pattern** during monitor mode:
@@ -238,6 +240,7 @@ Monitor mode scans every N minutes (configurable, default 15). LLM is called eve
 - **No numpy/pandas** — all technical indicators are pure Python to keep dependencies minimal
 - **CSV-first** for watchlist and holdings — `Config` prefers CSV over JSON arrays; CSV is easier to edit manually
 - **Data source**: Sina Finance (quotes) + East Money (north flow, stock flow, dragon-tiger) with Tencent fallback for turnover/volume ratio
+- **港股支持**（最小可用）：报价 + 日/分钟 K 线（腾讯 `fqkline` + akshare `stock_hk_hist*`）。港股资金流/量比/换手率/两融无数据源、保持空（`data_fetcher._is_hk` 短路跳过）
 - **AKShare** is an optional dependency (`pip install akshare`) used for dragon-tiger board and K-line fallback
 - **LLM_BASE_URL** env var allows swapping DeepSeek for any OpenAI-compatible endpoint (local models, proxies)
 - **`_run_once_new()`** (shared pool) is the single scan loop used by monitor mode — reads quotes/K-lines from `SharedDataPool` (daily K via `fetch_daily_hybrid`), builds `tech_summaries` on daily K
