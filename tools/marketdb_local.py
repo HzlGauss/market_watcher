@@ -1382,9 +1382,11 @@ def _r(x, nd=2):
 def screen_bluechip(db=None) -> int:
     """全市场白马/蓝筹基本面筛选（纯本地 DuckDB，离线），落库 + CSV + 控制台排名表。
 
-    市值 = PB_MRQ(最新) × 净资产(最新年报)；ROE/增长用最新+上年年报；PB/PE 历史分位用
-    valuation_daily 全历史正值序列。分层：蓝筹（大盘+连续盈利+ROE 达标+估值不极端）→
-    白马（蓝筹基础上 ROE 更严 + 营收/净利正增长）。阈值全部来自 data/bluechip_config.json。
+    市值 = PB_MRQ(最新) × 净资产(最新年报)；ROE/连续盈利用最新+上年年报；营收/净利同比用
+    最新可得报告期 vs 上年同期（季报优先、年报兜底，避免被滞后近一年的年报口径误导）；
+    PB/PE 历史分位用 valuation_daily 全历史正值序列。分层：蓝筹（大盘+连续盈利+ROE 达标+
+    估值不极端）→ 白马（蓝筹基础上 ROE 更严 + 营收/净利正增长）。阈值全部来自
+    data/bluechip_config.json。
     """
     db_path = _db_path(db)
     if not db_path.exists():
@@ -1431,14 +1433,21 @@ years AS (
   SELECT i.thscode, MAX(i.period_end) AS cur_pe
   FROM inc i JOIN bal b ON b.thscode = i.thscode AND b.period_end = i.period_end
   GROUP BY i.thscode
+),
+grow AS (
+  SELECT thscode, period_end, operating_income, parent_holder_net_profit
+  FROM fin_income
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY thscode ORDER BY period_end DESC) = 1
 )
 SELECT y.thscode, s.ticker, s.name, s.exchange,
        v.pb_mrq, v.pe_ttm,
        ic.operating_income AS rev_cur, ic.operating_costs AS cost_cur,
        ic.parent_holder_net_profit AS np_cur,
-       ip.operating_income AS rev_prior, ip.parent_holder_net_profit AS np_prior,
+       ip.parent_holder_net_profit AS np_prior,
        bc.holder_equity_total AS eq_cur, bc.assets_total AS assets_cur,
-       bc.total_debt AS debt_cur, bp.holder_equity_total AS eq_prior
+       bc.total_debt AS debt_cur, bp.holder_equity_total AS eq_prior,
+       gc.operating_income AS rev_g_cur, gc.parent_holder_net_profit AS np_g_cur,
+       gp.operating_income AS rev_g_prior, gp.parent_holder_net_profit AS np_g_prior
 FROM years y
 JOIN val v ON v.thscode = y.thscode
 JOIN dim_symbol s ON s.thscode = y.thscode
@@ -1448,6 +1457,9 @@ LEFT JOIN inc ip ON ip.thscode = y.thscode
 JOIN bal bc ON bc.thscode = y.thscode AND bc.period_end = y.cur_pe
 LEFT JOIN bal bp ON bp.thscode = y.thscode
   AND bp.period_end = CAST(CAST(LEFT(y.cur_pe, 4) AS INTEGER) - 1 AS VARCHAR) || '-12-31'
+JOIN grow gc ON gc.thscode = y.thscode
+LEFT JOIN fin_income gp ON gp.thscode = y.thscode
+  AND gp.period_end = CAST(CAST(LEFT(gc.period_end, 4) AS INTEGER) - 1 AS VARCHAR) || SUBSTRING(gc.period_end, 5)
 WHERE s.asset_type = 'a-share' AND s.exchange IN ('SH', 'SZ')
 """
 
@@ -1480,17 +1492,20 @@ GROUP BY v.thscode
     lanchou: list[dict] = []
     for r in rows:
         (thscode, ticker, name, exchange, pb_mrq, pe_ttm,
-         rev_cur, cost_cur, np_cur, rev_prior, np_prior,
-         eq_cur, assets_cur, debt_cur, eq_prior) = r
+         rev_cur, cost_cur, np_cur, np_prior,
+         eq_cur, assets_cur, debt_cur, eq_prior,
+         rev_g_cur, np_g_cur, rev_g_prior, np_g_prior) = r
         name = name or ""
         if exclude_st and ("ST" in name.upper() or "退" in name):
             continue
         pb_mrq = _num(pb_mrq); pe_ttm = _num(pe_ttm)
         eq_cur = _num(eq_cur); eq_prior = _num(eq_prior)
         np_cur = _num(np_cur); np_prior = _num(np_prior)
-        rev_cur = _num(rev_cur); rev_prior = _num(rev_prior)
+        rev_cur = _num(rev_cur)
         cost_cur = _num(cost_cur)
         assets_cur = _num(assets_cur); debt_cur = _num(debt_cur)
+        rev_g_cur = _num(rev_g_cur); np_g_cur = _num(np_g_cur)
+        rev_g_prior = _num(rev_g_prior); np_g_prior = _num(np_g_prior)
 
         mkt = pb_mrq * eq_cur / 1e8 if (pb_mrq and eq_cur and pb_mrq > 0 and eq_cur > 0) else None
         if mkt is None or mkt < mc:
@@ -1510,8 +1525,8 @@ GROUP BY v.thscode
         if pb_pct is not None and pb_pct > pb_pct_max:
             continue
 
-        rev_g = _growth(rev_cur, rev_prior)
-        np_g = _growth(np_cur, np_prior)
+        rev_g = _growth(rev_g_cur, rev_g_prior)
+        np_g = _growth(np_g_cur, np_g_prior)
         rec = {
             "thscode": thscode, "ticker": ticker, "name": name, "exchange": exchange,
             "market_cap_yi": mkt, "roe_cur": roe_cur, "roe_prior": roe_prior,
@@ -1594,7 +1609,7 @@ CREATE TABLE IF NOT EXISTS bluechip_screen (
     print()
     print(f"  合计 {len(baima) + len(lanchou)} 只（白马 {len(baima)} / 蓝筹 {len(lanchou)}）")
     print(f"  ✅ 已落库 bluechip_screen（{len(baima) + len(lanchou)} 行）+ CSV: {csv_path}")
-    print("  说明: 市值=PB×净资产估算；ROE=最新年报归母净利/归母净资产；分位=当前值在10年估值历史中的百分位（越低越便宜）")
+    print("  说明: 市值=PB×净资产估算；ROE=最新年报归母净利/归母净资产；营收/净利同比=最新报告期 vs 上年同期（季报优先）；分位=当前值在10年估值历史中的百分位（越低越便宜）")
     return 0
 
 
