@@ -377,24 +377,28 @@ def _fund_gate(f: dict) -> tuple[str, str]:
     return "✅ 通过", "估值+基本面 双过"
 
 
-def _fundamental_check(results, top: int) -> None:
-    """对 top 候选跑估值分位 + 净利同比 + ROE 确定性门槛。"""
+def _init_mx():
+    """初始化妙想客户端（无 MX_APIKEY 返回 None）。"""
     try:
         from app.config import Config
         from app.utils import load_env
     except Exception:
-        return
-    mx = None
+        return None
     try:
         load_env(_ROOT)
         config = Config(_ROOT / "watchlist_config.json")
         keys = config.mx_apikeys
         if keys:
             from app.miaoxiang import MXClient
-            mx = MXClient(keys)
+            return MXClient(keys)
     except Exception:
-        mx = None
+        pass
+    return None
 
+
+def _fundamental_check(results, top: int) -> None:
+    """对 top 候选跑估值分位 + 净利同比 + ROE 确定性门槛。"""
+    mx = _init_mx()
     n_fund = min(top, len(results), 10)
     print()
     print("=" * 72)
@@ -421,6 +425,42 @@ def _fundamental_check(results, top: int) -> None:
     print("  （白名单/CSV 输入直接复用其自带 ROE/净利同比/PB分位 快照；板块/行业输入由本地库+同花顺直供、")
     print("   PB 历史分位优先本地逐日累积、不足回退妙想，缺失时显示 --）")
     print("  仅 ✅通过 才值得进一步看买点；❌/⚠️/待查 建议排除或人工补查后观望。")
+
+
+def _fundamental_check_deep(deep_results, top: int) -> None:
+    """对「深度超阈值(>45%)」候选同样跑估值分位 + 净利同比 + ROE 门槛（仅标注，不升格）。
+
+    left-side 回测结论与 golden-pit 相反：深跌≥40% 多为暴雷、fut20 最差，故深坑组不升格、
+    只做基本面标注，把极少数「深跌但基本面未坏（可能是深度错杀，而非暴雷）」的票浮出来，
+    供人工判断是否转交 golden-pit 细看。复用白名单 fund_csv 快照，免网络。
+    """
+    if not deep_results:
+        return
+    mx = _init_mx()
+    n_deep = min(len(deep_results), top, 20)
+    print()
+    print("=" * 72)
+    print(f"深度超阈值(>45%)基本面标注（前 {n_deep} 名，仅标注不升格）")
+    print("=" * 72)
+    print(f"  {'代码':<8}{'名称':<10}{'回撤%':>7}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
+    print("  " + "-" * 70)
+    for r in deep_results[:n_deep]:
+        fc = r.get("fund_csv")
+        if fc and any(v is not None for v in (fc.get("pb_pct"), fc.get("roe"), fc.get("profit_growth"))):
+            f = {"pb_pct": fc.get("pb_pct"), "roe": fc.get("roe"), "profit_growth": fc.get("profit_growth")}
+        else:
+            f = _fetch_fundamental(mx, r["name"], r["code"])
+        r["fund"] = f
+        r["fund_verdict"] = _fund_gate(f)
+        label, note = r["fund_verdict"]
+        pb_txt = f"{f['pb_pct']:.1f}%" if f["pb_pct"] is not None else " --"
+        roe_txt = f"{f['roe']:.1f}%" if f["roe"] is not None else " --"
+        pg_txt = f"{f['profit_growth']:.1f}%" if f["profit_growth"] is not None else " --"
+        print(f"  {r['code']:<8}{r['name']:<10}{r['dd']:>7.1f}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label}"
+              + (f"  {note}" if note and note != "估值+基本面 双过" else ""))
+    print()
+    print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
+    print("  ✅通过 的深坑股是少数「深度错杀」，值得人工判断是否转交 golden-pit 细看；❌/⚠️ 是暴雷或仍贵，勿接飞刀。")
 
 
 # ---------------------------------------------------------------- 本地库 streaks 初筛
@@ -615,6 +655,7 @@ def main():
         print("  说明: 站半年线(MA120)✅ + 缩量比<1.0 = 更可能是「深度错杀」，值得进一步查基本面。")
 
     _fundamental_check(results, top)
+    _fundamental_check_deep(deep_results, top)
     return 0
 
 

@@ -715,6 +715,44 @@ def _fundamental_check(results, top: int) -> None:
     print("  仅 ✅通过 才对单只跑 analyze_golden_pit.py 细看买点/止损；❌/⚠️/待查 建议排除或人工补查后观望。")
 
 
+def _fundamental_check_deep(deep_results, top: int) -> None:
+    """对「深度超阈值(>45%)」候选同样跑估值分位 + 净利同比 + ROE 确定性门槛。
+
+    回测结论：深度坑(>45%)全 regime 有效，但技术面筛不动（站半年线+缩量的几乎为 0），
+    只能靠基本面门槛拆「深度错杀 vs 深度暴雷」。全市场模式已内置此步(_fundamental_gate_b1)；
+    白名单/CSV/板块模式此前漏了这步、把深坑整组当「疑似暴雷」冷落。这里补齐，复用
+    白名单 fund_csv 快照（免网络），在深度回调市里让「基本面未坏、估值仍低的白马被砸过
+    45%」浮上来——这正是黄金坑要找的深度错杀。
+    """
+    if not deep_results:
+        return
+    mx = _init_mx()
+    n_fund = min(len(deep_results), 20)
+    print()
+    print("=" * 72)
+    print(f"深度超阈值(>45%)基本面门槛（前 {n_fund} 名，本地库 + 妙想）")
+    print("=" * 72)
+    print(f"  {'代码':<8}{'名称':<10}{'回撤%':>7}{'PB分位':>8}{'ROE':>8}{'净利同比':>10}  门槛判定")
+    print("  " + "-" * 70)
+    for r in deep_results[:n_fund]:
+        fc = r.get("fund_csv")
+        if fc and any(v is not None for v in (fc.get("pb_pct"), fc.get("roe"), fc.get("profit_growth"))):
+            f = {"pb_pct": fc.get("pb_pct"), "roe": fc.get("roe"), "profit_growth": fc.get("profit_growth")}
+        else:
+            f = _fetch_fundamental(mx, r["name"], r["code"])
+        r["fund"] = f
+        r["fund_verdict"] = _fund_gate(f)
+        label, note = r["fund_verdict"]
+        pb_txt = f"{f['pb_pct']:.1f}%" if f["pb_pct"] is not None else " --"
+        roe_txt = f"{f['roe']:.1f}%" if f["roe"] is not None else " --"
+        pg_txt = f"{f['profit_growth']:.1f}%" if f["profit_growth"] is not None else " --"
+        print(f"  {r['code']:<8}{r['name']:<10}{r['dd']:>7.1f}{pb_txt:>8}{roe_txt:>8}{pg_txt:>10}  {label}"
+              + (f"  {note}" if note and note != "估值+基本面 双过" else ""))
+    print()
+    print("  门槛规则: ❌真跌(净利同比<0) / ⚠️估值高(PB分位>70) / ⚠️成色弱(ROE<8) / --待查(PB分位缺失) / ✅通过")
+    print("  ✅通过 的深坑股是「深度错杀」候选，值得对单只跑 analyze_golden_pit.py 细看；❌/⚠️ 是基本面坏了或仍贵，抄底是接飞刀。")
+
+
 # 基本面兜底判定分级（❌真跌最重 → --待查最轻），用于 B1 暴雷组排序。
 _FUND_SEVERITY = {"❌ 真跌": 0, "⚠️ 估值高": 1, "⚠️ 成色弱": 2, "-- 待查": 3}
 
@@ -1011,6 +1049,7 @@ def main():
         _fundamental_gate_b1(results, deep_results, top)
     else:
         _fundamental_check(results, top)
+        _fundamental_check_deep(deep_results, top)
     return 0
 
 
