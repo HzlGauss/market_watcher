@@ -20,6 +20,7 @@
 """
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免 Windows 控制台中文乱码
@@ -444,17 +445,43 @@ def main():
     window = max(30, int(30 * 1.5) + 3)
     q = (f"{code} {name} 近{window}日 资金流向 "
          f"主力净流入 超大单净流入 大单净流入 中单净流入 小单净流入").strip()
-    flow_rows, seen = [], set()
+    # 妙想对「近N日资金流向」的返回结构不稳定：5 档常被拆到多张表，且部分列名带
+    # 「(区间)」前缀（如 (区间)主力净流入资金，实测为逐日值、与超大单+大单一致）。
+    # 这里跨表按日期合并、剥前缀后再算主力，避免丢列导致整行被跳过。
+    _TIER_KEYS = ("主力净流入资金", "超大单净流入资金", "大单净流入资金", "中单净流入资金", "小单净流入资金")
+    merged: dict[str, dict] = {}
     for t in mx.query_structured(q):
         for r in t.get("rows") or []:
             d = _norm_date(r.get("日期"))
-            main = _row_main_net(r)
-            if not d or main is None or d in seen:
+            if not d:
                 continue
-            seen.add(d)
-            if "主力净流入资金" not in r:
-                r["主力净流入资金"] = main
-            flow_rows.append((d, r))
+            row = merged.setdefault(d, {})
+            for k, v in r.items():
+                k = str(k)
+                if k.startswith("(") and ")" in k:  # 剥「(区间)」前缀
+                    k = k.split(")", 1)[1]
+                if k in _TIER_KEYS and row.get(k) is None:
+                    row[k] = v
+    flow_rows = []
+    for d, row in merged.items():
+        main = _row_main_net(row)
+        if main is None:
+            continue
+        if "主力净流入资金" not in row:
+            row["主力净流入资金"] = main
+        flow_rows.append((d, row))
+    flow_rows.sort(key=lambda x: x[0], reverse=True)
+    flow_rows = flow_rows[:30]
+    if not flow_rows:
+        # 结构化多日数据拿不到（妙想限频/口径差异）时，退化为单日资金流兜底。东财
+        # push2/push2his 全系在本机被 IP 封锁，故仍走妙想 stock_fund_flow 保当日 5 档。
+        detail = mx.stock_fund_flow(code, name)
+        if detail is not None:
+            row = {"主力净流入资金": detail.main_net, "超大单净流入资金": detail.super_large_net,
+                   "大单净流入资金": detail.large_net, "中单净流入资金": detail.medium_net,
+                   "小单净流入资金": detail.small_net}
+            if _row_main_net(row) is not None:
+                flow_rows = [(date.today().strftime("%Y-%m-%d"), row)]
     if flow_rows:
         flow_rows.sort(key=lambda x: x[0], reverse=True)
         flow_rows = flow_rows[:30]
