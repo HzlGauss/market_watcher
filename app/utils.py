@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
@@ -47,14 +48,19 @@ def setup_logger(
     ))
     logger.addHandler(console_handler)
     
-    # 文件处理器（可选）
-    if log_file:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-        logger.addHandler(file_handler)
+    # 文件处理器：默认落盘 logs/watcher.log（按 5MB×5 滚动），便于回溯盯盘问题
+    if log_file is None:
+        log_file = Path(__file__).resolve().parent.parent / "logs" / "watcher.log"
+    log_file = Path(log_file)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    file_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(file_handler)
     
     return logger
 
