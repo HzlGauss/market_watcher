@@ -143,7 +143,25 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 
 # Closing recap (收盘复盘：holdings.csv show_flow=1 标的 走势+资金流+技术阶段 → 短期操作结论+写 memory)
 py .claude/skills/closing-recap/recap_holdings.py
+
+# Local data unified query (本地数据统一查询：基本面/估值分位/日K/资金流/5分钟K 一条命令)
+py tools/local_query.py <代码> [名称] [日K天数]
 ```
+
+## 本地数据优先（先查本地，勿外网搜）
+
+**查个股/ETF 的基本面（ROE/毛利率/净利同比）、估值历史分位（PE/PB）、历史日K、当日资金流、5分钟K 时，一律先查本地 DuckDB，本地没有再走远端（妙想/同花顺/新浪/WebSearch）。** 本地数据源速查：
+
+| 数据 | 位置 | 读法 |
+|---|---|---|
+| 基本面（ROE/毛利率/负债率/营收/净利同比/经营现金流） | `data/market.duckdb`（fin_income/balance/cashflow） | `app/fundamental_local.financial_snapshot(code)` |
+| 估值历史分位（PB/PE 3年/5年/上市以来） | `data/market.duckdb`（valuation_daily，历史回填到 2018 起） | `app/fundamental_local.valuation_percentile_multi(code)` |
+| 历史日K（前复权） | `data/market.duckdb`（raw_kline_daily + 复权因子） | `app/kline_local.fetch_daily_local_first(code, market)` |
+| 当日资金流（五档净流入时序） | `data/fund_flow_intraday.duckdb` | `app/intraday_store.latest_snapshot(code)` |
+| 5分钟K（保留15自然日） | `data/min5.duckdb` | `app/min5_local.read_history(code, market)` |
+| 行业景气落库 | `data/sector_beta.duckdb` | sector-beta skill |
+
+一键查全部：`py tools/local_query.py <代码> [名称] [日K天数]`。三张报表同步到最新报告期、估值逐日同步到当日，故「净利同比 / PB分位」这类对比先跑本地，别去 WebSearch。
 
 ## Skills
 
