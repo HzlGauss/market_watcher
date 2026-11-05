@@ -140,6 +140,9 @@ py .claude/skills/dragon-pullback/backtest_dragon_pullback.py [回测日期数]
 py .claude/skills/left-side/backtest_left_side.py [回测日期数]
 py .claude/skills/right-side/backtest_right_side.py [回测日期数]
 py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
+
+# Closing recap (收盘复盘：holdings.csv show_flow=1 标的 走势+资金流+技术阶段 → 短期操作结论+写 memory)
+py .claude/skills/closing-recap/recap_holdings.py
 ```
 
 ## Skills
@@ -172,6 +175,7 @@ py .claude/skills/intraday-signal/backtest_intraday.py [回测日期数]
 - **`t0-query`** — 做T信号快照查询：读取做T监控线程写入的 `state/t0_signals.json`，输出某标的当前的买/卖挂单价、支撑位、压力位、盈亏比与触发时间，或列出当前所有做T信号。用户问「XX 现在做T该挂多少钱买/卖」「XX 的支撑压力在哪」「当前有哪些做T信号」时使用。纯读 JSON、零依赖零网络，需先启动做T监控（快照由 `T0MonitorThread` 每轮扫描覆盖写）。详见 `.claude/skills/t0-query/SKILL.md`。
 - **`sector-beta`** — 行业景气雷达：用「牛股密度（行业近 250 日翻倍股占比）+ 板块动量（10 日涨跌）+ 主力资金流（10 日净流入）」三信号给全市场行业打分排名，输出主线行业；每次结果落库 `data/sector_beta.duckdb`，`--history` 看持续性/轮动/新晋。用户问「现在主线行业是什么」「哪些行业有大机会/持续性」「行业轮动到哪了」「哪个行业牛股多」时使用。自上而下选行业（行业 beta 是牛股主因）。不依赖 `MX_APIKEY`，需本地 duckdb（miniconda python）。详见 `.claude/skills/sector-beta/SKILL.md`。
 - **`holdings-news`** — 持仓个股消息面扫描（利好/利空）：读 holdings.csv 里的普通 A 股个股（排除 ETF/基金），逐只用妙想拉新闻/公告/研报，再由 DeepSeek 判定净方向（利好/利空/中性）+ 强度 + 关键事件，按「利空→利好→中性、强→弱」排序输出。用户问「我的持仓有没有消息/公告」「持仓哪些有利好/利空」「持仓股最近有什么大事」时使用。详见 `.claude/skills/holdings-news/SKILL.md`。
+- **`closing-recap`** — 收盘复盘 + 短期操作（重点持仓）：读 holdings.csv 里 `show_flow=1` 的标的（个股+ETF），逐只做轻量复盘（今日收盘价/涨跌幅 + 技术阶段 + 主力资金方向），生成短期操作结论并更新进 memory 合并单文件 `holdings-closing-recap.md`。今日快照用 `state/close_drift_latest.json`（收盘竞价定盘价）、今日主力用 `data/fund_flow_intraday.duckdb`（落库到尾盘 ≥14:45 才用，否则回退妙想全天口径），近5日/连续天数/ETF净申购走妙想兜底。用户问「收盘复盘」「我的重点持仓今天怎么样」「短期怎么操作」「把今天复盘写进 memory」时使用。详见 `.claude/skills/closing-recap/SKILL.md`。
 
 ## Configuration
 

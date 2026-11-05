@@ -491,7 +491,7 @@ def _fetch_fund_flow_minute(code: str, market: str = "SH") -> Optional[FundFlowD
                 except requests.exceptions.RequestException:
                     if attempt == 2:
                         raise
-                    time.sleep(1.5 * (attempt + 1))
+                    time.sleep(2.0 * (2 ** attempt))  # 指数退避 2s/4s/8s，降低封禁触发
             if resp is None or resp.status_code != 200:
                 continue
             data = resp.json().get("data")
@@ -686,6 +686,9 @@ def _fetch_fund_flow_sina(code: str, market: str = "SH") -> Optional[FundFlowDet
         return None  # 静默失败
 
 
+_mx_flow_client = None  # 妙想兜底复用 client（保留失效 key 状态，跨调用禁用额度用尽的 key）
+
+
 def fetch_fund_flow_miaoxiang(code: str, market: str = "SZ", name: str = "") -> Optional[FundFlowDetail]:
     """妙想（东方财富 Miaoxiang）兜底：查询个股当日实时资金流向（4 档分类）
 
@@ -711,8 +714,12 @@ def fetch_fund_flow_miaoxiang(code: str, market: str = "SZ", name: str = "") -> 
     keys = [k for k in (os.environ.get("MX_APIKEY"), os.environ.get("MX_APIKEY_2")) if k]
     if not keys:
         return None
-    client = MXClient(keys)
-    flow = client.stock_fund_flow(code, name)
+    # 复用模块级 client：跨调用保留失效 key 状态（额度用尽 113 的 key 持续禁用），
+    # 避免每次新建导致 _disabled_keys 重置、反复重试已失效 key。多 key 轮换 + 限频重试在 MXClient._post 内处理。
+    global _mx_flow_client
+    if _mx_flow_client is None:
+        _mx_flow_client = MXClient(keys)
+    flow = _mx_flow_client.stock_fund_flow(code, name)
     if flow is not None:
         flow.source = "miaoxiang"
     return flow
@@ -1462,8 +1469,8 @@ class BackgroundDataCache:
             if self._stop_event.is_set():
                 return
             time.sleep(1)
-        # 主力净流入刷新间隔更长（600秒=10分钟），因为API容易被屏蔽
-        flow_interval = 600
+        # 主力净流入刷新间隔更长（900秒=15分钟），因为东财 fflow 是 IP 级封禁、易被屏蔽
+        flow_interval = 900
         while not self._stop_event.is_set():
             try:
                 self._refresh_flow()
@@ -1515,10 +1522,15 @@ class BackgroundDataCache:
             self._last_update = time.time()
 
     def _refresh_flow(self) -> None:
-        """刷新资金流向明细（东财主源，反爬不稳定时回退妙想；静默失败）"""
+        """刷新资金流向明细（东财主源，反爬不稳定时回退妙想；静默失败）
+
+        东财 fflow 为 IP 级封禁（RemoteDisconnected 间歇窗口），连续多只失败即判进入
+        封禁窗口，提前结束本轮，避免空转剩余标的进一步加剧封禁。
+        """
         if not self._items:
             return
 
+        consecutive_fail = 0
         for item in self._items:
             if self._stop_event.is_set():
                 return
@@ -1540,12 +1552,19 @@ class BackgroundDataCache:
                 cached = self._cache.get(code) or {}
             # 落库日内时序（含来源标注），供 skill 复用当日盘中历史
             if detail is not None:
+                consecutive_fail = 0
                 try:
                     from app.intraday_store import write_snapshot
                     write_snapshot(code, item.name, detail, cached)
                 except Exception:
                     pass  # 落库失败不影响盯盘主流程
-            time.sleep(1.0 + random.random() * 0.4)  # 请求间隔 1.0~1.4s 随机抖动，避免规律性触发限频
+            else:
+                consecutive_fail += 1
+                # 连续多只失败 → 判进入东财封禁窗口，本轮提前结束（避免空转加剧封禁）
+                if consecutive_fail >= 4:
+                    log.warning(f"资金流连续 {consecutive_fail} 只抓取失败，疑似东财 fflow 封禁窗口，本轮提前结束")
+                    return
+            time.sleep(2.0 + random.random() * 2.0)  # 请求间隔 2~4s 随机抖动，降低触发 IP 封禁概率
 
 
 # ============================================================
