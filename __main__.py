@@ -1270,7 +1270,7 @@ def main() -> None:
                 report_lines = [format_dragon_tiger_report(summary)]
 
                 if analyses:
-                    seat_report = generate_seat_report(analyses)
+                    seat_report = generate_seat_report(analyses, date=summary.date)
                     report_lines.append("\n---\n")
                     report_lines.append(seat_report)
 
@@ -1337,10 +1337,14 @@ def main() -> None:
                         log.warning(f"Agent 挖掘异常: {e}")
                         print(f"  {Color.YELLOW}⚠️ Agent 挖掘异常: {e}{Color.RESET}")
 
-                # 5. 写入报告
+                # 5. 写入报告（文件名按龙虎榜真实交易日，避免 T+1 数据配生成日造成错配）
                 full_report = "\n".join(report_lines)
                 from pathlib import Path
-                dt_report_path = REPORT_DIR / f"dragon_tiger_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+                trade_date_tag = (summary.date or "").replace("-", "")
+                if trade_date_tag:
+                    dt_report_path = REPORT_DIR / f"dragon_tiger_{trade_date_tag}_{datetime.now().strftime('%H%M')}.md"
+                else:
+                    dt_report_path = REPORT_DIR / f"dragon_tiger_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
                 dt_report_path.write_text(full_report, encoding='utf-8')
 
                 elapsed = _time.time() - _start

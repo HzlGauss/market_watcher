@@ -283,15 +283,23 @@ def _load_history() -> dict[str, list]:
         return {}
 
 
+def _records_trade_date(records: list) -> str:
+    """从龙虎榜记录里取真实交易日，缺省回退到当前日期。"""
+    for r in records:
+        if getattr(r, "trade_date", ""):
+            return r.trade_date
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def _save_history(records: list, max_days: int = 20):
     """保存龙虎榜历史记录（保留最近 N 个交易日）"""
     import json
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    trade_date = _records_trade_date(records)
     history = _load_history()
 
-    # 添加今日记录
-    history[today] = [
+    # 按龙虎榜真实交易日记录（T+1 披露，早于生成时刻属正常）
+    history[trade_date] = [
         {
             "code": r.code,
             "name": r.name,
@@ -299,7 +307,7 @@ def _save_history(records: list, max_days: int = 20):
             "change_pct": r.change_pct,
             "total_trade": r.total_trade,
             "reason": r.reason,
-            "date": today,
+            "date": trade_date,
         }
         for r in records
     ]
@@ -327,8 +335,9 @@ def detect_consecutive_listings(
     # 保存本次数据
     _save_history(records)
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = _records_trade_date(records)
+    _today_dt = datetime.strptime(today, "%Y-%m-%d")
+    yesterday = (_today_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
     history = _load_history()
 
@@ -358,7 +367,7 @@ def detect_consecutive_listings(
         if last.get("date", "") != yesterday:
             # 允许跳过周末
             last_date = datetime.strptime(last.get("date", ""), "%Y-%m-%d")
-            days_gap = (datetime.now() - last_date).days
+            days_gap = (_today_dt - last_date).days
             if days_gap > 3:  # 超过3天就不是连续了
                 continue
 
@@ -695,18 +704,20 @@ def _safe_int(val, default=0):
 # 报告生成
 # ============================================================
 
-def generate_seat_report(analyses: list[SeatAnalysis]) -> str:
+def generate_seat_report(analyses: list[SeatAnalysis], date: str = "") -> str:
     """生成席位级龙虎榜深度分析报告（Markdown）
 
     Args:
         analyses: SeatAnalysis 列表（已排序）
+        date: 龙虎榜真实交易日（YYYY-MM-DD），空则回退当前日期
 
     Returns:
         Markdown 格式报告
     """
     now = datetime.now()
+    report_date = date or now.strftime("%Y-%m-%d")
     lines = [
-        f"## 🐉 席位级龙虎榜深度分析（{now.strftime('%Y-%m-%d')}）",
+        f"## 🐉 席位级龙虎榜深度分析（{report_date}）",
         f"",
         f"**分析样本**: {len(analyses)} 只上榜个股",
         f"**席位分类**: 机构专用 | 沪深股通 | 知名游资 | 量化 | 散户(拉萨) | 普通",

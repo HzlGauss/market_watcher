@@ -767,10 +767,12 @@ class DragonTigerRecord:
         buy_seats: 买入前5席位
         sell_seats: 卖出前5席位
         main_net_inflow: 主力净流入（元）
+        trade_date: 龙虎榜真实交易日（YYYY-MM-DD，T+1 披露，可能早于报告生成日）
     """
     code: str = ""
     name: str = ""
     reason: str = ""
+    trade_date: str = ""
     change_pct: Optional[float] = None
     total_buy: float = 0.0
     total_sell: float = 0.0

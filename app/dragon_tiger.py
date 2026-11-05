@@ -37,16 +37,22 @@ def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
     优先同花顺官方金融数据（HITHINK_FINANCE_API_KEY），失败/无 key 回退 AKShare。
     同花顺无「换手率」，turnover_rate 置 None；total_trade 由买入额+卖出额近似。
 
+    龙虎榜为 T 日盘后披露 T 日数据，但同花顺接口更新可能滞后于东财：
+    当同花顺 trade_date 落后于东财最新日期时，改用东财当天数据，避免拿到前一日旧名单。
+
     Args:
         max_count: 最大返回条数
 
     Returns:
         DragonTigerRecord 列表
     """
-    # 同花顺主源
+    ths_records: list[DragonTigerRecord] = []
+    ths_date = ""
+
+    # 1. 同花顺主源
     try:
         from app import hithink
-        items = hithink.fetch_dragon_tiger()
+        items, ths_date = hithink.fetch_dragon_tiger()
         if items:
             records = []
             for it in items:
@@ -65,18 +71,29 @@ def fetch_dragon_tiger_list(max_count: int = 30) -> list[DragonTigerRecord]:
                         total_trade=total_buy + total_sell,
                         turnover_rate=None,
                         reason=str(it.get("limit_reason", "")),
+                        trade_date=ths_date,
                     ))
                 except Exception:
                     continue
                 if len(records) >= max_count:
                     break
             if records:
-                log.info(f"龙虎榜数据获取成功(同花顺): {len(records)} 条")
-                return records
+                ths_records = records
+                log.info(f"龙虎榜数据获取成功(同花顺): {len(records)} 条 (交易日 {ths_date})")
     except Exception as e:
         log.warning(f"同花顺龙虎榜获取失败: {e}")
 
-    return _fetch_dragon_tiger_akshare(max_count)
+    # 2. 东财 AKShare：兜底 + 检测同花顺是否滞后
+    ak_records = _fetch_dragon_tiger_akshare(max_count)
+    ak_date = ak_records[0].trade_date if ak_records else ""
+
+    # 3. 选更新数据源：东财更新于同花顺时，改走东财（同花顺接口滞后）
+    if ak_records and ak_date and (not ths_records or ak_date > ths_date):
+        if ths_records:
+            log.info(f"同花顺龙虎榜滞后({ths_date})，东财已更新到({ak_date})，改用东财数据")
+        return ak_records
+
+    return ths_records if ths_records else ak_records
 
 
 def _fetch_dragon_tiger_akshare(max_count: int = 30) -> list[DragonTigerRecord]:
@@ -103,13 +120,15 @@ def _fetch_dragon_tiger_akshare(max_count: int = 30) -> list[DragonTigerRecord]:
         return []
 
     # 取最近一个交易日的数据（适配周末/节假日跑）
+    trade_date = ""
     date_col = next(
         (c for c in ("上榜日", "上榜日期", "交易日期", "日期") if c in df.columns), None
     )
     if date_col is not None:
         latest = df[date_col].max()
         df = df[df[date_col] == latest]
-        log.info(f"龙虎榜取最新交易日数据: {latest}")
+        trade_date = _normalize_trade_date(latest)
+        log.info(f"龙虎榜取最新交易日数据: {trade_date}")
 
     records = []
     for _, row in df.iterrows():
@@ -124,6 +143,7 @@ def _fetch_dragon_tiger_akshare(max_count: int = 30) -> list[DragonTigerRecord]:
                 total_trade=float(row.get("龙虎榜成交额", 0) or 0),
                 turnover_rate=_parse_float(row.get("换手率")),
                 reason=str(row.get("上榜原因", "")),
+                trade_date=trade_date,
             )
             records.append(record)
         except Exception:
@@ -144,6 +164,17 @@ def _parse_float(val) -> Optional[float]:
         return v
     except (ValueError, TypeError):
         return None
+
+
+def _normalize_trade_date(val) -> str:
+    """把龙虎榜日期列值统一成 YYYY-MM-DD。"""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return s
 
 
 from app.data_fetcher import fetch_stock_industry_map as _get_stock_industry_map
@@ -448,6 +479,7 @@ def merge_duplicate_records(records: list[DragonTigerRecord]) -> list[DragonTige
             merged_record = DragonTigerRecord(
                 code=code,
                 name=first.name,
+                trade_date=first.trade_date,
                 change_pct=first.change_pct,
                 total_buy=total_buy,
                 total_sell=total_sell,
@@ -826,6 +858,14 @@ def _detect_sector_divergence(records: list[DragonTigerRecord], industry_map: di
     return divergences
 
 
+def _trade_date_of(records: list[DragonTigerRecord]) -> str:
+    """从龙虎榜记录里取真实交易日，缺省回退到当前日期。"""
+    for r in records:
+        if getattr(r, "trade_date", ""):
+            return r.trade_date
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def analyze_dragon_tiger(
     records: list[DragonTigerRecord],
     seat_analyses: list | None = None,
@@ -843,9 +883,10 @@ def analyze_dragon_tiger(
     Returns:
         DragonTigerSummary 综合分析结果
     """
+    trade_date = _trade_date_of(records)
     if not records:
         return DragonTigerSummary(
-            date=datetime.now().strftime("%Y-%m-%d"),
+            date=trade_date,
             total_count=0,
             overall_assessment="今日无龙虎榜数据（可能非交易日）",
         )
@@ -978,7 +1019,7 @@ def analyze_dragon_tiger(
     overall = "；".join(assessment_parts) if assessment_parts else "龙虎榜资金面无明显方向性信号"
 
     summary = DragonTigerSummary(
-        date=datetime.now().strftime("%Y-%m-%d"),
+        date=trade_date,
         total_count=len(merged),
         records=merged[:30],
         institutional_focus=top_focus,

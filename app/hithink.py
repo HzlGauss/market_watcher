@@ -342,18 +342,21 @@ def fetch_limit_pool(kind: str, date: str = "") -> list[dict]:
 # 龙虎榜
 # ============================================================
 
-def fetch_dragon_tiger(date: str = "", board_type: str = "all") -> list[dict]:
-    """龙虎榜榜单，返回 stock_items 列表。
+def fetch_dragon_tiger(date: str = "", board_type: str = "all") -> tuple[list[dict], str]:
+    """龙虎榜榜单，返回 (stock_items 列表, trade_date)。
 
     date: YYYY-MM-DD，空则取最近交易日；board_type: all/org/hot_money。
+    trade_date: 龙虎榜真实交易日（YYYY-MM-DD），龙虎榜 T+1 披露，可能早于当前日期。
     """
     params: dict = {"board_type": board_type}
     if date:
         params["date"] = date
     data = _get("/api/a-share/special-data/dragon-tiger-list", params)
     if not data:
-        return []
-    return list(data.get("stock_items") or [])
+        return [], ""
+    items = list(data.get("stock_items") or [])
+    trade_date = str(data.get("trade_date") or "")
+    return items, trade_date
 
 
 # ============================================================
