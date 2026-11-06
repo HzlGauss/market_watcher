@@ -227,6 +227,84 @@ class MXClient:
             log.debug(f"妙想个股资金流解析失败 {code}: {e}")
             return None
 
+    # ---- 1.6 个股机构评级 / 一致目标价 ----
+
+    def get_stock_rating(self, code: str, name: str = "") -> Optional[dict]:
+        """查询个股机构评级汇总 + 一致目标价（妙想 query「机构评级 目标价」）
+
+        返回结构化 dict：
+            code, name, windows(时间窗口列表，如「1月内/2月内/...」),
+            ratings({窗口: {综合, 买入, 增持, 中性, 减持, 卖出, 合计}}),
+            target_price(一致目标价), target_rating(一致评级中文), upside_pct(上涨空间%)
+
+        失败 / 无数据返回 None（不抛异常）。
+        """
+        query_text = f"{code} {name} 机构评级 目标价".strip()
+        tables = self.query_structured(query_text)
+        if not tables:
+            return None
+
+        # 定位「评级家数/综合评级」表（行标签含"评级"）与「一致目标价」表
+        rating_table = None
+        target_table = None
+        for t in tables:
+            title = (t.get("title") or "") + " " + " ".join(t.get("columns") or [])
+            rows = t.get("rows") or []
+            if any("评级" in str(r.get("日期", "")) for r in rows):
+                rating_table = t
+            elif "一致目标价" in title or "上涨空间" in title:
+                target_table = t
+
+        if rating_table is None:
+            return None
+
+        windows = [c for c in (rating_table.get("columns") or []) if c != "日期"]
+        if not windows:
+            return None
+
+        _ROW_KEY = {
+            "综合评级": "综合", "评级买入家数": "买入", "评级增持家数": "增持",
+            "评级中性家数": "中性", "评级减持家数": "减持", "评级卖出家数": "卖出",
+            "评级机构总家数": "合计",
+        }
+        ratings: dict[str, dict] = {w: {} for w in windows}
+        for r in rating_table.get("rows") or []:
+            label = str(r.get("日期", "")).strip()
+            key = _ROW_KEY.get(label)
+            if key is None:
+                key = _ROW_KEY.get("评级" + label) or _ROW_KEY.get(label + "家数")
+            if key is None:
+                continue
+            for w in windows:
+                ratings[w][key] = r.get(w, "")
+
+        result: dict = {
+            "code": code,
+            "name": name,
+            "windows": windows,
+            "ratings": ratings,
+            "target_price": None,
+            "target_rating": "",
+            "upside_pct": None,
+        }
+
+        if target_table:
+            cols = target_table.get("columns") or []
+            rows = target_table.get("rows") or []
+            if rows:
+                row = rows[0]
+
+                def _col(*keys: str):
+                    for k in keys:
+                        if k in cols:
+                            return row.get(k)
+                    return None
+
+                result["target_price"] = self._parse_amount(row.get("日期"))
+                result["target_rating"] = str(_col("一致评级(中文)", "一致评级") or "").strip()
+                result["upside_pct"] = self._parse_amount(_col("上涨空间"))
+        return result
+
     # ---- 2. 智能选股 ----
 
     def stock_screen(self, keyword: str, page_no: int = 1, page_size: int = 20) -> Optional[dict]:

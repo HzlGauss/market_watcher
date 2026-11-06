@@ -11,6 +11,7 @@ description: 自然语言金融数据查询。输入任意金融问句，返回�
 
 ```bash
 py .claude/skills/financial-query/query_finance.py <自然语言问题>
+py .claude/skills/financial-query/query_rating.py <代码> [名称]     # 个股机构评级 + 一致目标价
 ```
 
 示例：
@@ -20,11 +21,21 @@ py .claude/skills/financial-query/query_finance.py 招商银行 市盈率 历史
 py .claude/skills/financial-query/query_finance.py 贵州茅台 近5日主力资金净流入
 py .claude/skills/financial-query/query_finance.py 宁德时代 最新财报 净利润 营收 同比增长
 py .claude/skills/financial-query/query_finance.py 沪深300 市盈率 市净率
+py .claude/skills/financial-query/query_rating.py 300661 圣邦股份
 ```
 
 参数说明：
 
 - **问题**（必填）：完整自然语言问句，可包含证券代码/名称 + 指标关键词。妙想会自动识别证券与指标类型。
+- **代码**（`query_rating.py` 必填）：6 位 A 股代码；**名称**（可选）提升查询精度。
+
+## 个股机构评级（query_rating.py）
+
+用户问「XX 机构评级/目标价/机构态度」「券商怎么看 XX」时，用 `query_rating.py` 而非关键词搜研报——它走妙想 `query`「机构评级 目标价」，返回比 `news-search` 关键词搜索更全的结构化结果：
+
+- **一致目标价 + 一致评级 + 上涨空间**（妙想/东财一致预期口径，比 Investing 更权威）。
+- **评级家数汇总**（1月/2月/3月/6月/1年 各窗口的买入/增持/中性/减持/卖出家数 + 综合评级），一眼看清「全票看多还是分歧」。
+- 底层是 `MXClient.get_stock_rating(code, name)`，返回 dict 供程序复用。
 
 ## 脚本输出与解读
 
