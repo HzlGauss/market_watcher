@@ -23,6 +23,7 @@
 import csv
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import date, timedelta
@@ -113,7 +114,6 @@ def _resolve_targets(arg: str) -> list[tuple[str, str]]:
         return _default_targets()
     # 逗号分隔代码列表（或单个 6 位代码）
     if all(re.fullmatch(r"\d{6}", t.strip()) for t in arg.split(",")):
-        import re
         return [(t.strip().zfill(6), "") for t in arg.split(",") if _is_ashare(t.strip())]
     # 板块/行业名 → 成分股池
     try:
@@ -336,8 +336,6 @@ def main():
             limit = max(1, min(int(a), 100))
         elif a and not a.startswith("-"):
             target = a
-
-    import re  # noqa: F401  (供 _resolve_targets 使用)
 
     print("=" * 76)
     print("早盘竞价雷达（个股竞价强弱 + 全市场短线风向标 · 同花顺）")
