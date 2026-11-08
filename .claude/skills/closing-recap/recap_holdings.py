@@ -303,9 +303,81 @@ def _fetch_etf_flow(mx, code, name):
     return main_net, sub
 
 
+# ---------------------------------------------------------------- 主力意图归类
+
+def _classify_intent(stage, box, flow, chg):
+    """个股方向归类（概率化）：偏多 / 偏空 / 中性 / 无法判断。
+
+    资金流背离 + 连续性为主信号，阶段仅作位置/背景；不把技术阶段包装成确定主力意图。
+    返回 (direction, reason)。
+    """
+    if stage is None or not stage.stage or stage.stage == "数据不足":
+        return "无法判断", "缺阶段/K线数据"
+
+    st = stage.stage
+    trend = stage.trend_axis or ""
+    vol = stage.volume_axis or ""
+    fund_axis = stage.fund_axis or ""
+    pos = box.pos_pct if (box and box.pos_pct is not None) else 50.0
+    consec = flow.get("consec") or 0
+    sign = flow.get("consec_sign") or 0
+    today_main = flow.get("today_main")
+
+    in_flow = sign == 1 and consec >= 2     # 主力连续流入 ≥2 日
+    out_flow = sign == -1 and consec >= 2   # 主力连续流出 ≥2 日
+    is_high = pos >= 70
+    is_low = pos <= 30
+    shrink = vol.startswith("缩量")
+
+    # ① 资金背离（最强、最直接的主力意图信号）
+    if today_main is not None and chg is not None:
+        if today_main < 0 < chg:
+            return "偏空", "价涨主力流出背离"
+        if today_main > 0 > chg:
+            return "偏多", "价跌主力流入背离"
+
+    # ② 资金连续性 + 位置（连流入/流出为主信号）
+    if is_high and out_flow:
+        return "偏空", f"高位({pos:.0f}%)+主力连{consec}日流出"
+    if is_low and in_flow:
+        return "偏多", f"低位({pos:.0f}%)+主力连{consec}日流入"
+
+    # ③ 阶段背景（修正映射：技术超买是动量非顶部）
+    if st == "派发期":
+        return "偏空", "派发期"
+    if st == "赶顶期":
+        if "净流出" in fund_axis:
+            return "偏空", "赶顶+主力净流出"
+        return "中性", "赶顶期·强势加速"
+    if st == "下跌期":
+        return "偏空", "下跌期·主力已撤离"
+    if st == "磨底期":
+        if "净流入" in fund_axis or in_flow:
+            return "偏多", "磨底吸筹"
+        return "中性", "磨底期·主力未确认"
+    if trend == "多头回调" and shrink and not out_flow:
+        return "偏多", "缩量洗盘"
+    if st in ("主升浪", "启动期"):
+        return "中性", f"{st}·拉升持有"
+
+    return "中性", f"{st}·方向未明"
+
+
+def _classify_etf_intent(flow):
+    """ETF 机构配置方向：机构加仓 / 机构撤离 / 中性，基于申赎口径而非庄家控盘。"""
+    sub = flow.get("net_subscribe")
+    if sub is None:
+        return "中性", "净申购数据缺失"
+    if sub > 0:
+        return "机构加仓", "净申购为正"
+    if sub < 0:
+        return "机构撤离", "净赎回"
+    return "中性", "净申购≈0"
+
+
 # ---------------------------------------------------------------- 输出
 
-def _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage, flow):
+def _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage, flow, intent):
     """打印单标复盘块（紧凑）。"""
     print("─" * 60)
     hold = f"持仓 {it['amount']}@{it['cost']}" if it["amount"] else "空仓观察"
@@ -358,6 +430,7 @@ def _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage
     if is_etf:
         sub = flow.get("net_subscribe")
         print(f"  资金: 主力 {_fmt_amt(today_main)}{src_txt} | 净申购 {_fmt_amt(sub)}")
+        print(f"  机构方向:{intent}")
     else:
         parts = [f"今日主力 {_fmt_amt(today_main)}{src_txt}"]
         if cum5:
@@ -372,6 +445,7 @@ def _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage
             elif today_main < 0 and chg > 0:
                 line += " ⚠️价涨主力出货"
         print(line)
+        print(f"  方向:{intent}")
     print()
 
 
@@ -460,18 +534,24 @@ def main():
             except Exception:
                 stage = None
 
-        _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage, flow)
+        if is_etf:
+            intent_label, intent_reason = _classify_etf_intent(flow)
+        else:
+            intent_label, intent_reason = _classify_intent(stage, box, flow, chg)
+        intent = f"{intent_label}（{intent_reason}）" if intent_reason else intent_label
+
+        _print_block(it, board, is_etf, price, chg, snap_src, klines, ts, box, stage, flow, intent)
 
         stage_txt = stage.stage if (stage and stage.stage != "数据不足") else "—"
-        summary.append((code, name, "ETF" if is_etf else board, chg, flow.get("today_main"), stage_txt))
+        summary.append((code, name, "ETF" if is_etf else board, chg, flow.get("today_main"), stage_txt, intent_label))
 
     # 汇总表
     print("=" * 60)
-    print("汇总：代码 名称 | 类型 | 今涨跌 | 今日主力 | 阶段")
+    print("汇总：代码 名称 | 类型 | 今涨跌 | 今日主力 | 阶段 | 方向")
     print("=" * 60)
-    for code, name, kind, chg, today_main, stage_txt in summary:
+    for code, name, kind, chg, today_main, stage_txt, intent_label in summary:
         chg_s = f"{chg:+.2f}%" if chg is not None else "  --"
-        print(f"{code} {name} | {kind} | {chg_s} | {_fmt_amt(today_main)} | {stage_txt}")
+        print(f"{code} {name} | {kind} | {chg_s} | {_fmt_amt(today_main)} | {stage_txt} | {intent_label}")
     return 0
 
 
