@@ -130,14 +130,23 @@ def _parse_sina_quote(item: WatchItem, fields: list[str]) -> Optional[Quote]:
 
 
 def fetch_quotes(items: list[WatchItem]) -> list[Quote]:
-    """批量获取实时行情（新浪财经 + 腾讯财经量比/换手率）
+    """批量获取实时行情（沪深/港股走新浪+腾讯；北交所走同花顺快照）。
 
-    Args:
-        items: 盯盘标的列表
-
-    Returns:
-        行情数据列表，网络异常时返回空列表
+    北交所（BJ）920/43/83/87 号段新浪与腾讯均不覆盖，单独走同花顺
+    `fetch_snapshot` 兜底；其余标的（沪深/港股/ETF）行为不变。
     """
+    if not items:
+        return []
+    bj_items = [it for it in items if it.market == "BJ"]
+    other_items = [it for it in items if it.market != "BJ"]
+    results = _fetch_quotes_hithink(bj_items) if bj_items else []
+    if other_items:
+        results.extend(_fetch_quotes_sina(other_items))
+    return results
+
+
+def _fetch_quotes_sina(items: list[WatchItem]) -> list[Quote]:
+    """新浪财经 + 腾讯财经量比/换手率的沪深/港股行情主路径。"""
     if not items:
         return []
 
