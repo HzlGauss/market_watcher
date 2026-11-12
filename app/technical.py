@@ -807,6 +807,170 @@ def calc_macd(closes: list[float], short: int = 12, long: int = 26, signal_perio
 
 
 # ============================================================
+# MACD 背驰 —— 相邻两段同向走势的力度对比
+# ============================================================
+
+@dataclass
+class MacdDivergence:
+    """MACD 背驰（两段力度对比）结果"""
+    direction: str = ""              # "顶背离" / "底背离" / "" 无背驰
+    force0: float = 0.0              # 前一段力度（红/绿柱面积）
+    force1: float = 0.0              # 后一段力度
+    price0: Optional[float] = None   # 前一段端点价（高点/低点）
+    price1: Optional[float] = None   # 后一段端点价
+    weakening: Optional[float] = None  # 力度衰减比例（0~1，越大越背离）
+
+
+def _find_close_pivots(values: list[float], left: int, right: int) -> list[tuple[int, float, int]]:
+    """在收盘价序列上找局部极值点，返回 [(idx, val, kind)] 按时间升序。kind: +1 高点 / -1 低点。"""
+    pivots: list[tuple[int, float, int]] = []
+    n = len(values)
+    for i in range(left, n - right):
+        window = values[i - left:i + right + 1]
+        if any(v is None for v in window):
+            continue
+        v = values[i]
+        if v == max(window) and v == min(window):
+            continue  # 平台/停牌，跳过
+        if v == max(window):
+            pivots.append((i, v, 1))
+        elif v == min(window):
+            pivots.append((i, v, -1))
+    return pivots
+
+
+def _filter_min_swing(
+    pivots: list[tuple[int, float, int]], min_swing_pct: float
+) -> list[tuple[int, float, int]]:
+    """把极值序列合并成「有意义」的交替高低点。
+
+    - 同类型相邻（前一个反向摆动被过滤掉导致）→ 保留更极端的一个。
+    - 反向摆动幅度 < min_swing_pct(%) → 视为杂波丢弃，继续用上一极值作参照。
+
+    等价于：先合并相邻同类，再按最小摆动幅度过滤；min_swing_pct<=0 时退化为纯合并。
+    """
+    out: list[tuple[int, float, int]] = []
+    for idx, val, kind in pivots:
+        if not out:
+            out.append((idx, val, kind))
+            continue
+        last = out[-1]
+        if kind == last[2]:
+            if (kind == 1 and val >= last[1]) or (kind == -1 and val <= last[1]):
+                out[-1] = (idx, val, kind)
+            continue
+        swing = abs(val - last[1]) / last[1] * 100.0 if last[1] else 0.0
+        if swing >= min_swing_pct:
+            out.append((idx, val, kind))
+    return out
+
+
+def _hist_area(hist: list[float], start: int, end: int, direction: int) -> float:
+    """一段走势的 MACD 力度（柱面积）。direction +1 取红柱(>0)面积，-1 取绿柱(<0)面积。"""
+    total = 0.0
+    for j in range(max(0, start), min(len(hist), end + 1)):
+        if direction == 1 and hist[j] > 0:
+            total += hist[j]
+        elif direction == -1 and hist[j] < 0:
+            total += -hist[j]
+    return total
+
+
+def detect_macd_divergence(
+    closes: list[float],
+    dif_vals: list[float],
+    lookback: int = 60,
+    pivot_left: int = 2,
+    pivot_right: int = 2,
+    min_swing_pct: float = 2.5,
+    min_leg: int = 3,
+) -> MacdDivergence:
+    """MACD 背驰检测（相邻两段同向走势力度对比，后一段可进行中）。
+
+    缠论口径：比较最近两段同向走势的 MACD 柱面积（力度），而非单窗口内价格/指标高点错位。
+    - 顶背离：后一段创新高，但红柱面积弱于前一段 → 上涨动能衰竭，见顶风险。
+    - 底背离：后一段创新低，但绿柱面积弱于前一段 → 抛压衰竭，见底蓄力。
+
+    后一段取「最后一个确认极值 → 当前 bar」这段进行中的走势，因此**无确认滞后**，可在创新高/新低
+    当日就触发（配合逃顶组合的「当日股价新高」条件用）。前一段取上一个已确认的同向走势。
+
+    Args:
+        closes: 收盘价序列（时间升序，与 dif_vals 逐位对齐）。
+        dif_vals: MACD DIF 序列（ema12 - ema26）。
+        lookback: 只在最近 N 根内寻找两段走势（需足够容纳两段，默认 60）。
+        pivot_left / pivot_right: 历史极值点左右确认根数（默认 2）。
+        min_swing_pct: 最小摆动幅度(%)，小于此幅度的反向摆动视为杂波丢弃（默认 2.5）。
+        min_leg: 单段走势最少包含的 K 线根数（默认 3），过滤过短的假「段」。
+
+    Returns:
+        MacdDivergence。无背驰时 direction 为空串。
+
+    简化说明：分型用收盘价极值近似（未用最高/最低价），力度用 2*(DIF-DEA) 柱面积的累计。
+    """
+    if not closes or len(dif_vals) < len(closes):
+        return MacdDivergence()
+    window = min(lookback, len(closes))
+    c = closes[-window:]
+    d = dif_vals[-window:]
+
+    dea = _ema(d, 9)
+    if len(dea) != len(d):
+        return MacdDivergence()
+    hist = [2.0 * (dif - dea_v) for dif, dea_v in zip(d, dea)]
+
+    pivots = _filter_min_swing(_find_close_pivots(c, pivot_left, pivot_right), min_swing_pct)
+    if len(pivots) < 3:
+        return MacdDivergence()
+
+    n = len(c)
+    end = n - 1  # 当前段终点 = 最新 bar
+    last = pivots[-1]
+
+    if last[2] == -1:
+        # 最后一个确认极值是低点 → 当前段上涨；前一段上涨 = pivots[-3](低) → pivots[-2](高)
+        if pivots[-2][2] != 1 or pivots[-3][2] != -1:
+            return MacdDivergence()
+        if end - last[0] + 1 < min_leg or pivots[-2][0] - pivots[-3][0] + 1 < min_leg:
+            return MacdDivergence()  # 段太短，过滤
+        cur_high = max(c[last[0]:end + 1])
+        if c[end] < cur_high or cur_high <= pivots[-2][1]:
+            return MacdDivergence()  # 当日未创本段新高，或未突破前高点
+        force0 = _hist_area(hist, pivots[-3][0], pivots[-2][0], 1)  # 前段红柱面积
+        force1 = _hist_area(hist, last[0], end, 1)                  # 当前段红柱面积
+        if force0 <= 0 or force1 >= force0:
+            return MacdDivergence()  # 力度未衰减
+        return MacdDivergence(
+            direction="顶背离",
+            force0=round(force0, 4),
+            force1=round(force1, 4),
+            price0=pivots[-2][1],
+            price1=cur_high,
+            weakening=round(1.0 - force1 / force0, 4),
+        )
+
+    # 最后一个确认极值是高点 → 当前段下跌；前一段下跌 = pivots[-3](高) → pivots[-2](低)
+    if pivots[-2][2] != -1 or pivots[-3][2] != 1:
+        return MacdDivergence()
+    if end - last[0] + 1 < min_leg or pivots[-2][0] - pivots[-3][0] + 1 < min_leg:
+        return MacdDivergence()
+    cur_low = min(c[last[0]:end + 1])
+    if c[end] > cur_low or cur_low >= pivots[-2][1]:
+        return MacdDivergence()  # 当日未创本段新低，或未跌破前低点
+    force0 = _hist_area(hist, pivots[-3][0], pivots[-2][0], -1)  # 前段绿柱面积
+    force1 = _hist_area(hist, last[0], end, -1)                  # 当前段绿柱面积
+    if force0 <= 0 or force1 >= force0:
+        return MacdDivergence()
+    return MacdDivergence(
+        direction="底背离",
+        force0=round(force0, 4),
+        force1=round(force1, 4),
+        price0=pivots[-2][1],
+        price1=cur_low,
+        weakening=round(1.0 - force1 / force0, 4),
+    )
+
+
+# ============================================================
 # KDJ —— 随机指标
 # ============================================================
 

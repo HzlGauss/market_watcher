@@ -6,6 +6,7 @@ import pytest
 from app.technical import (
     calc_rsi, rsi_signal, calc_macd, calc_kdj,
     calc_support_resistance, get_technical_summary, _ema,
+    detect_macd_divergence,
     MACDResult, KDJResult, SupportResistance,
 )
 from app.models import KlineData, Quote, TechnicalSummary
@@ -324,3 +325,54 @@ class TestTechnicalSummary:
         result = get_technical_summary(quote, klines)
         # 强上涨趋势应该有 RSI 超买或 MACD 信号
         assert len(result.signals) >= 1 or result.macd_signal in ("多头", "金叉")
+
+
+# ============================================================
+# MACD 背驰 测试
+# ============================================================
+
+class TestMacdDivergence:
+    def _dif(self, closes):
+        es = _ema(closes, 12)
+        el = _ema(closes, 26)
+        return [s - l for s, l in zip(es, el)]
+
+    def test_top_divergence(self):
+        """第二段创新高但上涨力度（红柱面积）弱于第一段 → 顶背离"""
+        c = [10, 9, 8, 9, 10]
+        for i in range(15): c.append(10 + (i + 1) / 15 * 10)  # ->20 强
+        for i in range(8):  c.append(20 - (i + 1) / 8 * 4)     # ->16
+        for i in range(15): c.append(16 + (i + 1) / 15 * 4.5)  # ->20.5 弱创新高
+        r = detect_macd_divergence(c, self._dif(c), lookback=60)
+        assert r.direction == "顶背离"
+        assert r.price1 > r.price0
+        assert r.weakening is not None and 0 < r.weakening <= 1
+
+    def test_bottom_divergence(self):
+        """第二段创新低但下跌力度（绿柱面积）弱于第一段 → 底背离"""
+        c = [30, 31, 32, 31, 30]
+        for i in range(15): c.append(30 - (i + 1) / 15 * 10)  # ->20 强
+        for i in range(8):  c.append(20 + (i + 1) / 8 * 4)     # ->24
+        for i in range(15): c.append(24 - (i + 1) / 15 * 4.5)  # ->19.5 弱创新低
+        r = detect_macd_divergence(c, self._dif(c), lookback=60)
+        assert r.direction == "底背离"
+        assert r.price1 < r.price0
+
+    def test_no_divergence_strong_second_leg(self):
+        """第二段百分比更强，不应判顶背离"""
+        c = [10, 9, 8, 9, 10]
+        for i in range(15): c.append(10 + (i + 1) / 15 * 10)  # 8->20
+        for i in range(8):  c.append(20 - (i + 1) / 8 * 4)     # ->16
+        for i in range(15): c.append(16 + (i + 1) / 15 * 29)   # 16->45
+        r = detect_macd_divergence(c, self._dif(c), lookback=60)
+        assert r.direction == ""
+
+    def test_no_divergence_monotonic(self):
+        """单边上涨无有效摆动 → 无背驰"""
+        c = [10 + i * 0.3 for i in range(60)]
+        r = detect_macd_divergence(c, self._dif(c), lookback=60)
+        assert r.direction == ""
+
+    def test_insufficient_data(self):
+        r = detect_macd_divergence([1, 2, 3], [0.1, 0.2, 0.3])
+        assert r.direction == ""

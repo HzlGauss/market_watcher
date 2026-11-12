@@ -16,6 +16,7 @@ from app.technical import (
     is_breakabove_bb_middle,
     is_low_volume,
     calc_obv,
+    detect_macd_divergence,
     estimate_full_day_volume,
 )
 
@@ -96,22 +97,13 @@ def _is_price_new_high(price: Optional[float], klines: list[KlineData], lookback
     return price >= highest
 
 
-def _is_macd_top_divergence(closes: list[float], dif_vals: list[float], lookback: int = 20) -> bool:
+def _is_macd_top_divergence(closes: list[float], dif_vals: list[float], lookback: int = 60) -> bool:
     """
-    MACD 顶背离简化判断：
-    价格创近期新高，但 DIF 未创同期新高
+    MACD 顶背离（两段力度对比）：
+    最近两段上涨中，后一段价格创新高但上涨力度（红柱面积）弱于前一段 → 上涨动能衰竭。
+    对比旧版「单窗口价格新高 vs DIF 新高」更严谨，见 app.technical.detect_macd_divergence。
     """
-    if len(closes) < lookback or len(dif_vals) < lookback:
-        return False
-    window = closes[-lookback:]
-    dif_window = dif_vals[-lookback:]
-
-    price_high_idx = max(range(len(window)), key=lambda i: window[i])
-    dif_high_idx = max(range(len(dif_window)), key=lambda i: dif_window[i])
-
-    if price_high_idx != dif_high_idx and price_high_idx > dif_high_idx:
-        return True
-    return False
+    return detect_macd_divergence(closes, dif_vals, lookback).direction == "顶背离"
 
 
 def _is_macd_below_zero_flattening(dif: Optional[float], dea: Optional[float],
@@ -252,7 +244,7 @@ def check_top_escape(
         conditions.append("股价20日新高")
 
     # 条件2: MACD 顶背离
-    if _is_macd_top_divergence(closes, dif_vals, 20):
+    if _is_macd_top_divergence(closes, dif_vals):
         sig.matched_conditions += 1
         conditions.append("MACD顶背离")
 
