@@ -919,3 +919,216 @@ def fetch_futures_commodity_indexes() -> list[dict]:
     """商品指数合约列表，返回 [{thscode, ticker, name, list_date, end_date}]。"""
     data = _get("/api/futures/contracts/commodity-index-list")
     return list(data.get("item") or []) if data else []
+
+
+# ============================================================
+# 涨停统计 / 单股龙虎榜机构 / 营业部
+# ============================================================
+
+def _fetch_has_next_pages(path: str, params: Optional[dict] = None, size: int = 30,
+                          max_pages: int = 1) -> list[dict]:
+    """按 pagination.has_next 翻页的接口（size 有上限的端点）拉取 item 列表。
+
+    与 _fetch_all_pages（用 pagination.pages）不同，这批新端点返回 has_next + size 上限，
+    且部分 total 可达数千（营业部历史），默认只拉首页（max_pages=1）足够。
+    """
+    items: list[dict] = []
+    page = 1
+    while True:
+        p = dict(params or {})
+        p["page"] = page
+        p["size"] = size
+        data = _get(path, p)
+        if not data:
+            break
+        items.extend(data.get("item") or [])
+        pag = data.get("pagination") or {}
+        if not pag.get("has_next") or page >= max_pages:
+            break
+        page += 1
+    return items
+
+
+def fetch_limit_up_statistics(date: str = "") -> dict:
+    """涨停强度与晋级统计，返回原始 data。
+
+    data 含 seal_rate（封板率，小数）、open_stock_count（打开家数）、
+    limit_up_stock_count / touched_limit_up_stock_count（封板/触板家数）、
+    page_boards[]（one/two/three/four/five_plus 档位家数 + promotion_rate 晋级率）、
+    exact_boards[]（精确 N 板家数，N≥2）。
+    """
+    params: dict = {}
+    if date:
+        params["date"] = date
+    return _get("/api/a-share/special-data/limit-up-statistics", params) or {}
+
+
+def fetch_dragon_tiger_stock_institution(code: str, market: str = "", date: str = "",
+                                         range_days: Optional[int] = None) -> dict:
+    """单股龙虎榜机构交易详情（1日/3日区间），返回原始 data。
+
+    data.item[] 含 org_buy/sell/net_value（机构买卖净额）、org_buy/sell_num（机构数）、
+    org_net_rate（机构净买比例）、buy/sell_departments[]（席位 ID+名称）。
+    range_days: 1 或 3；省略返回两类实际记录。
+    """
+    params: dict = {"thscode": thscode(code, market)}
+    if date:
+        params["date"] = date
+    if range_days is not None:
+        params["range_days"] = int(range_days)
+    return _get("/api/a-share/special-data/dragon-tiger-stock-institution", params) or {}
+
+
+def fetch_dragon_tiger_department_classic_record(department_id: str) -> dict:
+    """营业部经典战绩，返回原始 data（department_name/classic_record，可能 null）。"""
+    return _get("/api/a-share/special-data/dragon-tiger-department-classic-record",
+                {"department_id": department_id}) or {}
+
+
+def fetch_dragon_tiger_department_history(department_id: str, size: int = 30,
+                                          min_net_buy_amount: Optional[int] = None,
+                                          sort_field: str = "trade_date", sort_dir: str = "desc",
+                                          max_pages: int = 1) -> list[dict]:
+    """营业部历史上榜记录（分页），返回 item 列表（默认首页）。
+
+    item[] 含 thscode/name/trade_date/change_ratio/net_buy_amount/rank_type。
+    min_net_buy_amount 档位：5000000/30000000/50000000/100000000。
+    """
+    params: dict = {"department_id": department_id, "sort_field": sort_field, "sort_dir": sort_dir}
+    if min_net_buy_amount is not None:
+        params["min_net_buy_amount"] = int(min_net_buy_amount)
+    return _fetch_has_next_pages("/api/a-share/special-data/dragon-tiger-department-history",
+                                 params, size=max(1, min(int(size), 30)), max_pages=max_pages)
+
+
+# ============================================================
+# 新股 / 打新（A 股 + 港股）
+# ============================================================
+
+def fetch_ipo_calendar(market: str = "sh_sz", status: str = "subscribable") -> list[dict]:
+    """A 股新股发行日历。market: sh_sz/bj；status: upcoming/subscribable/awaiting_listing。
+
+    item[] 含 thscode/ticker/name/subscription_code/subscription_date/listing_date/issue_price。
+    发行市盈率等破发判断字段此端点不提供，破发分析仍以 akshare stock_ipo_ths 为主。
+    """
+    data = _get("/api/a-share/ipo/calendar-list", {"market": market, "status": status})
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_hk_ipo_application_list(page: int = 1, size: int = 50) -> dict:
+    """港股新股递表记录，返回原始 data（item[] + pagination.has_next）。"""
+    return _get("/api/hk-share/ipo/application-list",
+                {"page": page, "size": max(1, min(int(size), 50))}) or {}
+
+
+def fetch_hk_ipo_calendar_list(status: str = "subscribable") -> list[dict]:
+    """港股认购/待上市日历。status: subscribable/awaiting_listing。
+
+    item[] 含 issue_code/thscode/name/listing_date/issue_price/currency/
+    subscription_end_date/entry_fee/issue_price_text（招股价区间文本）。
+    """
+    data = _get("/api/hk-share/ipo/calendar-list", {"status": status})
+    return list(data.get("item") or []) if data else []
+
+
+def fetch_hk_ipo_issue_detail(issue_code: str) -> dict:
+    """港股新股发行详情，返回原始 data（issue_price_range/lot_size/entry_fee，均 HKD）。"""
+    return _get("/api/hk-share/ipo/issue-detail", {"issue_code": issue_code}) or {}
+
+
+# ============================================================
+# 集合竞价机会 / 严重异动
+# ============================================================
+
+def fetch_auction_opportunity_dates() -> dict:
+    """集合竞价机会可选交易日，返回原始 data（dates[]/latest_date）。"""
+    return _get("/api/a-share/special-data/auction-opportunity-dates") or {}
+
+
+def fetch_auction_stock_opportunities(date: str = "", warn_types: str = "", market: str = "a_share",
+                                      exclude_st: bool = False, thscodes: str = "",
+                                      sort_by: str = "warn_time", sort_order: str = "desc",
+                                      size: int = 20, max_pages: int = 5) -> list[dict]:
+    """集合竞价个股机会筛选（分页），返回 item 列表。
+
+    item[] 含 thscode/ticker/name/warn_type/warn_name（如"涨停试盘"）/bid_price/
+    bid_change_ratio/bid_amount/previous_amount/explain/grade/related_block。
+    warn_types: 逗号分隔机会码（68710~68727）；date 须属于可用日期集合。
+    """
+    params: dict = {"market": market, "sort_by": sort_by, "sort_order": sort_order}
+    if date:
+        params["date"] = date
+    if warn_types:
+        params["warn_types"] = warn_types
+    if exclude_st:
+        params["exclude_st"] = "true"
+    if thscodes:
+        params["thscodes"] = thscodes
+    return _fetch_has_next_pages("/api/a-share/special-data/auction-stock-opportunities",
+                                 params, size=max(1, min(int(size), 20)), max_pages=max_pages)
+
+
+def fetch_abnormal_monitor_list(state: str = "current", size: int = 30, max_pages: int = 1) -> list[dict]:
+    """异动监控列表（严重异动/重点监控）。state: current/history。
+
+    item[] 含 thscode/name/start_date_ms/end_date_ms/monitor_type/monitor_label
+    （monitor_type 1/2=严重异动，其它=重点监控）。
+    """
+    return _fetch_has_next_pages("/api/a-share/special-data/abnormal-monitor-list",
+                                 {"state": state}, size=max(1, min(int(size), 30)), max_pages=max_pages)
+
+
+# ============================================================
+# 资讯（快讯 / 公告解读 / 个股分时新闻 / 热门专题 / 异动解读）
+# ============================================================
+
+def fetch_news_article_detail(client_type: str, encoded_seq: str) -> dict:
+    """资讯详情（正文 HTML）。client_type: WEB/WEB_ENCRYPTED/PC/PC_LIST。"""
+    return _get("/api/news/article/detail",
+                {"client_type": client_type, "encoded_seq": encoded_seq}) or {}
+
+
+def fetch_news_notice_detail(seq: str) -> dict:
+    """公告详情与结构化解读，返回原始 data（summary/monthly_report_interpretation）。"""
+    return _get("/api/news/notice/detail", {"seq": seq}) or {}
+
+
+def fetch_news_topic_hot_list(tab_id: int, cursor: str = "", limit: int = 10,
+                              important_only: bool = False) -> dict:
+    """热门深度专题（cursor 分页），返回原始 data（items[]/next_cursor/has_more）。"""
+    params: dict = {"tab_id": int(tab_id), "limit": max(1, min(int(limit), 10))}
+    if cursor:
+        params["cursor"] = cursor
+    if important_only:
+        params["important_only"] = "true"
+    return _get("/api/news/topic/hot-list", params) or {}
+
+
+def fetch_news_anomaly_analysis(begin_date: str, end_date: str, code: str = "", market: str = "") -> dict:
+    """日期范围异动解读，返回原始 data（items[]/was_truncated）。code 省略=全量。"""
+    params: dict = {"begin_date": begin_date, "end_date": end_date}
+    if code:
+        params["thscode"] = thscode(code, market)
+    return _get("/api/news/anomaly/analysis", params) or {}
+
+
+def fetch_news_stock_timeline(code: str, market: str = "", size: int = 20) -> list[dict]:
+    """个股分时新闻（首页），返回 items 列表（id/type/title/author/source/summary/publish_time_ms）。"""
+    params: dict = {"thscode": thscode(code, market), "offset": "first"}
+    if size:
+        params["size"] = max(1, min(int(size), 100))
+    data = _get("/api/news/stock/timeline-list", params)
+    return list(data.get("items") or []) if data else []
+
+
+def fetch_news_flash_list(tag_id: int, seq: str = "0") -> list[dict]:
+    """快讯列表（首页 seq 传 "0"），返回 items 列表（title/summary/tags/create_time_ms 等）。"""
+    data = _get("/api/news/flash/list", {"tag_id": int(tag_id), "seq": seq})
+    return list(data.get("items") or []) if data else []
+
+
+def fetch_news_flash_refresh(tag_id: int, seq: str, create_time_ms: int) -> list[dict]:
+    """快讯刷新（传入已知最新 seq + create_time_ms），返回 items 列表。"""
+    data = _get("/api/news/flash/refresh",
+                {"tag_id": int(tag_id), "seq": seq, "create_time_ms": int(create_time_ms)})
+    return list(data.get("items") or []) if data else []

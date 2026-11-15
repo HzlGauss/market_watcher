@@ -1,6 +1,6 @@
 ---
 name: ipo-analysis
-description: 打新申购分析（新股 IPO / 新债可转债）。输入新股或新债代码，拉取发行信息（新股：发行价/发行市盈率/行业市盈率/板块；新债：转股价值/转股溢价率/信用评级/发行规模），用规则引擎算破发概率区间 + 申购结论标签 + 综合评分（0~100），再结合公司/正股质地与市场环境给出「建议申购 / 谨慎申购 / 放弃申购」结论。当用户问「XX 能不能打新」「XX 值不值得申购」「XX 破发概率多大」「这只新股/新债打不打」「近期有什么可以打新」时使用。
+description: 打新申购分析（新股 IPO / 新债可转债 / 港股打新）。输入新股或新债代码，拉取发行信息（新股：发行价/发行市盈率/行业市盈率/板块；新债：转股价值/转股溢价率/信用评级/发行规模），用规则引擎算破发概率区间 + 申购结论标签 + 综合评分（0~100），再结合公司/正股质地与市场环境给出「建议申购 / 谨慎申购 / 放弃申购」结论；`--list` 列出待申购新股/新债 + 港股待认购/待上市，`--hk` 查港股新股发行详情（招股价区间/每手/入场费）。当用户问「XX 能不能打新」「XX 值不值得申购」「XX 破发概率多大」「这只新股/新债打不打」「近期有什么可以打新」「港股有什么新股/招股价多少」时使用。
 ---
 
 # 打新申购分析（新股 IPO / 新债可转债）
@@ -12,8 +12,11 @@ description: 打新申购分析（新股 IPO / 新债可转债）。输入新股
 ```bash
 py .claude/skills/ipo-analysis/analyze_ipo.py <代码> [名称]
 
-# 打新日历：列出当前待申购的新股/新债
+# 打新日历：列出当前待申购的新股/新债 + 港股待认购/待上市
 py .claude/skills/ipo-analysis/analyze_ipo.py --list [数量]
+
+# 港股新股发行详情（issue_code 如 HK6157）
+py .claude/skills/ipo-analysis/analyze_ipo.py --hk <issue_code>
 ```
 
 示例：
@@ -21,14 +24,16 @@ py .claude/skills/ipo-analysis/analyze_ipo.py --list [数量]
 ```bash
 py .claude/skills/ipo-analysis/analyze_ipo.py 688837          # 新股（科创板）
 py .claude/skills/ipo-analysis/analyze_ipo.py 113710 四方转债  # 新债（可转债）
-py .claude/skills/ipo-analysis/analyze_ipo.py --list 10       # 打新日历
+py .claude/skills/ipo-analysis/analyze_ipo.py --list 10       # 打新日历（A股+港股）
+py .claude/skills/ipo-analysis/analyze_ipo.py --hk HK6157     # 港股新股发行详情
 ```
 
 参数说明：
 
 - **代码**（必填）：新股 6 位数字（如 688837）；新债 11/12 开头（如 113710）。
 - **名称**（可选）：提升匹配精度。
-- **`--list`**：列出待申购的新股/新债清单，无需代码。
+- **`--list`**：列出待申购的新股/新债清单（A股 + 港股待认购/待上市），无需代码。
+- **`--hk <issue_code>`**：查港股新股发行详情（招股价区间/每手股数/入场费），issue_code 见 `--list` 港股段的 `issue_code`。
 
 ## 脚本输出与解读
 
@@ -36,6 +41,8 @@ py .claude/skills/ipo-analysis/analyze_ipo.py --list 10       # 打新日历
 - **② 破发判断（规则引擎）**：破发概率区间 + 申购结论标签 + 综合评分（0~100）+ 关键因子。
 - **③ 市场环境**：上证/深证/创业板当日涨跌。
 - **④ 质地数据**（妙想，可选）：公司/正股的主营构成、行业分类、营收净利及增速、毛利率。
+- **`--list` 港股段**：港股新股待认购（招股价/入场费/截止日）+ 待上市（发行价/上市日），由同花顺官方接口提供。
+- **`--hk` 详情**：港股新股发行详情（发行记录/币种/招股价区间/每手股数/入场费）。
 
 ## 分析框架（AI 在数据包之上生成报告）
 
@@ -67,7 +74,7 @@ py .claude/skills/ipo-analysis/analyze_ipo.py --list 10       # 打新日历
 
 ## 注意事项
 
-- **依赖**：核心数据走 akshare（`stock_ipo_ths` 新股 / `bond_zh_cov` 新债），需 `pip install akshare`；未安装时脚本提示无法获取。市场环境走新浪（无需 key）。质地数据走妙想（需 `.env` 配置 `MX_APIKEY`，无 key 时跳过）。
+- **依赖**：核心数据走 akshare（`stock_ipo_ths` 新股 / `bond_zh_cov` 新债），需 `pip install akshare`；未安装时脚本提示无法获取。A股打新日历在 akshare 不可用时回退同花顺 `ipo/calendar-list`（仅日历、无发行 PE 字段，破发分析仍以 akshare 为主）。港股打新（`--list` 港股段 / `--hk` 详情）走同花顺官方接口，需 `.env` 配置 `HITHINK_FINANCE_API_KEY`，无 key 时跳过。市场环境走新浪（无需 key）。质地数据走妙想（需 `.env` 配置 `MX_APIKEY`，无 key 时跳过）。
 - **发行市盈率未披露**：常见于未盈利企业（科创板/北交所）或待定价新股，规则引擎会按「中高风险」处理，需结合④质地判断是否值得博。
 - **申购日期格式**：新股待申购显示「MM-DD 周X」（本年），已过显示「YYYY-MM-DD」；据此判断是否仍在申购窗口内。
 - **新债中签收益 vs 破发**：可转债重点不是「会不会破发」而是「上市首日能赚多少」——评级高 + 转股价值高的，破发概率极低，几乎可无脑打。

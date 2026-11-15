@@ -36,6 +36,8 @@ from app.utils import load_env
 from app.ipo_analyzer import (
     detect_and_analyze,
     list_upcoming,
+    list_hk_ipos,
+    hk_ipo_detail,
     _fetch_market_context,
     _mx_query,
     _num,
@@ -161,12 +163,74 @@ def _print_list(limit: int):
     if not data["stocks"] and not data["bonds"]:
         print("  (暂无待申购标的，或 akshare 未安装)")
 
+    # 港股打新（同花顺官方）
+    hk_sub = list_hk_ipos("subscribable")
+    hk_list = list_hk_ipos("awaiting_listing")
+    if hk_sub:
+        print("【港股新股 · 待认购】")
+        for d in hk_sub:
+            print(
+                f"  {d.get('issue_code', '')} {d.get('name', '')} | "
+                f"招股价 {d.get('issue_price_text') or '--'} | "
+                f"入场费 {_fmt(_num(d.get('entry_fee')), ' HKD')} | "
+                f"截止 {d.get('subscription_end_date', '')}"
+            )
+        print()
+    if hk_list:
+        print("【港股新股 · 待上市】")
+        for d in hk_list:
+            print(
+                f"  {d.get('issue_code', '')} {d.get('name', '')} | "
+                f"发行价 {_fmt(_num(d.get('issue_price')), ' HKD')} | "
+                f"上市 {d.get('listing_date', '')}"
+            )
+        print()
+    if not hk_sub and not hk_list:
+        print("  (暂无港股打新，或需 HITHINK_FINANCE_API_KEY)")
+
+
+def _print_hk_detail(issue_code: str):
+    """打印港股新股发行详情（招股价区间/每手/入场费）。"""
+    d = hk_ipo_detail(issue_code)
+    print(f"=== 港股新股发行详情: {issue_code} ===\n")
+    if not d:
+        print("  ❌ 未找到该发行记录（或需 HITHINK_FINANCE_API_KEY）")
+        print("  · 用 --list 查看当前港股待认购/待上市清单（issue_code 如 HK6157）")
+        return
+    rng = d.get("issue_price_range") or {}
+    lower, upper = rng.get("lower"), rng.get("upper")
+    if lower is not None and upper is not None:
+        price_s = f"{lower} ~ {upper} HKD"
+    else:
+        price_s = "--"
+    print(f"  发行记录:   {d.get('issue_code', issue_code)}")
+    print(f"  币种:       {d.get('currency') or 'HKD'}")
+    print(f"  招股价区间: {price_s}")
+    print(f"  每手股数:   {_fmt(_num(d.get('lot_size')), ' 股', 0)}")
+    print(f"  入场费:     {_fmt(_num(d.get('entry_fee')), ' HKD')}")
+
 
 def main():
     args = sys.argv[1:]
     if not args:
         print(__doc__)
         return 2
+
+    load_env(_ROOT)
+
+    # --hk 模式：港股新股发行详情（issue_code 如 HK6157）
+    if "--hk" in args:
+        issue = ""
+        for a in args:
+            a = a.strip()
+            if a and not a.startswith("--"):
+                issue = a
+                break
+        if not issue:
+            _print_list(10)
+            return 1
+        _print_hk_detail(issue)
+        return 0
 
     # --list 模式
     if "--list" in args:
@@ -185,7 +249,6 @@ def main():
         if a and not a.isdigit() and not a.startswith("--"):
             name = a
 
-    load_env(_ROOT)
     config = Config(_ROOT / "watchlist_config.json")
 
     result = detect_and_analyze(code, name)

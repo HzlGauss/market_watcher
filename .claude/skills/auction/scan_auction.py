@@ -326,6 +326,42 @@ def _print_combo(rows: list[dict], cd_map: dict[str, dict], cd_trade_date: str,
     print(f"  汇总: {summary} / 共 {len(combos)} 只")
 
 
+def _print_auction_opportunities(limit: int):
+    """【竞价机会】同花顺集合竞价机会筛选（涨停试盘等 18 种异动）。"""
+    print()
+    print("=" * 76)
+    print("【4. 竞价机会（同花顺 · 涨停试盘等异动）】")
+    print("=" * 76)
+    try:
+        from app import hithink
+        dates = hithink.fetch_auction_opportunity_dates()
+        items = hithink.fetch_auction_stock_opportunities()
+    except Exception:
+        dates, items = {}, []
+    latest = (dates or {}).get("latest_date")
+    if latest:
+        print(f"  竞价机会交易日: {latest}")
+    if not items:
+        print("  ⚠️ 无竞价机会数据（无 key / 非竞价时段 / 接口不可达）")
+        return
+    header = f"  {'代码':<8}{'名称':<10}{'机会类型':<12}{'竞价价':>8}{'竞价涨跌':>9}{'竞价额':>9}"
+    print(header)
+    print("  " + "-" * 72)
+    for it in items[:limit]:
+        code = str(it.get("ticker") or "").zfill(6)
+        name = _short(it.get("name") or "", 9)
+        warn = _short(it.get("warn_name") or str(it.get("warn_type") or ""), 11)
+        bid_price = it.get("bid_price")
+        bid_chg = it.get("bid_change_ratio")
+        bid_amt = it.get("bid_amount")
+        price_s = f"{bid_price:.2f}" if bid_price is not None else "     --"
+        chg_s = f"{bid_chg * 100:+.2f}%" if bid_chg is not None else "    --"
+        amt_s = f"{bid_amt / 1e8:.2f}亿" if bid_amt is not None else "   --"
+        print(f"  {code:<8}{name:<10}{warn:<12}{price_s:>8}{chg_s:>9}{amt_s:>9}")
+    if len(items) > limit:
+        print(f"  ... 省略 {len(items) - limit} 条 ...")
+
+
 def main():
     argv = sys.argv[1:]
     target = ""
@@ -350,6 +386,7 @@ def main():
     rows = _print_snapshot(targets, limit)
     cd_trade_date, cd_map = _load_close_drift()
     _print_combo(rows, cd_map, cd_trade_date, _prev_trade_day(), limit)
+    _print_auction_opportunities(limit)
 
     print()
     print("  说明:")

@@ -105,6 +105,55 @@ def _fetch_stock_ipos():
         return None
 
 
+def _fetch_stock_ipos_hithink() -> list[dict]:
+    """同花顺官方 A 股新股日历（sh_sz + bj 待申购），akshare 不可用时的兜底。
+
+    同花顺 ipo/calendar-list 无发行市盈率/行业市盈率字段，仅作日历兜底（PE 列置 None）。
+    """
+    try:
+        from app import hithink
+    except Exception:
+        return []
+    out: list[dict] = []
+    for market in ("sh_sz", "bj"):
+        try:
+            items = hithink.fetch_ipo_calendar(market, "subscribable")
+        except Exception:
+            continue
+        for it in items:
+            out.append({
+                "股票代码": str(it.get("ticker") or "").zfill(6),
+                "股票简称": str(it.get("name") or ""),
+                "申购代码": str(it.get("subscription_code") or ""),
+                "申购日期": str(it.get("subscription_date") or ""),
+                "上市日期": str(it.get("listing_date") or ""),
+                "发行价格": it.get("issue_price"),
+                "发行市盈率": None,
+                "行业市盈率": None,
+            })
+    return out
+
+
+def list_hk_ipos(status: str = "subscribable") -> list[dict]:
+    """港股待认购/待上市列表（同花顺）。status: subscribable/awaiting_listing。"""
+    try:
+        from app import hithink
+        return hithink.fetch_hk_ipo_calendar_list(status)
+    except Exception as e:
+        log.warning(f"港股新股日历获取失败: {e}")
+        return []
+
+
+def hk_ipo_detail(issue_code: str) -> dict:
+    """港股新股发行详情（招股价区间/每手股数/入场费，HKD）。"""
+    try:
+        from app import hithink
+        return hithink.fetch_hk_ipo_issue_detail(issue_code)
+    except Exception as e:
+        log.warning(f"港股发行详情获取失败: {e}")
+        return {}
+
+
 def _fetch_bond_covs():
     """可转债列表（集思录数据）。"""
     ak = _akshare()
@@ -402,6 +451,9 @@ def list_upcoming(limit: int = 10) -> dict:
             d = row.to_dict()
             if str(d.get("上市日期", "") or "").strip() in ("", "-", "None", "nan", "NaT"):
                 stocks.append(d)
+    else:
+        # akshare 不可用时回退同花顺官方新股日历（无 PE 字段）
+        stocks = _fetch_stock_ipos_hithink()
 
     bonds: list[dict] = []
     df2 = _fetch_bond_covs()

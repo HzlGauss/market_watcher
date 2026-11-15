@@ -13,6 +13,7 @@
 """
 import os
 import sys
+from pathlib import Path
 
 # 强制 UTF-8 输出，避免控制台中文乱码
 for _stream in (sys.stdout, sys.stderr):
@@ -25,11 +26,23 @@ for _stream in (sys.stdout, sys.stderr):
 # 禁用 akshare/tqdm 进度条，避免污染输出
 os.environ.setdefault("TQDM_DISABLE", "1")
 
+# 定位项目根目录（skills/akshare-news 上三级）
+_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_ROOT))
+
+# 加载 .env（同花顺 API Key 等，供兜底源使用）
+try:
+    from app.utils import load_env
+    load_env(_ROOT)
+except Exception:
+    pass
+
+_ak = None
 try:
     import akshare as ak
+    _ak = ak
 except ImportError:
-    print("❌ 未安装 akshare，请先执行: pip install akshare")
-    sys.exit(1)
+    pass
 
 
 def _parse_args(argv):
@@ -60,6 +73,42 @@ def _fmt_ts(ts):
     return s[:10]
 
 
+def _fmt_ts_ms(ms):
+    """毫秒时间戳 → 'MM-DD HH:MM'。"""
+    if not ms:
+        return "?"
+    from datetime import datetime, timezone, timedelta
+    try:
+        dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone(timedelta(hours=8)))
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def _print_hithink(code: str):
+    """同花顺个股分时新闻（free，需 HITHINK_FINANCE_API_KEY）。"""
+    try:
+        from app import hithink
+        items = hithink.fetch_news_stock_timeline(code, size=20)
+    except Exception:
+        items = []
+    print(f"=== 个股分时新闻: {code}（数据源 同花顺 news/timeline）===\n")
+    if not items:
+        print("  ⚠️ 无同花顺分时新闻（未配置 HITHINK_FINANCE_API_KEY 或接口不可达）")
+        print()
+        return
+    print(f"共 {len(items)} 条\n")
+    for i, it in enumerate(items):
+        title = str(it.get("title") or "").strip()
+        source = str(it.get("source") or "").strip()
+        summary = str(it.get("summary") or "").strip()
+        meta = ", ".join(x for x in [source, _fmt_ts_ms(it.get("publish_time_ms"))] if x)
+        print(f"  {i + 1}. {title}  [{meta}]")
+        if summary:
+            print(f"     {summary[:120]}")
+        print()
+
+
 def main():
     raw_code, name = _parse_args(sys.argv[1:])
     code = _normalize_code(raw_code)
@@ -69,33 +118,37 @@ def main():
         return 2
 
     label = f"{name}({code})" if name else code
-    print(f"=== 个股新闻: {label}（数据源 AKShare 东财）===\n")
 
-    try:
-        df = ak.stock_news_em(symbol=code)
-    except Exception as e:
-        print(f"❌ 拉取失败: {e}")
-        return 1
+    # 1) AKShare 东财新闻（可选用，未安装 akshare 则跳过）
+    if _ak is not None:
+        print(f"=== 个股新闻: {label}（数据源 AKShare 东财）===\n")
+        try:
+            df = _ak.stock_news_em(symbol=code)
+        except Exception as e:
+            print(f"⚠️ 东财新闻拉取失败: {e}\n")
+            df = None
+        if df is not None and not df.empty:
+            print(f"共 {len(df)} 条\n")
+            for i, r in df.iterrows():
+                title = str(r.get("新闻标题", "") or "").strip()
+                source = str(r.get("文章来源", "") or "").strip()
+                ts = r.get("发布时间")
+                content = str(r.get("新闻内容", "") or "").strip()
+                url = r.get("新闻链接")
+                meta = ", ".join(x for x in [source, _fmt_ts(ts)] if x)
+                print(f"  {i + 1}. {title}  [{meta}]")
+                if content:
+                    print(f"     {content[:120]}")
+                if url:
+                    print(f"     {url}")
+                print()
+        elif df is not None and df.empty:
+            print("⚠️ 未获取到该股票的东财新闻\n")
+    else:
+        print("⚠️ 未安装 akshare，跳过东财新闻（pip install akshare）\n")
 
-    if df is None or df.empty:
-        print("⚠️ 未获取到该股票的新闻")
-        return 1
-
-    print(f"共 {len(df)} 条\n")
-    for i, r in df.iterrows():
-        title = str(r.get("新闻标题", "") or "").strip()
-        source = str(r.get("文章来源", "") or "").strip()
-        ts = r.get("发布时间")
-        content = str(r.get("新闻内容", "") or "").strip()
-        url = r.get("新闻链接")
-
-        meta = ", ".join(x for x in [source, _fmt_ts(ts)] if x)
-        print(f"  {i + 1}. {title}  [{meta}]")
-        if content:
-            print(f"     {content[:120]}")
-        if url:
-            print(f"     {url}")
-        print()
+    # 2) 同花顺个股分时新闻（免费兜底/补充，需 HITHINK_FINANCE_API_KEY）
+    _print_hithink(code)
 
     return 0
 

@@ -377,6 +377,40 @@ def _print_attention():
         print("  ⚠️ 无关注度数据（无 key 或接口不可达）")
 
 
+def _print_abnormal_monitor():
+    """【严重异动/重点监控】交易所口径异动监控列表（同花顺）。"""
+    print()
+    print("=" * 72)
+    print("【6c. 异动监控（同花顺 · 严重异动/重点监控）】")
+    print("=" * 72)
+    try:
+        from app import hithink
+        items = hithink.fetch_abnormal_monitor_list("current")
+    except Exception:
+        items = []
+    if not items:
+        print("  ⚠️ 无异动监控数据（无 key / 接口不可达）")
+        return
+    for it in items:
+        code = str(it.get("thscode") or "").split(".")[0].zfill(6)
+        name = _short(it.get("name") or "", 9)
+        label = str(it.get("monitor_label") or "")
+        start = it.get("start_date_ms")
+        end = it.get("end_date_ms")
+        s = ""
+        if start:
+            from datetime import datetime, timezone, timedelta
+            tz = timezone(timedelta(hours=8))
+            s = datetime.fromtimestamp(int(start) / 1000, tz=tz).strftime("%m-%d")
+        e = ""
+        if end:
+            from datetime import datetime, timezone, timedelta
+            tz = timezone(timedelta(hours=8))
+            e = datetime.fromtimestamp(int(end) / 1000, tz=tz).strftime("%m-%d")
+        rng = f"{s}~{e}" if s else "--"
+        print(f"  {code} {name:<10}{label:<10} 区间 {rng}")
+
+
 # ---------------------------------------------------------------- 主流程
 
 def _parse_args(argv):
@@ -440,6 +474,7 @@ def main():
 
     # ---- 关注度雷达（同花顺：飙升榜/热股榜/异动原因）----
     _print_attention()
+    _print_abnormal_monitor()
 
     # ---- 情绪面 ----
     print()

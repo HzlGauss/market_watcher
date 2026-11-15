@@ -55,8 +55,11 @@ py .claude/skills/news-search/search_news.py <关键词> [小时]
 # Real-time financial flash news (实时财经快讯流：全球快讯，可按关键词过滤)
 py .claude/skills/akshare-news/flash_news.py [关键词] [条数]
 
-# Individual stock news (个股新闻：某只股票的东财新闻)
+# Individual stock news (个股新闻：某只股票的东财+同花顺分时新闻)
 py .claude/skills/akshare-news/stock_news.py <代码> [名称]
+
+# Hot deep topics (热门深度专题：同花顺置顶/重要深度专题)
+py .claude/skills/akshare-news/topic_news.py [数量] [--important] [--all]
 
 # Natural-language financial data query (自然语言金融数据问答)
 py .claude/skills/financial-query/query_finance.py <自然语言问题>

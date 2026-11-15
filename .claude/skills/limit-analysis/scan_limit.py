@@ -368,7 +368,7 @@ def _print_tiers(tiers, high):
 def _print_break_rate(zt_n, zb_n, zb_known=True):
     print()
     print("=" * 72)
-    print("【2. 炸板率】")
+    print("【2b. 炸板率（本地口径 · 交叉验证）】")
     print("=" * 72)
     if not zb_known:
         print("  ⚠️ 炸板池数据缺失（本地兜底/接口不可达），炸板率不可算")
@@ -497,6 +497,100 @@ def _print_ladder():
         print("  次日晋级率: 无样本")
 
 
+def _ymd(date: str) -> str:
+    """YYYYMMDD → YYYY-MM-DD（同花顺新端点用横杠日期）。"""
+    d = str(date or "").strip()
+    if len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return d
+
+
+def _print_limit_up_statistics(date: str):
+    """【涨停强度统计】同花顺官方口径：封板率 + 档位晋级率 + 精确连板家数。
+
+    封板率 = 封板家数 / 触板家数，是炸板率的镜像（更权威）；page_boards 给二/三/四/五板晋级率。
+    """
+    print()
+    print("=" * 72)
+    print("【2. 涨停强度统计（同花顺官方口径 · 封板率/晋级率/精确连板）】")
+    print("=" * 72)
+    try:
+        from app import hithink
+        data = hithink.fetch_limit_up_statistics(_ymd(date))
+    except Exception:
+        data = {}
+    if not data:
+        print("  ⚠️ 无涨停统计（无 key / 接口不可达）")
+        return
+    seal_rate = data.get("seal_rate")
+    open_n = data.get("open_stock_count")
+    limit_n = data.get("limit_up_stock_count")
+    touched_n = data.get("touched_limit_up_stock_count")
+    if seal_rate is not None:
+        print(f"  封板率 {seal_rate * 100:.1f}%   |   打开 {open_n} / 封板 {limit_n} / 触板 {touched_n}")
+        verdict = ("封板坚决，情绪强" if seal_rate >= 0.75
+                   else ("情绪中性" if seal_rate >= 0.55 else "封板弱，分歧大/情绪弱"))
+        print(f"  情绪判定: {verdict}")
+    page_boards = data.get("page_boards") or []
+    if page_boards:
+        names = {"one": "首板", "two": "2板", "three": "3板", "four": "4板", "five_plus": "5板+"}
+        parts = []
+        for b in page_boards:
+            lv = names.get(b.get("board_level"), str(b.get("board_level")))
+            cnt = b.get("stock_count")
+            pr = b.get("promotion_rate")
+            parts.append(f"{lv}{cnt}(晋级{pr*100:.0f}%)" if pr is not None else f"{lv}{cnt}")
+        print(f"  板数档位: " + " / ".join(parts))
+    exact = data.get("exact_boards") or []
+    if exact:
+        print("  精确连板: " + " / ".join(f"{e.get('board_num')}板×{e.get('stock_count')}" for e in exact))
+
+
+def _print_institution(date: str, high: list[dict]):
+    """【机构净买 / 游资战绩】对高度板 top3 查机构净买 + 游资经典战绩。"""
+    print()
+    print("=" * 72)
+    print("【3b. 高度板机构净买 / 游资战绩（同花顺）】")
+    print("=" * 72)
+    if not high:
+        print("  ⚠️ 无连板股（≥2板）")
+        return
+    try:
+        from app import hithink
+    except Exception:
+        return
+    for h in high[:3]:
+        code, name = h["code"], h["name"]
+        try:
+            inst = hithink.fetch_dragon_tiger_stock_institution(code, date=_ymd(date))
+        except Exception:
+            inst = {}
+        items = (inst or {}).get("item") or []
+        one = next((it for it in items if it.get("range_days") == 1), items[0] if items else None)
+        if one is None:
+            print(f"  {code} {_short(name, 9)}  无龙虎榜机构数据")
+            continue
+        org_net = one.get("org_net_value")
+        if org_net is not None:
+            sign = "+" if org_net >= 0 else ""
+            print(f"  {code} {_short(name, 9)}  机构净买 {sign}{org_net / 1e8:.2f}亿"
+                  f"（买{one.get('org_buy_num')}/卖{one.get('org_sell_num')}家）")
+        else:
+            print(f"  {code} {_short(name, 9)}  机构净买 --（未上榜/无数据）")
+        # 游资席位：买入席位里第一个非「机构专用」的营业部，查其经典战绩
+        for dep in (one.get("buy_departments") or []):
+            if dep.get("name") == "机构专用":
+                continue
+            try:
+                rec = hithink.fetch_dragon_tiger_department_classic_record(dep.get("department_id") or "")
+            except Exception:
+                rec = {}
+            cr = (rec or {}).get("classic_record") or {}
+            if cr:
+                print(f"      游资 {_short(dep.get('name'), 14)}  经典战绩 {cr.get('name')} {cr.get('board_pattern')}")
+            break
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main():
@@ -556,11 +650,17 @@ def main():
     # 1b. 连板梯队矩阵（近30日 + 晋级率）
     _print_ladder()
 
-    # 2. 炸板率
+    # 2. 涨停强度统计（同花顺官方封板率/晋级率/精确连板）
+    _print_limit_up_statistics(date)
+
+    # 2b. 炸板率（本地口径交叉验证）
     _print_break_rate(zt_n, zb_n, zb_known=(zb_df is not None))
 
     # 3. 封单额 TOP
     _print_seal_top(_seal_top(zt_df))
+
+    # 3b. 高度板机构净买 / 游资战绩
+    _print_institution(date, high)
 
     # 4. 题材归类
     _print_industry("【4. 题材归类 · 涨停题材聚集】", _industry_agg(zt_df))
