@@ -113,9 +113,24 @@ def _pull(code: str, market: str, days: int) -> list:
     return out
 
 
+def _require_duckdb() -> bool:
+    """确认当前 Python 环境可导入 duckdb；否则落盘会静默失败（write 吞掉 ImportError）。"""
+    try:
+        import duckdb  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _sync(days: int) -> int:
     """对 holdings 里的 ETF 逐只拉近 days 日并 upsert，返回成功落盘的 ETF 数。"""
     from app import etf_kline_local
+
+    if not _require_duckdb():
+        print("❌ 当前 Python 环境缺少 duckdb，落盘会静默失败（etf_kline_local 吞掉 ImportError）。")
+        print("   请用已安装 duckdb 的解释器运行，例如：")
+        print("   /Users/hanzhanli/miniconda3/bin/python3.13 tools/sync_etf_kline.py daily")
+        return 0
 
     etfs = _holdings_etfs()
     if not etfs:
@@ -138,6 +153,12 @@ def _sync(days: int) -> int:
 
 def _status() -> None:
     from app import etf_kline_local
+
+    if not _require_duckdb():
+        print("❌ 当前 Python 环境缺少 duckdb，无法读取落盘状态。")
+        print("   请用已安装 duckdb 的解释器运行，例如：")
+        print("   /Users/hanzhanli/miniconda3/bin/python3.13 tools/sync_etf_kline.py status")
+        return
 
     etfs = _holdings_etfs()
     if not etfs:
