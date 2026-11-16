@@ -126,8 +126,21 @@ def _f(v) -> Optional[float]:
     return None if f != f else f  # NaN
 
 
+def _is_etf_code(code: str) -> bool:
+    """6 位代码是否为场内基金（ETF/LOF），按号段判断（与 hithink 口径一致）。"""
+    return str(code).strip().startswith(("51", "56", "58", "15", "16", "18"))
+
+
 def fetch_daily(code: str, market: str, days: int = 60) -> Optional[list[KlineData]]:
-    """读本地前复权日K（升序，最近 days 日），不可用返回 None。"""
+    """读本地前复权日K（升序，最近 days 日），不可用返回 None。
+
+    股票走 marketdb（data/market.duckdb）；ETF/LOF 走 etf_kline（data/etf_kline.duckdb），
+    因 marketdb 的 Parquet dump 只含 a-share、无 ETF，ETF 另由 tools/sync_etf_kline.py 落盘。
+    """
+    if _is_etf_code(code):
+        from . import etf_kline_local
+        return etf_kline_local.read_daily(code, market, days)
+
     db = _db_path()
     if not db.exists():
         return None

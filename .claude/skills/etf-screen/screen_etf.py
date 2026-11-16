@@ -46,7 +46,8 @@ except Exception:
     pass
 
 from app.data_fetcher import fetch_etf_spot_snapshot, _etf_name_to_industry
-from app.technical import calc_rsi, calc_macd, calc_ma_alignment, fetch_historical_kline
+from app.technical import calc_rsi, calc_macd, calc_ma_alignment
+from app.kline_local import fetch_daily_hybrid
 from app.helpers import _detect_market
 
 # ============================================================
@@ -454,9 +455,7 @@ def main():
     checked = 0
     for s in passed[:MAX_KLINE_FETCH]:
         checked += 1
-        klines = fetch_historical_kline(
-            s["code"], _detect_market(s["code"]), days=60, scale=240
-        )
+        klines = fetch_daily_hybrid(s["code"], _detect_market(s["code"]), days=60)
         mscore, detail = _score_momentum(klines) if klines else (0, {})
         if klines:
             candidates.append({

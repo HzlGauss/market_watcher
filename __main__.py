@@ -86,7 +86,7 @@ def _show_menu() -> str:
     print(f"  {Color.CYAN}D{Color.RESET}. Dragon Tiger Deep Analysis (龙虎榜深度分析)")
     print(f"  {Color.CYAN}W{Color.RESET}. Weekly Review (周报·持仓+自选)")
     print(f"  {Color.CYAN}M{Color.RESET}. Miaoxiang AI (东方财富妙想)")
-    print(f"  {Color.CYAN}U{Color.RESET}. Data Sync (日K + 估值 本地库更新)")
+    print(f"  {Color.CYAN}U{Color.RESET}. Data Sync (日K + 估值 + 持仓ETF 本地库更新)")
     print(f"  {Color.CYAN}F{Color.RESET}. Financial Statements Sync (三张报表落库·财报季后)")
     print(f"  {Color.CYAN}B{Color.RESET}. Blue-Chip / White-Horse Screen (白马蓝筹筛选·本地库)")
     print(f"  {Color.CYAN}0{Color.RESET}. Exit")
@@ -984,16 +984,17 @@ def _run_marketdb_steps(steps) -> None:
 
 
 def _run_data_sync() -> None:
-    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积 + regime 重算（每日用）。
+    """主菜单「数据更新」：日K增量同步 + 估值快照逐日累积 + regime 重算 + 持仓ETF日K落盘（每日用）。
 
-    前两项走 tools/marketdb_local.py 子命令：
+    前三项走 tools/marketdb_local.py 子命令：
     - sync: auto-sync 自动判断 skip/incremental/full，把本地日K补齐到最近交易日（T+1，最多到昨天）
     - sync-valuation --all: 全市场估值快照落库（PE/PB/PS/PCF），历史分位需每日收盘后累积
     第三项走 app/regime.py --update：离线重算分层广度 regime（站上MA20占比 → 牛/熊/震荡），
     供盘中买卖门控用（scan_position / left-side / right-side 等热路径只做 JSON 查表）。
+    第四项走 tools/sync_etf_kline.py daily：持仓 ETF 日K 落盘（marketdb dump 无 ETF，另建 etf_kline.duckdb）。
     """
     print(f"\n{Color.BOLD}{Color.CYAN}🔄 数据更新（本地行情库）{Color.RESET}")
-    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）  ③ regime 重算（广度牛熊）{Color.RESET}")
+    print(f"{Color.DIM}  ① 日K增量同步（补齐到最近交易日）  ② 估值快照累积（PE/PB 历史分位每日积累）  ③ regime 重算（广度牛熊）  ④ 持仓ETF日K落盘{Color.RESET}")
     print(f"{Color.DIM}  提示：日K为 T+1 发布，开盘前同步可补齐到上一交易日；估值需每日收盘后累积。{Color.RESET}\n")
     _run_marketdb_steps([
         ("日K 增量同步", ["sync"]),
@@ -1010,6 +1011,23 @@ def _run_data_sync() -> None:
             print(f"{Color.YELLOW}  ⚠️ regime 重算退出码 {rc}（可能缺 duckdb/pandas，回退指数 MA20/MA60）{Color.RESET}\n")
     except Exception as e:
         print(f"{Color.RED}  ❌ regime 重算失败: {e}{Color.RESET}\n")
+
+    # ④ 持仓 ETF 日K 落盘（marketdb dump 无 ETF，另建 data/etf_kline.duckdb）
+    _run_etf_kline_sync()
+
+
+def _run_etf_kline_sync() -> None:
+    """持仓 ETF 日K 落盘（tools/sync_etf_kline.py daily），不依赖 marketdb，用当前解释器即可。"""
+    tool = BASE_DIR / "tools" / "sync_etf_kline.py"
+    print(f"{Color.BOLD}持仓 ETF 日K 落盘:{Color.RESET}")
+    try:
+        rc = subprocess.run([sys.executable, str(tool), "daily"], cwd=str(BASE_DIR)).returncode
+        if rc == 0:
+            print(f"{Color.GREEN}  ✅ 持仓 ETF 日K 落盘完成{Color.RESET}\n")
+        else:
+            print(f"{Color.YELLOW}  ⚠️ 持仓 ETF 日K 落盘退出码 {rc}（可能缺 duckdb 或同花顺限流，稍后重试）{Color.RESET}\n")
+    except Exception as e:
+        print(f"{Color.RED}  ❌ 持仓 ETF 日K 落盘失败: {e}{Color.RESET}\n")
 
 
 def _run_financials_sync() -> None:

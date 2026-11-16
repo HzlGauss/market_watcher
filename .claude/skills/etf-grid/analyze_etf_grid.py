@@ -38,13 +38,13 @@ from app.helpers import _detect_market
 from app.models import WatchItem, KlineData
 from app.data_fetcher import fetch_quotes
 from app.technical import (
-    fetch_historical_kline,
     calc_ma_alignment,
     calc_support_resistance,
     calc_bollinger,
     calc_rsi,
     detect_box_regime,
 )
+from app.kline_local import fetch_daily_hybrid
 
 # 场内 ETF 代码号段（上海：51/56/58，深圳：15/16/18）
 _ETF_PREFIX = ("51", "56", "58", "15", "16", "18")
@@ -145,7 +145,7 @@ def main():
         amount = quote.amount
 
     # ---- 2. 日 K 线 ----
-    klines = fetch_historical_kline(code, market, days=days, scale=240)
+    klines = fetch_daily_hybrid(code, market, days=days)
     if not klines:
         print("❌ 未能获取 K 线数据（新浪 + AKShare 均失败），请检查代码或稍后重试。")
         return 1

@@ -104,6 +104,11 @@ py tools/marketdb_local.py screen-golden-pit
 # Bottoming whole-market SQL pre-screen (全市场磨底技术初筛：止跌+横盘+缩量，本地 DuckDB)
 py tools/marketdb_local.py screen-bottoming
 
+# Sync holdings ETF daily K-line to local DuckDB (marketdb dump 无 ETF，另建 etf_kline.duckdb)
+py tools/sync_etf_kline.py full     # 全历史回填（分片覆盖 5 年窗口上限）
+py tools/sync_etf_kline.py daily    # 收盘后增量（近 250 交易日 upsert 自愈缺口）
+py tools/sync_etf_kline.py status   # 落盘状态
+
 # Bottoming scan (磨底：止跌横盘缩量打底阶段扫描)
 py .claude/skills/bottoming/scan_bottoming.py <板块/行业|白马蓝筹|CSV路径|全市场> [输出数量]
 py .claude/skills/bottoming/backtest_bottoming.py [回测日期数]
@@ -168,7 +173,8 @@ py tools/local_query.py <代码> [名称] [日K天数]
 |---|---|---|
 | 基本面（ROE/毛利率/负债率/营收/净利同比/经营现金流） | `data/market.duckdb`（fin_income/balance/cashflow） | `app/fundamental_local.financial_snapshot(code)` |
 | 估值历史分位（PB/PE 3年/5年/上市以来） | `data/market.duckdb`（valuation_daily，历史回填到 2018 起） | `app/fundamental_local.valuation_percentile_multi(code)` |
-| 历史日K（前复权） | `data/market.duckdb`（raw_kline_daily + 复权因子） | `app/kline_local.fetch_daily_local_first(code, market)` |
+| 历史日K（前复权，A股） | `data/market.duckdb`（raw_kline_daily + 复权因子） | `app/kline_local.fetch_daily_local_first(code, market)` |
+| 历史日K（前复权，持仓ETF） | `data/etf_kline.duckdb`（marketdb dump 无 ETF，另建） | `app/etf_kline_local.read_daily(code, market)`（`fetch_daily_local_first` 对 ETF 号段自动走此库） |
 | 当日资金流（五档净流入时序） | `data/fund_flow_intraday.duckdb` | `app/intraday_store.latest_snapshot(code)` |
 | 5分钟K（保留15自然日） | `data/min5.duckdb` | `app/min5_local.read_history(code, market)` |
 | 行业景气落库 | `data/sector_beta.duckdb` | sector-beta skill |

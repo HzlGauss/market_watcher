@@ -277,31 +277,23 @@ def fetch_all_market_snapshot(limit: int = 1000) -> list[dict]:
 # 历史日K线
 # ============================================================
 
-def fetch_daily_kline(code: str, market: str = "", days: int = 60, adjust: str = "forward") -> list[dict]:
-    """日K线（升序），返回 [{date, open, high, low, close, volume}]。
+# 历史端点单次 [start, end] 最多跨 5 年（日历日），超出报 code=1003；拉更长历史需分片。
+_MAX_SPAN_DAYS = 1825
 
-    同花顺仅支持 interval=1d（日线）；分钟线无此能力，勿调用。
-    """
-    start = datetime.now(_SH_TZ) - timedelta(days=int(days) * 2 + 5)  # 覆盖周末/节假日冗余
-    end = datetime.now(_SH_TZ)
-    c = str(code).strip()
-    # ETF/LOF/封闭基金号段（51/56/58/15/16/18 开头）走基金场内历史行情端点；
-    # 该端点仅 ETF 支持历史、固定前复权且不接受 adjust 参数。
-    is_etf = _is_etf_code(c)
-    params = {
-        "thscode": thscode(code, market),
-        "interval": "1d",
-        "start": int(start.timestamp() * 1000),
-        "end": int(end.timestamp() * 1000),
-    }
-    path = "/api/fund/market/historical" if is_etf else "/api/a-share/prices/historical"
-    if not is_etf:
+
+def _fetch_hist_window(
+    path: str, thscode_: str, interval: str,
+    start_ms: int, end_ms: int, adjust: Optional[str] = None,
+) -> list[dict]:
+    """单窗口历史K线（升序 dict 列表），请求失败/无数据返回空。"""
+    params = {"thscode": thscode_, "interval": interval, "start": int(start_ms), "end": int(end_ms)}
+    if adjust:
         params["adjust"] = adjust
     data = _get(path, params)
     if not data:
         return []
     items = sorted((data.get("item") or []), key=lambda x: x.get("date_ms", 0))
-    out = [
+    return [
         {
             "date": _fmt_date(it.get("date_ms")),
             "open": it.get("open_price"),
@@ -312,7 +304,32 @@ def fetch_daily_kline(code: str, market: str = "", days: int = 60, adjust: str =
         }
         for it in items
     ]
-    return out[-int(days):]
+
+
+def fetch_daily_kline(code: str, market: str = "", days: int = 60, adjust: str = "forward") -> list[dict]:
+    """日K线（升序），返回 [{date, open, high, low, close, volume}]。
+
+    同花顺仅支持 interval=1d（日线）；分钟线无此能力，勿调用。历史端点单次
+    [start, end] 最多跨 5 年（超出报 code=1003），且基金（ETF）历史数据深度本身
+    只保留约 5 年，故窗口直接收窄到最近 5 年，更早无数据、无需分片。
+    """
+    c = str(code).strip()
+    # ETF/LOF/封闭基金号段（51/56/58/15/16/18 开头）走基金场内历史行情端点；
+    # 该端点仅 ETF 支持历史、固定前复权且不接受 adjust 参数。
+    is_etf = _is_etf_code(c)
+    path = "/api/fund/market/historical" if is_etf else "/api/a-share/prices/historical"
+    adjust_param = None if is_etf else adjust
+    ts = thscode(code, market)
+
+    end = datetime.now(_SH_TZ)
+    start = end - timedelta(days=int(days) * 2 + 5)  # 覆盖周末/节假日冗余
+    start = max(start, end - timedelta(days=_MAX_SPAN_DAYS))  # 单次跨度上限 5 年
+
+    items = _fetch_hist_window(
+        path, ts, "1d",
+        start.timestamp() * 1000, end.timestamp() * 1000, adjust_param,
+    )
+    return items[-int(days):]
 
 
 # ============================================================

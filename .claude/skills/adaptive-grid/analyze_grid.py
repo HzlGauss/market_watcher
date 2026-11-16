@@ -47,10 +47,10 @@ from app.models import WatchItem, KlineData
 from app.data_fetcher import fetch_quotes
 from app.hithink import thscode
 from app.technical import (
-    fetch_historical_kline,
     calc_support_resistance,
     detect_box_regime,
 )
+from app.kline_local import fetch_daily_hybrid
 
 # 筹码分布：成交额时间衰减半衰期（交易日）。半衰期 40 日 ≈ 日均换手 2% 的衰减节奏。
 _CHIP_HALFLIFE = 40
@@ -453,7 +453,7 @@ def main():
     bars = _read_local_bars(code, market, days)
     amount_based = bool(bars)
     if not bars:
-        klines_raw = fetch_historical_kline(code, market, days=days, scale=240)
+        klines_raw = fetch_daily_hybrid(code, market, days=days)
         bars = [
             {"date": k.date, "open": k.open, "high": k.high, "low": k.low,
              "close": k.close, "volume": k.volume, "amount": None}
