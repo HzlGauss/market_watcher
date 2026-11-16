@@ -1017,11 +1017,16 @@ def _run_data_sync() -> None:
 
 
 def _run_etf_kline_sync() -> None:
-    """持仓 ETF 日K 落盘（tools/sync_etf_kline.py daily），不依赖 marketdb，用当前解释器即可。"""
+    """持仓 ETF 日K 落盘（tools/sync_etf_kline.py daily）。
+
+    落盘依赖 duckdb（etf_kline_local.write），duckdb 装在独立环境时须走 MARKETDB_PYTHON，
+    与 marketdb/regime 步骤同一解释器；否则写库静默失败（count 返回 0）。
+    """
     tool = BASE_DIR / "tools" / "sync_etf_kline.py"
+    py = os.environ.get("MARKETDB_PYTHON") or sys.executable
     print(f"{Color.BOLD}持仓 ETF 日K 落盘:{Color.RESET}")
     try:
-        rc = subprocess.run([sys.executable, str(tool), "daily"], cwd=str(BASE_DIR)).returncode
+        rc = subprocess.run([py, str(tool), "daily"], cwd=str(BASE_DIR)).returncode
         if rc == 0:
             print(f"{Color.GREEN}  ✅ 持仓 ETF 日K 落盘完成{Color.RESET}\n")
         else:
